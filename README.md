@@ -39,6 +39,8 @@ One tool, many jobs — the point of a Swiss-army knife:
 | `knife dis FILE --count N [--vaddr X\|--off Y]` | x86/x64 disassembly (iced-x86) |
 | `knife hex FILE --off O --len L` | hex dump |
 | `knife map FILE --buckets N` | whole-file entropy sparkline, packed regions flagged |
+| `knife funcs FILE [--by-refs]` | recover functions via control-flow analysis |
+| `knife dis FILE --func NAME` | disassemble a whole function with labels + xrefs |
 | `knife scan FILE` | crypto constants, packer markers, embedded formats |
 | `knife yara RULES FILE` | match YARA rules (RULES = a file or a directory) |
 | `knife ls FILE` | archive (.a/.lib) members |
@@ -56,6 +58,25 @@ three: a signed Windows DLL, a stripped RISC-V ELF, and a macOS x86-64 Mach-O.
 
 Disassembly is x86/x64 via `iced-x86`; other architectures are reported as
 unsupported rather than guessed at.
+
+## Control-flow analysis
+
+`knife funcs` runs a recursive-descent engine that recovers functions, basic
+blocks, a control-flow graph, and cross-references — the backbone of an
+interactive disassembler. It seeds from the entry point and every named symbol,
+follows calls and branches, splits basic blocks, and counts incoming references.
+
+```
+knife funcs sample.exe --by-refs      # busiest functions first
+knife dis   sample.exe --func main     # whole function, with loc_ labels,
+                                       # resolved call targets, and xrefs-to
+```
+
+Everything is in virtual-address space, so the address column, branch operands,
+and symbol names all agree. A named symbol marks a function boundary, so the
+engine keeps distinct functions apart instead of merging them. Direct calls
+resolve to `sub_<addr>` or the symbol name; import-name resolution through the
+IAT is the next step. x86/x64 only (disassembly is via iced-x86).
 
 ## YARA
 

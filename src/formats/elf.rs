@@ -1,7 +1,7 @@
 //! ELF → Binary.
 
 use super::mk_section;
-use crate::model::{Arch, Binary, Format, ImportedLib};
+use crate::model::{Arch, Binary, Format, ImportedLib, SymKind, Symbol};
 use goblin::elf::Elf;
 
 const SHF_WRITE: u64 = 0x1;
@@ -76,6 +76,27 @@ pub fn build(path: &str, bytes: &[u8], elf: Elf) -> Binary {
         }]
     };
 
+    // Defined function symbols (STT_FUNC, non-zero address) seed the engine.
+    // syms use .strtab, dynsyms use .dynstrtab — keep them separate.
+    let mut symbols: Vec<Symbol> = Vec::new();
+    let mut collect_funcs = |it: goblin::elf::sym::SymIterator, strtab: &goblin::strtab::Strtab| {
+        for sym in it {
+            if sym.st_type() != 2 || sym.st_value == 0 || sym.st_shndx == 0 {
+                continue; // STT_FUNC, defined, with an address
+            }
+            let name = strtab.get_at(sym.st_name).unwrap_or("");
+            if !name.is_empty() {
+                symbols.push(Symbol {
+                    addr: sym.st_value,
+                    name: name.to_string(),
+                    kind: SymKind::Func,
+                });
+            }
+        }
+    };
+    collect_funcs(elf.syms.iter(), &elf.strtab);
+    collect_funcs(elf.dynsyms.iter(), &elf.dynstrtab);
+
     let stripped = !elf.section_headers.iter().any(|sh| sh.sh_type == 2); // SHT_SYMTAB present == not stripped
 
     let mut notes = Vec::new();
@@ -114,6 +135,7 @@ pub fn build(path: &str, bytes: &[u8], elf: Elf) -> Binary {
         sections,
         imports,
         exports,
+        symbols,
         libs: elf.libraries.iter().map(|s| s.to_string()).collect(),
         rpaths: elf
             .rpaths

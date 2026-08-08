@@ -352,6 +352,7 @@ mod tests {
             sections: vec![],
             imports: vec![],
             exports: vec![],
+            symbols: vec![],
             libs: vec![],
             rpaths: vec![],
             overall_entropy: 0.0,

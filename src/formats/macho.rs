@@ -101,6 +101,7 @@ fn build_one(path: &str, bytes: &[u8], m: MachO) -> Binary {
         sections,
         imports,
         exports,
+        symbols: Vec::new(),
         libs: m.libs.iter().map(|s| s.to_string()).collect(),
         rpaths: m.rpaths.iter().map(|s| s.to_string()).collect(),
         overall_entropy: 0.0,

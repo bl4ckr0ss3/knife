@@ -1,7 +1,7 @@
 //! PE → Binary.
 
 use super::mk_section;
-use crate::model::{Arch, Binary, Format, ImportedLib};
+use crate::model::{Arch, Binary, Format, ImportedLib, SymKind, Symbol};
 use goblin::pe::PE;
 use std::collections::BTreeMap;
 
@@ -66,6 +66,27 @@ pub fn build(path: &str, bytes: &[u8], pe: PE) -> Binary {
         .filter_map(|e| e.name.map(|n| n.to_string()))
         .collect();
 
+    // Addressed symbols for the analysis engine: export RVAs, and each import's
+    // IAT-slot RVA (so `call [rip+x]` through the IAT can be named).
+    let mut symbols: Vec<Symbol> = Vec::new();
+    for e in &pe.exports {
+        if let (Some(name), rva) = (e.name, e.rva) {
+            symbols.push(Symbol {
+                addr: rva as u64,
+                name: name.to_string(),
+                kind: SymKind::Export,
+            });
+        }
+    }
+    for imp in &pe.imports {
+        let module = imp.dll.rsplit_once('.').map(|(s, _)| s).unwrap_or(imp.dll);
+        symbols.push(Symbol {
+            addr: imp.rva as u64,
+            name: format!("{module}!{}", imp.name),
+            kind: SymKind::Import,
+        });
+    }
+
     let (subsystem, image_base, timestamp, has_sig, sig_region) =
         if let Some(oh) = pe.header.optional_header {
             let sub = subsystem_name(oh.windows_fields.subsystem);
@@ -118,6 +139,7 @@ pub fn build(path: &str, bytes: &[u8], pe: PE) -> Binary {
         sections,
         imports,
         exports,
+        symbols,
         libs: pe.libraries.iter().map(|s| s.to_string()).collect(),
         rpaths: Vec::new(),
         overall_entropy: 0.0,

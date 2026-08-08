@@ -93,6 +93,24 @@ pub struct ImportedLib {
     pub functions: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum SymKind {
+    /// A defined function (has code at `addr`).
+    Func,
+    /// An exported function/symbol.
+    Export,
+    /// An imported function; `addr` is the IAT slot it is called through.
+    Import,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Symbol {
+    /// Image address (PE: RVA; ELF/Mach-O: virtual address).
+    pub addr: u64,
+    pub name: String,
+    pub kind: SymKind,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Binary {
     pub path: String,
@@ -110,6 +128,8 @@ pub struct Binary {
     pub sections: Vec<Section>,
     pub imports: Vec<ImportedLib>,
     pub exports: Vec<String>,
+    /// Addressed symbols for the analysis engine (functions, exports, imports).
+    pub symbols: Vec<Symbol>,
     pub libs: Vec<String>,
     pub rpaths: Vec<String>,
     pub overall_entropy: f64,

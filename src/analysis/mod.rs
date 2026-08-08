@@ -1,5 +1,6 @@
 pub mod capabilities;
 pub mod disasm;
+pub mod engine;
 pub mod entropy;
 pub mod hashes;
 pub mod signatures;

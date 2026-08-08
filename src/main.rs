@@ -7,7 +7,7 @@ mod formats;
 mod model;
 mod output;
 
-use analysis::{capabilities, disasm, hashes, signatures, strings as strs, triage, yara};
+use analysis::{capabilities, disasm, engine, hashes, signatures, strings as strs, triage, yara};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use model::Binary;
@@ -59,7 +59,7 @@ enum Command {
     Iocs { file: String },
     /// File hashes and imphash.
     Hashes { file: String },
-    /// Disassemble (x86/x64) from the entry point or a given location.
+    /// Disassemble (x86/x64) from the entry point, a location, or a function.
     Dis {
         file: String,
         #[arg(long, default_value_t = 40)]
@@ -70,6 +70,16 @@ enum Command {
         /// File offset to start at.
         #[arg(long)]
         off: Option<String>,
+        /// Disassemble a whole recovered function by name or address.
+        #[arg(long)]
+        func: Option<String>,
+    },
+    /// Recover and list functions (control-flow analysis, x86/x64).
+    Funcs {
+        file: String,
+        /// Sort by incoming references instead of address.
+        #[arg(long)]
+        by_refs: bool,
     },
     /// Hex dump a range.
     Hex {
@@ -117,6 +127,7 @@ fn real_main() -> Result<()> {
         "map",
         "scan",
         "yara",
+        "funcs",
         "ls",
         "help",
         "-h",
@@ -143,7 +154,9 @@ fn real_main() -> Result<()> {
             count,
             vaddr,
             off,
-        } => cmd_dis(&file, count, vaddr, off),
+            func,
+        } => cmd_dis(&file, count, vaddr, off, func),
+        Command::Funcs { file, by_refs } => cmd_funcs(&file, by_refs, cli.json),
         Command::Hex { file, off, len } => cmd_hex(&file, off, len),
         Command::Map { file, buckets } => cmd_map(&file, buckets, cli.json),
         Command::Scan { file } => cmd_scan(&file, cli.json),
@@ -582,7 +595,13 @@ fn print_disasm(insns: &[disasm::Insn]) {
     }
 }
 
-fn cmd_dis(file: &str, count: usize, vaddr: Option<String>, off: Option<String>) -> Result<()> {
+fn cmd_dis(
+    file: &str,
+    count: usize,
+    vaddr: Option<String>,
+    off: Option<String>,
+    func: Option<String>,
+) -> Result<()> {
     let bytes = load(file)?;
     let bin = parse(file, &bytes)?;
     if !disasm::supported(bin.arch) {
@@ -591,6 +610,13 @@ fn cmd_dis(file: &str, count: usize, vaddr: Option<String>, off: Option<String>)
             bin.arch.label()
         );
     }
+
+    // Function mode: recover the CFG and print the whole function with labels,
+    // resolved call targets, and cross-references.
+    if let Some(sel) = func {
+        return dis_function(&bin, &bytes, &sel);
+    }
+
     let (foff, va) = if let Some(o) = off {
         let o = parse_num(&o)?;
         (o, o)
@@ -606,6 +632,155 @@ fn cmd_dis(file: &str, count: usize, vaddr: Option<String>, off: Option<String>)
     section_header(&format!("disassembly @ 0x{va:x}"));
     let insns = disasm::disassemble(&bytes, foff, va, bin.bits, count);
     print_disasm(&insns);
+    Ok(())
+}
+
+fn cmd_funcs(file: &str, by_refs: bool, as_json: bool) -> Result<()> {
+    let bytes = load(file)?;
+    let bin = parse(file, &bytes)?;
+    if !disasm::supported(bin.arch) {
+        anyhow::bail!(
+            "control-flow analysis supports x86/x64 only; this is {}",
+            bin.arch.label()
+        );
+    }
+    let an = engine::analyze(&bin, &bytes, 500_000);
+
+    let mut funcs: Vec<&engine::Function> = an.functions.iter().collect();
+    if by_refs {
+        funcs.sort_by(|a, b| b.incoming.cmp(&a.incoming).then(a.addr.cmp(&b.addr)));
+    }
+
+    if as_json {
+        let rows: Vec<_> = funcs
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "addr": f.addr + an.display_base,
+                    "name": f.name,
+                    "named": f.named,
+                    "blocks": f.blocks.len(),
+                    "size": f.size,
+                    "incoming": f.incoming,
+                    "calls": f.calls.len(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+
+    let named = funcs.iter().filter(|f| f.named).count();
+    section_header(&format!("functions ({}, {} named)", funcs.len(), named));
+    println!(
+        "  {:<18} {:>6} {:>5} {:>5}  {}",
+        "addr".style(faint()),
+        "size".style(faint()),
+        "blks".style(faint()),
+        "refs".style(faint()),
+        "name".style(faint()),
+    );
+    for f in &funcs {
+        let a = f.addr + an.display_base;
+        let name_style = if f.named { mint() } else { muted() };
+        println!(
+            "  {:<18} {:>6} {:>5} {:>5}  {}",
+            format!("0x{a:x}").style(faint()),
+            f.size,
+            f.blocks.len(),
+            f.incoming,
+            f.name.style(name_style),
+        );
+    }
+    if an.truncated {
+        println!(
+            "  {}",
+            "analysis budget reached — listing is partial".style(amber())
+        );
+    }
+    Ok(())
+}
+
+fn dis_function(bin: &crate::model::Binary, bytes: &[u8], sel: &str) -> Result<()> {
+    let an = engine::analyze(bin, bytes, 500_000);
+
+    // Resolve the selector: a name, or an address (with or without image base).
+    let func = if let Some(f) = an.find_by_name(sel) {
+        Some(f)
+    } else if let Ok(v) = parse_num(sel) {
+        let internal = v.checked_sub(an.display_base).unwrap_or(v);
+        an.find_function(internal).or_else(|| an.find_function(v))
+    } else {
+        None
+    };
+    let func = func.with_context(|| format!("no function '{sel}' (try `knife funcs`)"))?;
+
+    let a = func.addr + an.display_base;
+    section_header(&format!("{} @ 0x{a:x}", func.name));
+    println!(
+        "  {}",
+        format!(
+            "{} block(s) · {} bytes · {} incoming ref(s)",
+            func.blocks.len(),
+            func.size,
+            func.incoming
+        )
+        .style(faint())
+    );
+
+    // xrefs into this function
+    if let Some(refs) = an.xrefs_to.get(&func.addr) {
+        let list: Vec<String> = refs
+            .iter()
+            .take(8)
+            .map(|x| format!("0x{:x}", x.from + an.display_base))
+            .collect();
+        let more = if refs.len() > 8 {
+            format!(" +{}", refs.len() - 8)
+        } else {
+            String::new()
+        };
+        println!(
+            "  {}",
+            format!("xrefs: {}{}", list.join(", "), more).style(faint())
+        );
+    }
+    println!();
+
+    for (i, block) in func.blocks.iter().enumerate() {
+        if i > 0 {
+            // label incoming block if referenced
+            let la = block.start + an.display_base;
+            println!("  {}:", format!("loc_{la:x}").style(amber()));
+        }
+        for ins in &block.insns {
+            let a = ins.addr + an.display_base;
+            let (mn, rest) = ins.text.split_once(' ').unwrap_or((ins.text.as_str(), ""));
+
+            // annotate branch/call targets
+            let annot = if let Some(name) = &ins.target_name {
+                format!("  ; {}", name).style(mint()).to_string()
+            } else if let Some(t) = ins.target {
+                let ta = t + an.display_base;
+                let lbl = if an.find_function(t).is_some() {
+                    an.label(t)
+                } else {
+                    format!("loc_{ta:x}")
+                };
+                format!("  ; {}", lbl).style(faint()).to_string()
+            } else {
+                String::new()
+            };
+
+            println!(
+                "  {}  {} {}{}",
+                format!("{a:012x}").style(faint()),
+                mn.style(accent()),
+                rest.style(muted()),
+                annot,
+            );
+        }
+    }
     Ok(())
 }
 
