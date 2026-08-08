@@ -459,6 +459,17 @@ pub fn analyze(bin: &Binary, bytes: &[u8], max_insns: usize, db: &crate::db::Db)
         }
     }
 
+    // Container-metadata function starts (the PE exception directory, a
+    // prologue sweep). These carry no name, so they seed and bound the descent
+    // but leave the function to render as `sub_`. This is what finds the code a
+    // stripped C++ binary only ever reaches through indirect calls.
+    for rva in &bin.func_hints {
+        let va = rva + base;
+        if in_exec(bin, base, va) && is_seed.insert(va) {
+            seeds.push_back(va);
+        }
+    }
+
     // Your own names win, and they also create work: naming an address the
     // symbol table never mentioned is how you tell the engine there is a
     // function there, which is most of the point of naming something in a
@@ -980,6 +991,35 @@ mod tests {
         let mut bytes = vec![0u8; vaddr as usize];
         bytes.extend_from_slice(code);
         (bin, bytes)
+    }
+
+    #[test]
+    fn a_func_hint_recovers_code_no_control_flow_reaches() {
+        // Two functions back to back. The entry (0x1000) just returns; the
+        // second (0x1002) is never called from anywhere the engine can see, so
+        // recursive descent alone never finds it. A func_hint is the only way
+        // in, which is the whole point of the PE exception directory.
+        let code = [
+            0xc3, // 0x1000  ret         (entry)
+            0x90, // 0x1001  padding
+            0x31, 0xc0, // 0x1002  xor eax, eax  (second function)
+            0xc3, // 0x1004  ret
+        ];
+        let (mut bin, bytes) = code_at(0x1000, &code);
+
+        // Without a hint, only the entry is recovered.
+        let bare = analyze(&bin, &bytes, 1000, &Db::default());
+        assert!(bare.find_function(0x1002).is_none());
+
+        // With the hint, the second function appears.
+        bin.func_hints = vec![0x1002];
+        let with_hint = analyze(&bin, &bytes, 1000, &Db::default());
+        let f = with_hint
+            .find_function(0x1002)
+            .expect("the hinted function should be recovered");
+        assert!(!f.blocks.is_empty());
+        // It has no name, so it renders as sub_ like any discovered function.
+        assert_eq!(with_hint.label(0x1002), "sub_1002");
     }
 
     #[test]

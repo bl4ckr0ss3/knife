@@ -228,6 +228,7 @@ pub fn build(path: &str, bytes: &[u8], elf: Elf) -> Binary {
         imports,
         exports,
         symbols,
+        func_hints: Vec::new(),
         libs: elf.libraries.iter().map(|s| s.to_string()).collect(),
         rpaths: elf
             .rpaths

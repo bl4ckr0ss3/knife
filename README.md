@@ -182,11 +182,21 @@ x86-64 Mach-O.
 
 **A real analysis engine.** `knife funcs` runs recursive-descent disassembly
 seeded from the entry point and every named symbol, follows calls and branches,
-splits basic blocks, builds a control-flow graph, and counts cross-references.
-`knife dis --func` prints a whole function with `loc_` labels, resolved call
-targets, and xrefs-to. On `kernel32.dll` it recovers 2218 functions, 1515 of
-them named. Everything is in virtual-address space, so the address column,
-branch operands, and symbol names all agree.
+splits basic blocks, resolves jump tables, builds a control-flow graph, and
+counts cross-references. `knife dis --func` prints a whole function with `loc_`
+labels, resolved call targets, and xrefs-to. On `kernel32.dll` it recovers 2605
+functions, 1515 of them named. Everything is in virtual-address space, so the
+address column, branch operands, and symbol names all agree.
+
+**It finds code control flow cannot reach.** A stripped C++ binary reaches most
+of its functions only through vtables and function pointers, which recursive
+descent cannot follow, so descent alone sees a fraction of the code. On x64
+Windows the PE exception directory lists every non-leaf function with its start
+address, so knife seeds from it: on 7-Zip's `7z.dll` that is the difference
+between recovering 87 functions and recovering 6472, and between `knife sinks`
+finding one `memcpy` call site and finding 503. Chained unwind entries are
+continuations, not functions, and are skipped, so the seeds are one per real
+function.
 
 **Imports resolve to names.** A call to a library function never goes there
 directly: ELF routes it through a `.plt` stub that jumps via a GOT slot, and PE
@@ -245,6 +255,8 @@ knife iocs sample.exe --json | jq '.[] | select(.kind=="url").value'
 - [x] Library-function identification (FLIRT-style)
 - [x] AArch64 disassembly and PLT-veneer resolution
 - [x] Argument-provenance bug audit (`knife audit`)
+- [x] Function discovery from the PE exception directory (stripped C++ coverage)
+- [ ] Function discovery from ELF `.eh_frame` (the same win for ELF)
 - [ ] IR lift toward a decompiler view
 
 ## Build from source

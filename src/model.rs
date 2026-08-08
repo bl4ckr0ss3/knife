@@ -183,6 +183,12 @@ pub struct Binary {
     pub exports: Vec<String>,
     /// Addressed symbols for the analysis engine (functions, exports, imports).
     pub symbols: Vec<Symbol>,
+    /// Function-start addresses recovered from container metadata rather than
+    /// from control flow: the PE exception directory, a prologue sweep. These
+    /// are image-relative like `Symbol::addr`, carry no name, and exist so the
+    /// engine can find code that is only ever reached through indirect calls,
+    /// which is most of a stripped C++ binary.
+    pub func_hints: Vec<u64>,
     pub libs: Vec<String>,
     pub rpaths: Vec<String>,
     pub overall_entropy: f64,
@@ -228,6 +234,7 @@ impl Binary {
             imports: Vec::new(),
             exports: Vec::new(),
             symbols: Vec::new(),
+            func_hints: Vec::new(),
             libs: Vec::new(),
             rpaths: Vec::new(),
             overall_entropy: 0.0,

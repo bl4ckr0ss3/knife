@@ -131,11 +131,21 @@ pub fn build(path: &str, bytes: &[u8], pe: PE) -> Binary {
             parse_load_config(bytes, off as usize, pe.is_64)
         });
 
+    // The exception directory lists every non-leaf function on x64 with its
+    // start address, so it recovers the code that recursive descent misses when
+    // functions are reached only through vtables and function pointers. That is
+    // most of a stripped C++ binary, which is why this matters so much more than
+    // its size suggests.
+    let func_hints = exception_function_starts(&pe, &sections, bytes);
+
     let mut notes = Vec::new();
     if pe.is_64 {
         notes.push("PE32+".into());
     } else {
         notes.push("PE32".into());
+    }
+    if !func_hints.is_empty() {
+        notes.push(format!("{} pdata functions", func_hints.len()));
     }
     let dotnet = pe
         .header
@@ -164,6 +174,7 @@ pub fn build(path: &str, bytes: &[u8], pe: PE) -> Binary {
         imports,
         exports,
         symbols,
+        func_hints,
         libs: pe.libraries.iter().map(|s| s.to_string()).collect(),
         rpaths: Vec::new(),
         overall_entropy: 0.0,
@@ -179,6 +190,41 @@ pub fn build(path: &str, bytes: &[u8], pe: PE) -> Binary {
         },
         notes,
     }
+}
+
+/// Function-start RVAs from the PE exception directory.
+///
+/// Each RUNTIME_FUNCTION names a code region and its unwind info. A function
+/// with more than one region is split across several entries whose tails are
+/// flagged CHAININFO in their unwind info; those tails are continuations, not
+/// separate functions, so they are skipped. What remains is one address per
+/// real function, which is exactly the seed set the engine cannot derive from
+/// control flow alone.
+fn exception_function_starts(
+    pe: &PE,
+    sections: &[crate::model::Section],
+    bytes: &[u8],
+) -> Vec<u64> {
+    const UNW_FLAG_CHAININFO: u8 = 0x4;
+    let Some(ed) = &pe.exception_data else {
+        return Vec::new();
+    };
+
+    let mut starts = Vec::new();
+    for rf in ed.functions().flatten() {
+        // The unwind info's first byte packs version (low 3 bits) and flags
+        // (high 5); a chained entry continues an earlier function.
+        let chained = rva_to_off(sections, rf.unwind_info_address as u64)
+            .and_then(|o| bytes.get(o as usize).copied())
+            .map(|b| (b >> 3) & UNW_FLAG_CHAININFO != 0)
+            .unwrap_or(false);
+        if !chained {
+            starts.push(rf.begin_address as u64);
+        }
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    starts
 }
 
 /// RVA → file offset over the section table. Used before the `Binary` exists,
