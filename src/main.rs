@@ -7,7 +7,7 @@ mod formats;
 mod model;
 mod output;
 
-use analysis::{capabilities, disasm, hashes, signatures, strings as strs, triage};
+use analysis::{capabilities, disasm, hashes, signatures, strings as strs, triage, yara};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use model::Binary;
@@ -34,7 +34,13 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Full triage report (default).
-    Info { file: String },
+    Info {
+        file: String,
+        /// Also run YARA rules (a .yar/.yara file or a directory) and fold
+        /// matches into the verdict.
+        #[arg(long)]
+        rules: Option<String>,
+    },
     /// List sections/segments with entropy.
     Sections { file: String },
     /// List imported libraries and functions.
@@ -81,6 +87,8 @@ enum Command {
     },
     /// Scan for crypto constants, packer markers, and embedded formats.
     Scan { file: String },
+    /// Match YARA rules against a file (rules = a .yar/.yara file or a directory).
+    Yara { rules: String, file: String },
     /// List archive (.a/.lib) members.
     Ls { file: String },
 }
@@ -108,6 +116,7 @@ fn real_main() -> Result<()> {
         "hex",
         "map",
         "scan",
+        "yara",
         "ls",
         "help",
         "-h",
@@ -121,7 +130,7 @@ fn real_main() -> Result<()> {
 
     let cli = Cli::parse_from(args);
     match cli.cmd {
-        Command::Info { file } => cmd_info(&file, cli.json),
+        Command::Info { file, rules } => cmd_info(&file, rules.as_deref(), cli.json),
         Command::Sections { file } => cmd_sections(&file, cli.json),
         Command::Imports { file } => cmd_imports(&file, cli.json),
         Command::Exports { file } => cmd_exports(&file, cli.json),
@@ -138,6 +147,7 @@ fn real_main() -> Result<()> {
         Command::Hex { file, off, len } => cmd_hex(&file, off, len),
         Command::Map { file, buckets } => cmd_map(&file, buckets, cli.json),
         Command::Scan { file } => cmd_scan(&file, cli.json),
+        Command::Yara { rules, file } => cmd_yara(&rules, &file, cli.json),
         Command::Ls { file } => cmd_ls(&file),
     }
 }
@@ -152,7 +162,7 @@ fn parse(file: &str, bytes: &[u8]) -> Result<Binary> {
 
 // ── info ─────────────────────────────────────────────────────────────────
 
-fn cmd_info(file: &str, as_json: bool) -> Result<()> {
+fn cmd_info(file: &str, rules: Option<&str>, as_json: bool) -> Result<()> {
     let bytes = load(file)?;
     let bin = parse(file, &bytes)?;
     let all_syms: Vec<&str> = bin
@@ -161,7 +171,17 @@ fn cmd_info(file: &str, as_json: bool) -> Result<()> {
         .collect();
     let caps = capabilities::matches(all_syms.into_iter());
     let cluster = capabilities::cluster(&caps);
-    let tri = triage::run(&bin, &caps);
+
+    // Optional YARA pass folded into the verdict.
+    let yara_matches = match rules {
+        Some(path) => {
+            let (compiled, _) = yara::compile(path)?;
+            yara::scan(&compiled, &bytes)?
+        }
+        None => Vec::new(),
+    };
+    let yara_names: Vec<String> = yara_matches.iter().map(|m| m.rule.clone()).collect();
+    let tri = triage::run(&bin, &caps, &yara_names);
     let fh = hashes::file_hashes(&bytes);
     let imphash = hashes::imphash(&bin);
     let all_strings = strs::extract(&bytes, 5);
@@ -298,6 +318,14 @@ fn cmd_info(file: &str, as_json: bool) -> Result<()> {
                 "  {}",
                 format!("… and {} more", iocs.len() - 20).style(faint())
             );
+        }
+    }
+
+    // YARA matches (only when --rules was given)
+    if !yara_matches.is_empty() {
+        section_header(&format!("yara ({})", yara_matches.len()));
+        for m in &yara_matches {
+            print_yara_match(m);
         }
     }
 
@@ -682,6 +710,70 @@ fn cmd_scan(file: &str, as_json: bool) -> Result<()> {
             h.name.style(st),
             format!("[{}] {} · {}", h.category, loc, h.note).style(faint()),
         );
+    }
+    Ok(())
+}
+
+fn print_yara_match(m: &yara::RuleMatch) {
+    let tags = if m.tags.is_empty() {
+        String::new()
+    } else {
+        format!("  [{}]", m.tags.join(", "))
+    };
+    println!(
+        "  {} {}{}",
+        "◆".style(red()),
+        m.rule.style(red()).bold(),
+        tags.style(faint())
+    );
+    if m.namespace != "default" {
+        println!(
+            "      {}",
+            format!("namespace: {}", m.namespace).style(faint())
+        );
+    }
+    for (k, v) in &m.meta {
+        println!("      {}", format!("{k}: {v}").style(faint()));
+    }
+    if !m.patterns.is_empty() {
+        let p: Vec<String> = m
+            .patterns
+            .iter()
+            .map(|(id, n)| {
+                if *n > 1 {
+                    format!("{id}×{n}")
+                } else {
+                    id.clone()
+                }
+            })
+            .collect();
+        println!(
+            "      {}",
+            format!("strings: {}", p.join(", ")).style(muted())
+        );
+    }
+}
+
+fn cmd_yara(rules: &str, file: &str, as_json: bool) -> Result<()> {
+    let bytes = load(file)?;
+    let (compiled, rule_count) = yara::compile(rules)?;
+    let matches = yara::scan(&compiled, &bytes)?;
+
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&matches)?);
+        return Ok(());
+    }
+
+    section_header(&format!("yara — {} matched", matches.len()));
+    if matches.is_empty() {
+        println!(
+            "  {}",
+            format!("no matches ({rule_count} rule source(s) compiled)").style(faint())
+        );
+        return Ok(());
+    }
+    for m in &matches {
+        print_yara_match(m);
     }
     Ok(())
 }

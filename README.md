@@ -40,7 +40,11 @@ One tool, many jobs — the point of a Swiss-army knife:
 | `knife hex FILE --off O --len L` | hex dump |
 | `knife map FILE --buckets N` | whole-file entropy sparkline, packed regions flagged |
 | `knife scan FILE` | crypto constants, packer markers, embedded formats |
+| `knife yara RULES FILE` | match YARA rules (RULES = a file or a directory) |
 | `knife ls FILE` | archive (.a/.lib) members |
+
+`knife FILE --rules RULES` runs the YARA pass as part of the full report and
+folds matches into the verdict.
 
 Add `--json` to any analysis command for machine-readable output.
 
@@ -52,6 +56,17 @@ three: a signed Windows DLL, a stripped RISC-V ELF, and a macOS x86-64 Mach-O.
 
 Disassembly is x86/x64 via `iced-x86`; other architectures are reported as
 unsupported rather than guessed at.
+
+## YARA
+
+`knife yara rules.yar sample` runs YARA rules through
+[yara-x](https://github.com/VirusTotal/yara-x), VirusTotal's pure-Rust engine,
+so there is no libyara C dependency and the cross-platform build stays clean.
+`RULES` may be a single `.yar`/`.yara` file or a directory that is walked
+recursively. Each match reports the rule name, tags, metadata, and which
+strings hit (with counts). Passing `--rules` to the main report folds matches
+into the triage score — a hit is weighted heavily, capped so one noisy ruleset
+cannot dominate.
 
 ## Constant scanning
 

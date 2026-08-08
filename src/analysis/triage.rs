@@ -39,7 +39,7 @@ pub struct TriageResult {
     pub signals: Vec<Signal>,
 }
 
-pub fn run(bin: &Binary, matches: &[Match]) -> TriageResult {
+pub fn run(bin: &Binary, matches: &[Match], yara_hits: &[String]) -> TriageResult {
     let mut signals = Vec::new();
     let mut score = 0i32;
     let mut add = |text: String, weight: i32, kind: &'static str, signals: &mut Vec<Signal>| {
@@ -196,6 +196,19 @@ pub fn run(bin: &Binary, matches: &[Match]) -> TriageResult {
         add(
             "Injection/theft capability in a packed binary".into(),
             2,
+            "bad",
+            &mut signals,
+        );
+    }
+
+    // A YARA match is a strong, curated signal. Weight it heavily but cap the
+    // contribution so one noisy ruleset cannot alone dominate the score.
+    if !yara_hits.is_empty() {
+        let w = (3 * yara_hits.len() as i32).min(8);
+        let names = yara_hits.join(", ");
+        add(
+            format!("YARA: {} rule(s) matched — {names}", yara_hits.len()),
+            w,
             "bad",
             &mut signals,
         );
