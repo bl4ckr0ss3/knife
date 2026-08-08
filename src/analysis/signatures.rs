@@ -77,10 +77,7 @@ fn is_pe_at(bytes: &[u8], off: usize) -> bool {
     ]) as usize;
     let pe = off + e_lfanew;
     // reject absurd offsets and require the PE signature to actually be there
-    e_lfanew >= 0x40
-        && e_lfanew < 0x1000
-        && pe + 4 <= bytes.len()
-        && &bytes[pe..pe + 4] == b"PE\0\0"
+    (0x40..0x1000).contains(&e_lfanew) && pe + 4 <= bytes.len() && &bytes[pe..pe + 4] == b"PE\0\0"
 }
 
 fn section_at(bin: &Binary, off: u64) -> Option<String> {
