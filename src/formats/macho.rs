@@ -1,7 +1,7 @@
 //! Mach-O → Binary. Fat binaries: the first architecture slice is used.
 
 use super::mk_section;
-use crate::model::{Arch, Binary, Format, ImportedLib};
+use crate::model::{Arch, Binary, Format, HardeningFacts, ImportedLib};
 use anyhow::{bail, Result};
 use goblin::mach::{Mach, MachO};
 
@@ -78,6 +78,24 @@ fn build_one(path: &str, bytes: &[u8], m: MachO) -> Binary {
         .map(|v| v.into_iter().map(|e| e.name).collect())
         .unwrap_or_default();
 
+    // Mitigation facts. Mach-O keeps its hardening opt-ins in the header flags
+    // word, with the code signature and the __RESTRICT segment as separate
+    // load-command and segment evidence.
+    let code_signature = m.load_commands.iter().any(|lc| {
+        matches!(
+            lc.command,
+            goblin::mach::load_command::CommandVariant::CodeSignature(_)
+        )
+    });
+    let restrict_segment = m
+        .segments
+        .iter()
+        .any(|seg| seg.name().is_ok_and(|n| n.starts_with("__RESTRICT")));
+    let stack_chk = imports
+        .iter()
+        .flat_map(|l| l.functions.iter())
+        .any(|n| n.trim_start_matches('_').starts_with("stack_chk"));
+
     let mut notes = vec!["Mach-O".to_string()];
     notes.push(if is64 {
         "64-bit".into()
@@ -108,8 +126,15 @@ fn build_one(path: &str, bytes: &[u8], m: MachO) -> Binary {
         overlay_off: None,
         overlay_size: 0,
         overlay_entropy: 0.0,
-        has_signature: false,
+        has_signature: code_signature,
         sig_region: None,
+        hardening: HardeningFacts {
+            macho_flags: Some(m.header.flags),
+            code_signature,
+            restrict_segment,
+            stack_chk,
+            ..Default::default()
+        },
         notes,
     }
 }

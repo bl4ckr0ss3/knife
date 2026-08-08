@@ -2,9 +2,9 @@
 # The `knife` name is taken on crates.io, so the crate publishes as `reknife`
 # while the installed command stays `knife` (see [[bin]] below).
 name = "reknife"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "A reverse engineer's binary Swiss-army knife: parse, triage, and disassemble PE/ELF/Mach-O. Installs as `knife`."
 license = "MIT"
 authors = ["0xblack"]
@@ -44,6 +44,7 @@ memmap2 = "0.9"
 owo-colors = "4"
 anyhow = "1"
 yara-x = "1.5.0"
+ratatui = "0.30"
 
 [profile.release]
 opt-level = 3

@@ -42,11 +42,12 @@ pub fn kind_style(kind: &str) -> Style {
 }
 
 /// Bracketed status marker in the classic tool style:
-/// `[-]` bad, `[=]` warning, `[+]` informational/good.
+/// `[-]` bad, `[=]` warning, `[+]` informational/good, `[ ]` not applicable.
 pub fn marker(kind: &str) -> &'static str {
     match kind {
         "bad" => "[-]",
         "warn" => "[=]",
+        "na" => "[ ]",
         _ => "[+]",
     }
 }

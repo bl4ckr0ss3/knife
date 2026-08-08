@@ -3,11 +3,17 @@
 //! Parse, triage, and disassemble PE / ELF / Mach-O. One binary, no runtime.
 
 mod analysis;
+mod db;
 mod formats;
+mod listing;
 mod model;
 mod output;
+mod tui;
 
-use analysis::{capabilities, disasm, engine, hashes, signatures, strings as strs, triage, yara};
+use analysis::{
+    capabilities, disasm, engine, hardening, hashes, signatures, sinks, strings as strs, triage,
+    yara,
+};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use model::Binary;
@@ -26,6 +32,10 @@ struct Cli {
     /// Emit machine-readable JSON instead of the terminal report.
     #[arg(long, global = true)]
     json: bool,
+
+    /// Use this annotation database instead of the one keyed by file hash.
+    #[arg(long, global = true, value_name = "PATH")]
+    db: Option<String>,
 
     #[command(subcommand)]
     cmd: Command,
@@ -49,6 +59,19 @@ enum Command {
     Exports { file: String },
     /// Capabilities inferred from imports/symbols.
     Caps { file: String },
+    /// Audit exploit mitigations (ASLR, NX, canaries, RELRO, CFG, ...).
+    Sec { file: String },
+    /// Dangerous-API call sites: the attack surface, with where each is called.
+    Sinks {
+        file: String,
+        /// Only this class (memory, format, exec, alloc, stack, path, random,
+        /// privilege).
+        #[arg(long)]
+        class: Option<String>,
+        /// Show every call site instead of the first few per API.
+        #[arg(long)]
+        all: bool,
+    },
     /// Extract printable strings.
     Strings {
         file: String,
@@ -74,6 +97,51 @@ enum Command {
         #[arg(long)]
         func: Option<String>,
     },
+    /// Find what references a function, import, address, or string.
+    Xrefs {
+        file: String,
+        /// Function name, imported API, or address to look up.
+        target: Option<String>,
+        /// Instead of a symbol, find references to strings containing this text.
+        #[arg(long)]
+        str: Option<String>,
+    },
+    /// Show how a sink is reached: call chains from entry points and exports.
+    Paths {
+        file: String,
+        /// Function, imported API, or address to reach.
+        target: String,
+        /// Start only from this function instead of every entry point/export.
+        #[arg(long)]
+        from: Option<String>,
+        /// Maximum number of chains to print.
+        #[arg(long, default_value_t = 10)]
+        max: usize,
+    },
+    /// Name an address, so every later command calls it that.
+    Name {
+        file: String,
+        /// Address to name.
+        addr: String,
+        /// The name. Omit with --clear to remove it.
+        name: Option<String>,
+        /// Forget the name and note stored at this address.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Leave a note at an address; it shows up in the disassembly.
+    Note {
+        file: String,
+        addr: String,
+        text: Option<String>,
+        /// Forget the name and note stored at this address.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Show everything stored for a binary.
+    Db { file: String },
+    /// Open the interactive view: functions, listing, xrefs, naming and notes.
+    Tui { file: String },
     /// Recover and list functions (control-flow analysis, x86/x64).
     Funcs {
         file: String,
@@ -119,10 +187,18 @@ fn real_main() -> Result<()> {
         "imports",
         "exports",
         "caps",
+        "sec",
+        "sinks",
         "strings",
         "iocs",
         "hashes",
         "dis",
+        "xrefs",
+        "paths",
+        "name",
+        "note",
+        "db",
+        "tui",
         "hex",
         "map",
         "scan",
@@ -146,6 +222,10 @@ fn real_main() -> Result<()> {
         Command::Imports { file } => cmd_imports(&file, cli.json),
         Command::Exports { file } => cmd_exports(&file, cli.json),
         Command::Caps { file } => cmd_caps(&file, cli.json),
+        Command::Sec { file } => cmd_sec(&file, cli.json),
+        Command::Sinks { file, class, all } => {
+            cmd_sinks(&file, class.as_deref(), all, cli.json, cli.db.as_deref())
+        }
         Command::Strings { file, min } => cmd_strings(&file, min, cli.json),
         Command::Iocs { file } => cmd_iocs(&file, cli.json),
         Command::Hashes { file } => cmd_hashes(&file, cli.json),
@@ -155,8 +235,56 @@ fn real_main() -> Result<()> {
             vaddr,
             off,
             func,
-        } => cmd_dis(&file, count, vaddr, off, func),
-        Command::Funcs { file, by_refs } => cmd_funcs(&file, by_refs, cli.json),
+        } => cmd_dis(&file, count, vaddr, off, func, cli.db.as_deref()),
+        Command::Xrefs { file, target, str } => cmd_xrefs(
+            &file,
+            target.as_deref(),
+            str.as_deref(),
+            cli.json,
+            cli.db.as_deref(),
+        ),
+        Command::Paths {
+            file,
+            target,
+            from,
+            max,
+        } => cmd_paths(
+            &file,
+            &target,
+            from.as_deref(),
+            max,
+            cli.json,
+            cli.db.as_deref(),
+        ),
+        Command::Name {
+            file,
+            addr,
+            name,
+            clear,
+        } => cmd_annotate(
+            &file,
+            &addr,
+            name.as_deref(),
+            None,
+            clear,
+            cli.db.as_deref(),
+        ),
+        Command::Note {
+            file,
+            addr,
+            text,
+            clear,
+        } => cmd_annotate(
+            &file,
+            &addr,
+            None,
+            text.as_deref(),
+            clear,
+            cli.db.as_deref(),
+        ),
+        Command::Db { file } => cmd_db(&file, cli.db.as_deref(), cli.json),
+        Command::Tui { file } => cmd_tui(&file, cli.db.as_deref()),
+        Command::Funcs { file, by_refs } => cmd_funcs(&file, by_refs, cli.json, cli.db.as_deref()),
         Command::Hex { file, off, len } => cmd_hex(&file, off, len),
         Command::Map { file, buckets } => cmd_map(&file, buckets, cli.json),
         Command::Scan { file } => cmd_scan(&file, cli.json),
@@ -171,6 +299,181 @@ fn load(file: &str) -> Result<Vec<u8>> {
 
 fn parse(file: &str, bytes: &[u8]) -> Result<Binary> {
     formats::analyze(file, bytes)
+}
+
+/// Open the annotation database for a target. Identity is the file's content,
+/// so the work follows the bytes rather than the path they arrived at.
+fn open_db(file: &str, bytes: &[u8], explicit: Option<&str>) -> Result<db::Db> {
+    db::Db::load(&hashes::sha256_hex(bytes), file, explicit)
+}
+
+/// Addresses are shown and typed as virtual addresses but stored relative to
+/// the image base, so a database stays valid if the image is ever rebased.
+fn to_stored(bin: &Binary, va: u64) -> u64 {
+    va.wrapping_sub(engine::display_base(bin))
+}
+
+/// Everything the code-analysis commands work from: the bytes, the parsed
+/// model, your stored annotations, and the engine's view with those annotations
+/// already folded in.
+struct Session {
+    bin: Binary,
+    bytes: Vec<u8>,
+    db: db::Db,
+    an: engine::Analysis,
+}
+
+impl Session {
+    /// `need` names the thing that requires a disassembler, so the error can
+    /// say which capability is unavailable rather than just "unsupported".
+    fn open(file: &str, db_path: Option<&str>, budget: usize, need: &str) -> Result<Session> {
+        let bytes = load(file)?;
+        let bin = parse(file, &bytes)?;
+        if !disasm::supported(bin.arch) {
+            anyhow::bail!(
+                "{need} needs x86/x64 disassembly; this is {}",
+                bin.arch.label()
+            );
+        }
+        let store = open_db(file, &bytes, db_path)?;
+        let an = engine::analyze(&bin, &bytes, budget, &store);
+        Ok(Session {
+            bin,
+            bytes,
+            db: store,
+            an,
+        })
+    }
+}
+
+fn cmd_annotate(
+    file: &str,
+    addr: &str,
+    name: Option<&str>,
+    note: Option<&str>,
+    clear: bool,
+    db_path: Option<&str>,
+) -> Result<()> {
+    let bytes = load(file)?;
+    let bin = parse(file, &bytes)?;
+    let va = parse_num(addr).with_context(|| format!("'{addr}' is not an address"))?;
+    let at = to_stored(&bin, va);
+    let mut store = open_db(file, &bytes, db_path)?;
+
+    if clear {
+        let (n, c) = store.clear(at);
+        if n.is_none() && c.is_none() {
+            anyhow::bail!("nothing stored at 0x{va:x}");
+        }
+        store.save()?;
+        println!("  {} 0x{va:x}", "cleared".style(faint()));
+        return Ok(());
+    }
+
+    match (name, note) {
+        (Some(n), _) => {
+            store.set_name(at, n);
+            println!("  {} 0x{va:x}  {}", "named".style(faint()), n.style(mint()));
+        }
+        (_, Some(t)) => {
+            store.set_note(at, t);
+            println!(
+                "  {} 0x{va:x}  {}",
+                "noted".style(faint()),
+                t.style(muted())
+            );
+        }
+        (None, None) => anyhow::bail!("give a value, or --clear to remove what is there"),
+    }
+    store.save()?;
+    Ok(())
+}
+
+fn cmd_tui(file: &str, db_path: Option<&str>) -> Result<()> {
+    let sess = Session::open(file, db_path, 2_000_000, "the interactive view")?;
+    if sess.an.functions.is_empty() {
+        anyhow::bail!("no functions were recovered, so there is nothing to browse");
+    }
+    let title = basename(file).to_string();
+    let app = tui::App::new(sess.bin, sess.bytes, sess.db, sess.an, title);
+    tui::run(app)
+}
+
+fn cmd_db(file: &str, db_path: Option<&str>, as_json: bool) -> Result<()> {
+    let bytes = load(file)?;
+    let bin = parse(file, &bytes)?;
+    let store = open_db(file, &bytes, db_path)?;
+    let base = engine::display_base(&bin);
+
+    if as_json {
+        let mut addrs: Vec<u64> = store
+            .names
+            .keys()
+            .chain(store.notes.keys())
+            .copied()
+            .collect();
+        addrs.sort_unstable();
+        addrs.dedup();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "sha256": store.sha256,
+                "path": store.path().map(|p| p.display().to_string()),
+                "entries": addrs.iter().map(|a| json!({
+                    "addr": a + base,
+                    "name": store.names.get(a),
+                    "note": store.notes.get(a),
+                })).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+
+    section_header(&format!(
+        "database ({} entr{})",
+        store.len(),
+        if store.len() == 1 { "y" } else { "ies" }
+    ));
+    if let Some(p) = store.path() {
+        kv("file", p.display());
+    }
+    kv("sha256", &store.sha256);
+
+    if store.is_empty() {
+        println!();
+        println!(
+            "  {}",
+            "nothing stored yet; `knife name` and `knife note` write here".style(faint())
+        );
+        return Ok(());
+    }
+
+    let mut addrs: Vec<u64> = store
+        .names
+        .keys()
+        .chain(store.notes.keys())
+        .copied()
+        .collect();
+    addrs.sort_unstable();
+    addrs.dedup();
+
+    println!();
+    for a in addrs {
+        let shown = a + base;
+        let name = store.names.get(&a).map(String::as_str).unwrap_or("");
+        println!(
+            "  {}  {:<28} {}",
+            format!("0x{shown:x}").style(faint()),
+            name.style(mint()),
+            store
+                .notes
+                .get(&a)
+                .map(String::as_str)
+                .unwrap_or("")
+                .style(muted()),
+        );
+    }
+    Ok(())
 }
 
 // ── info ─────────────────────────────────────────────────────────────────
@@ -293,6 +596,36 @@ fn cmd_info(file: &str, rules: Option<&str>, as_json: bool) -> Result<()> {
             marker(s.kind).style(kind_style(s.kind)),
             s.text,
             w.style(faint())
+        );
+    }
+
+    // mitigations, one line; `knife sec` carries the reasoning
+    let sec = hardening::run(&bin);
+    if !sec.findings.is_empty() {
+        section_header("mitigations");
+        let cells: Vec<String> = sec
+            .findings
+            .iter()
+            .filter(|f| f.state != hardening::State::NotApplicable)
+            .map(|f| {
+                let st = match f.state {
+                    hardening::State::On => mint(),
+                    hardening::State::Partial => amber(),
+                    _ => red(),
+                };
+                format!("{} {}", marker(f.state.kind()).style(st), f.name.style(st))
+            })
+            .collect();
+        println!("  {}", cells.join("   "));
+        println!(
+            "  {}",
+            format!(
+                "{} · {} of {} missing or weakened · run `knife sec` for detail",
+                sec.exposure.label(),
+                sec.missing,
+                sec.applicable
+            )
+            .style(faint())
         );
     }
 
@@ -520,6 +853,184 @@ fn cmd_caps(file: &str, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_sec(file: &str, as_json: bool) -> Result<()> {
+    let bytes = load(file)?;
+    let bin = parse(file, &bytes)?;
+    let rep = hardening::run(&bin);
+
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&rep)?);
+        return Ok(());
+    }
+
+    if rep.findings.is_empty() {
+        anyhow::bail!(
+            "no mitigation model for {} binaries",
+            bin.format.label().to_lowercase()
+        );
+    }
+
+    section_header("mitigations");
+    for f in &rep.findings {
+        let st = match f.state {
+            hardening::State::On => mint(),
+            hardening::State::Partial => amber(),
+            hardening::State::Off => red(),
+            hardening::State::NotApplicable => faint(),
+        };
+        println!(
+            "  {} {:<20} {:<10} {}",
+            marker(f.state.kind()).style(st),
+            f.name.style(st),
+            f.state.label().style(st),
+            f.detail.style(muted()),
+        );
+        // The consequence line is the point of the command, so it is always
+        // printed rather than hidden behind a verbose flag.
+        println!("  {:<4}{}", "", f.impact.style(faint()));
+    }
+
+    let style = match rep.exposure {
+        hardening::Exposure::Hardened => mint(),
+        hardening::Exposure::Moderate => muted(),
+        hardening::Exposure::Weak => amber(),
+        hardening::Exposure::Bare => red(),
+    };
+    println!();
+    println!(
+        "  {}   {}",
+        rep.exposure.label().style(style).bold(),
+        format!(
+            "exposure score {} · {} of {} mitigations missing or weakened",
+            rep.score, rep.missing, rep.applicable
+        )
+        .style(faint())
+    );
+    Ok(())
+}
+
+fn cmd_sinks(
+    file: &str,
+    class: Option<&str>,
+    all: bool,
+    as_json: bool,
+    db_path: Option<&str>,
+) -> Result<()> {
+    let s = Session::open(file, db_path, 2_000_000, "call-site recovery")?;
+    let an = &s.an;
+    let mut hits = sinks::find(an);
+    if let Some(c) = class {
+        hits.retain(|h| h.class.eq_ignore_ascii_case(c));
+    }
+
+    if as_json {
+        // Addresses are shifted into display space so they match every other
+        // command's output and can be pasted straight into a debugger.
+        let out: Vec<_> = hits
+            .iter()
+            .map(|h| {
+                json!({
+                    "api": h.api, "class": h.class, "note": h.note,
+                    "severity": h.severity, "local": h.local,
+                    "via": h.via.iter().map(|a| a + an.display_base).collect::<Vec<_>>(),
+                    "sites": h.sites.iter().map(|s| json!({
+                        "from": s.from + an.display_base,
+                        "in": s.in_func, "offset": s.at_off,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    let total: usize = hits.iter().map(|h| h.sites.len()).sum();
+    section_header(&format!(
+        "sinks ({} APIs, {} call sites)",
+        hits.len(),
+        total
+    ));
+    if hits.is_empty() {
+        println!("  {}", "no catalogued sink is imported".style(faint()));
+        return Ok(());
+    }
+
+    let cluster = sinks::cluster(&hits);
+    let line: Vec<String> = cluster.iter().map(|(k, v)| format!("{k} ×{v}")).collect();
+    println!("  {}", line.join("   ").style(amber()));
+    println!();
+
+    for h in &hits {
+        let st = match h.severity {
+            3 => red(),
+            2 => amber(),
+            _ => muted(),
+        };
+        let kind = match h.severity {
+            3 => "bad",
+            2 => "warn",
+            _ => "info",
+        };
+        println!(
+            "  {} {:<22} {:<10} {:<7} {}",
+            marker(kind).style(st),
+            h.api.style(st).bold(),
+            format!("{} site{}", h.sites.len(), plural(h.sites.len())).style(faint()),
+            h.origin().style(faint()),
+            h.note.style(faint()),
+        );
+
+        if h.is_unreferenced() {
+            println!(
+                "  {:<4}{}",
+                "",
+                "present but no call site recovered".style(faint())
+            );
+            continue;
+        }
+        // A long tail of call sites buries the rest of the report, so the
+        // default shows enough to start on and `--all` shows the whole list.
+        let cap = if all { usize::MAX } else { 6 };
+        for s in h.sites.iter().take(cap) {
+            let at = s.from + an.display_base;
+            let site = match &s.in_func {
+                Some(f) if s.at_off > 0 => format!("{f}+0x{:x}", s.at_off),
+                Some(f) => f.clone(),
+                None => "-".into(),
+            };
+            println!(
+                "  {:<4}{}  {}",
+                "",
+                format!("0x{at:x}").style(faint()),
+                site.style(muted())
+            );
+        }
+        if h.sites.len() > cap {
+            println!(
+                "  {:<4}{}",
+                "",
+                format!("… and {} more (--all)", h.sites.len() - cap).style(faint())
+            );
+        }
+    }
+
+    if an.truncated {
+        println!(
+            "  {}",
+            "analysis budget reached, call sites may be incomplete".style(amber())
+        );
+    }
+    Ok(())
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
 fn cmd_strings(file: &str, min: usize, as_json: bool) -> Result<()> {
     let bytes = load(file)?;
     let out = strs::extract(&bytes, min);
@@ -601,7 +1112,15 @@ fn cmd_dis(
     vaddr: Option<String>,
     off: Option<String>,
     func: Option<String>,
+    db_path: Option<&str>,
 ) -> Result<()> {
+    // Function mode: recover the CFG and print the whole function with labels,
+    // resolved call targets, cross-references, and your notes.
+    if let Some(sel) = func {
+        let sess = Session::open(file, db_path, 500_000, "disassembly")?;
+        return dis_function(&sess, &sel);
+    }
+
     let bytes = load(file)?;
     let bin = parse(file, &bytes)?;
     if !disasm::supported(bin.arch) {
@@ -609,12 +1128,6 @@ fn cmd_dis(
             "disassembly supports x86/x64 only; this is {}",
             bin.arch.label()
         );
-    }
-
-    // Function mode: recover the CFG and print the whole function with labels,
-    // resolved call targets, and cross-references.
-    if let Some(sel) = func {
-        return dis_function(&bin, &bytes, &sel);
     }
 
     let (foff, va) = if let Some(o) = off {
@@ -635,16 +1148,258 @@ fn cmd_dis(
     Ok(())
 }
 
-fn cmd_funcs(file: &str, by_refs: bool, as_json: bool) -> Result<()> {
-    let bytes = load(file)?;
-    let bin = parse(file, &bytes)?;
-    if !disasm::supported(bin.arch) {
-        anyhow::bail!(
-            "control-flow analysis supports x86/x64 only; this is {}",
-            bin.arch.label()
+/// One reference, rendered the same way whatever it points at.
+fn print_xref(an: &engine::Analysis, x: &engine::Xref) {
+    let from = x.from + an.display_base;
+    let site = match an.function_at(x.from) {
+        Some(f) => {
+            let off = x.from.saturating_sub(f.addr);
+            if off == 0 {
+                f.name.clone()
+            } else {
+                format!("{}+0x{off:x}", f.name)
+            }
+        }
+        None => "-".to_string(),
+    };
+    let st = match x.kind {
+        engine::XrefKind::Call => mint(),
+        engine::XrefKind::Data => muted(),
+        _ => amber(),
+    };
+    println!(
+        "  {}  {:<7} {}",
+        format!("0x{from:x}").style(faint()),
+        x.kind.label().style(st),
+        site,
+    );
+}
+
+fn cmd_xrefs(
+    file: &str,
+    target: Option<&str>,
+    needle: Option<&str>,
+    as_json: bool,
+    db_path: Option<&str>,
+) -> Result<()> {
+    let sess = Session::open(file, db_path, 2_000_000, "cross-references")?;
+    let (an, bin, bytes) = (&sess.an, &sess.bin, &sess.bytes);
+    let base = engine::display_base(bin);
+
+    // String mode: locate the literals, then ask what points at them.
+    if let Some(needle) = needle {
+        let lower = needle.to_lowercase();
+        let mut rows = Vec::new();
+        for s in strs::extract_located(bytes, 4) {
+            if !s.text.to_lowercase().contains(&lower) {
+                continue;
+            }
+            let Some(va) = engine::off_to_va(bin, base, s.off) else {
+                continue;
+            };
+            let Some(refs) = an.xrefs_to.get(&va) else {
+                continue;
+            };
+            rows.push((va, s, refs));
+        }
+
+        if as_json {
+            let out: Vec<_> = rows
+                .iter()
+                .map(|(va, s, refs)| {
+                    json!({
+                        "addr": va, "text": s.text, "wide": s.wide,
+                        "refs": refs.iter().map(|x| json!({
+                            "from": x.from + an.display_base,
+                            "kind": x.kind.label(),
+                            "in": an.function_at(x.from).map(|f| f.name.clone()),
+                        })).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            return Ok(());
+        }
+
+        section_header(&format!("strings matching '{needle}', referenced"));
+        if rows.is_empty() {
+            println!(
+                "  {}",
+                "no referenced string matched (unreferenced strings are not listed)".style(faint())
+            );
+            return Ok(());
+        }
+        for (va, s, refs) in &rows {
+            println!(
+                "  {}  {}",
+                format!("0x{va:x}").style(accent()),
+                format!("{:?}", s.text).style(muted())
+            );
+            for x in refs.iter() {
+                print_xref(an, x);
+            }
+        }
+        return Ok(());
+    }
+
+    let Some(target) = target else {
+        anyhow::bail!("give a symbol, an address, or --str <text>");
+    };
+
+    let addrs = an.resolve(target, parse_num(target).ok());
+    if addrs.is_empty() {
+        anyhow::bail!("nothing named '{target}' (try `knife funcs` or `knife imports`)");
+    }
+
+    if as_json {
+        let out: Vec<_> = addrs
+            .iter()
+            .map(|a| {
+                let refs = an.xrefs_to.get(a).map(Vec::as_slice).unwrap_or(&[]);
+                json!({
+                    "addr": a + an.display_base,
+                    "name": an.label(*a),
+                    "refs": refs.iter().map(|x| json!({
+                        "from": x.from + an.display_base,
+                        "kind": x.kind.label(),
+                        "in": an.function_at(x.from).map(|f| f.name.clone()),
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    let total: usize = addrs
+        .iter()
+        .map(|a| an.xrefs_to.get(a).map_or(0, Vec::len))
+        .sum();
+    section_header(&format!("xrefs to {target} ({total})"));
+
+    for a in &addrs {
+        let shown = a + an.display_base;
+        println!(
+            "  {} {}",
+            format!("0x{shown:x}").style(accent()),
+            an.label(*a).style(mint())
+        );
+        match an.xrefs_to.get(a) {
+            Some(refs) => {
+                for x in refs {
+                    print_xref(an, x);
+                }
+            }
+            None => println!("  {}", "no references".style(faint())),
+        }
+    }
+    if an.truncated {
+        println!(
+            "  {}",
+            "analysis budget reached, references may be incomplete".style(amber())
         );
     }
-    let an = engine::analyze(&bin, &bytes, 500_000);
+    Ok(())
+}
+
+fn cmd_paths(
+    file: &str,
+    target: &str,
+    from: Option<&str>,
+    max: usize,
+    as_json: bool,
+    db_path: Option<&str>,
+) -> Result<()> {
+    let sess = Session::open(file, db_path, 2_000_000, "call-graph search")?;
+    let (an, bin) = (&sess.an, &sess.bin);
+
+    let targets = an.resolve(target, parse_num(target).ok());
+    if targets.is_empty() {
+        anyhow::bail!("nothing named '{target}' (try `knife funcs` or `knife imports`)");
+    }
+
+    // Roots are the places control enters from outside: the entry point and
+    // every export. Narrowing with --from asks the more specific question,
+    // "is it reachable from *this* function".
+    let roots: Vec<u64> = match from {
+        Some(f) => {
+            let r = an.resolve(f, parse_num(f).ok());
+            if r.is_empty() {
+                anyhow::bail!("no function '{f}' to start from");
+            }
+            r
+        }
+        None => {
+            let base = engine::display_base(bin);
+            let mut r: Vec<u64> = bin
+                .symbols
+                .iter()
+                .filter(|s| s.kind == model::SymKind::Export)
+                .map(|s| s.addr + base)
+                .collect();
+            r.push(bin.entry + base);
+            r
+        }
+    };
+
+    let mut chains: Vec<Vec<u64>> = Vec::new();
+    for t in &targets {
+        chains.extend(an.paths_to(*t, &roots, max, from.is_some()));
+        if chains.len() >= max {
+            break;
+        }
+    }
+    chains.sort_by_key(|c| c.len());
+    chains.truncate(max);
+
+    if as_json {
+        let out: Vec<_> = chains
+            .iter()
+            .map(|c| {
+                c.iter()
+                    .map(|a| json!({"addr": a + an.display_base, "name": an.label(*a)}))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    section_header(&format!("paths to {target} ({})", chains.len()));
+    if chains.is_empty() {
+        let origin = match from {
+            Some(f) => format!("no call chain from {f} reaches it"),
+            None => "no call chain from an entry point or export reaches it".to_string(),
+        };
+        println!("  {}", origin.style(faint()));
+        println!(
+            "  {}",
+            "it may be reached indirectly, which static analysis cannot follow".style(faint())
+        );
+        return Ok(());
+    }
+
+    for c in &chains {
+        println!();
+        for (i, a) in c.iter().enumerate() {
+            let shown = a + an.display_base;
+            let arrow = if i == 0 { " " } else { "→" };
+            let st = if i + 1 == c.len() { red() } else { muted() };
+            println!(
+                "  {}{}  {} {}",
+                "  ".repeat(i.min(8)),
+                arrow.style(faint()),
+                format!("0x{shown:x}").style(faint()),
+                an.label(*a).style(st),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_funcs(file: &str, by_refs: bool, as_json: bool, db_path: Option<&str>) -> Result<()> {
+    let sess = Session::open(file, db_path, 500_000, "control-flow analysis")?;
+    let an = &sess.an;
 
     let mut funcs: Vec<&engine::Function> = an.functions.iter().collect();
     if by_refs {
@@ -701,8 +1456,8 @@ fn cmd_funcs(file: &str, by_refs: bool, as_json: bool) -> Result<()> {
     Ok(())
 }
 
-fn dis_function(bin: &crate::model::Binary, bytes: &[u8], sel: &str) -> Result<()> {
-    let an = engine::analyze(bin, bytes, 500_000);
+fn dis_function(sess: &Session, sel: &str) -> Result<()> {
+    let an = &sess.an;
 
     // Resolve the selector: a name, or an address (with or without image base).
     let func = if let Some(f) = an.find_by_name(sel) {
@@ -747,38 +1502,33 @@ fn dis_function(bin: &crate::model::Binary, bytes: &[u8], sel: &str) -> Result<(
     }
     println!();
 
-    for (i, block) in func.blocks.iter().enumerate() {
-        if i > 0 {
-            // label incoming block if referenced
-            let la = block.start + an.display_base;
-            println!("  {}:", format!("loc_{la:x}").style(amber()));
-        }
-        for ins in &block.insns {
-            let a = ins.addr + an.display_base;
-            let (mn, rest) = ins.text.split_once(' ').unwrap_or((ins.text.as_str(), ""));
-
-            // annotate branch/call targets
-            let annot = if let Some(name) = &ins.target_name {
-                format!("  ; {}", name).style(mint()).to_string()
-            } else if let Some(t) = ins.target {
-                let ta = t + an.display_base;
-                let lbl = if an.find_function(t).is_some() {
-                    an.label(t)
-                } else {
-                    format!("loc_{ta:x}")
-                };
-                format!("  ; {}", lbl).style(faint()).to_string()
-            } else {
-                String::new()
-            };
-
-            println!(
-                "  {}  {} {}{}",
-                format!("{a:012x}").style(faint()),
-                mn.style(accent()),
-                rest.style(muted()),
+    // The listing model is shared with the interactive view, so the two can
+    // never drift into showing different things.
+    for line in listing::function(an, func, &sess.db, engine::display_base(&sess.bin)) {
+        match line {
+            listing::Line::Label { text, .. } => println!("  {}:", text.style(amber())),
+            listing::Line::Insn {
+                addr,
+                mnemonic,
+                operands,
                 annot,
-            );
+                ..
+            } => {
+                let a = addr + an.display_base;
+                let annot = match annot {
+                    Some(listing::Annot::Note(t)) => format!("  ; {t}").style(amber()).to_string(),
+                    Some(listing::Annot::Symbol(t)) => format!("  ; {t}").style(mint()).to_string(),
+                    Some(listing::Annot::Local(t)) => format!("  ; {t}").style(faint()).to_string(),
+                    None => String::new(),
+                };
+                println!(
+                    "  {}  {} {}{}",
+                    format!("{a:012x}").style(faint()),
+                    mnemonic.style(accent()),
+                    operands.style(muted()),
+                    annot,
+                );
+            }
         }
     }
     Ok(())

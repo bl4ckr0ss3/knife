@@ -336,33 +336,8 @@ mod tests {
 
     #[test]
     fn finds_base64_and_sbox() {
-        let bin = crate::model::Binary {
-            path: "t".into(),
-            size: 0,
-            format: crate::model::Format::Unknown,
-            arch: crate::model::Arch::Other,
-            bits: 64,
-            endian_little: true,
-            is_lib: false,
-            is_stripped: false,
-            entry: 0,
-            image_base: 0,
-            subsystem: None,
-            timestamp: None,
-            sections: vec![],
-            imports: vec![],
-            exports: vec![],
-            symbols: vec![],
-            libs: vec![],
-            rpaths: vec![],
-            overall_entropy: 0.0,
-            overlay_off: None,
-            overlay_size: 0,
-            overlay_entropy: 0.0,
-            has_signature: false,
-            sig_region: None,
-            notes: vec![],
-        };
+        let bin =
+            crate::model::Binary::stub(crate::model::Format::Unknown, crate::model::Arch::Other);
         let mut data = vec![0u8; 32];
         data.extend_from_slice(aes_sbox());
         data.extend_from_slice(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/");

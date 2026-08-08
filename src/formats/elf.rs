@@ -1,12 +1,19 @@
 //! ELF → Binary.
 
 use super::mk_section;
-use crate::model::{Arch, Binary, Format, ImportedLib, SymKind, Symbol};
+use crate::model::{Arch, Binary, Format, HardeningFacts, ImportedLib, SymKind, Symbol};
 use goblin::elf::Elf;
 
 const SHF_WRITE: u64 = 0x1;
 const SHF_ALLOC: u64 = 0x2;
 const SHF_EXECINSTR: u64 = 0x4;
+
+const PT_GNU_STACK: u32 = 0x6474_e551;
+const PT_GNU_RELRO: u32 = 0x6474_e552;
+const PF_X: u32 = 0x1;
+const DF_BIND_NOW: u64 = 0x8;
+const DF_1_NOW: u64 = 0x1;
+const DF_1_PIE: u64 = 0x0800_0000;
 
 pub fn build(path: &str, bytes: &[u8], elf: Elf) -> Binary {
     let arch = match elf.header.e_machine {
@@ -97,7 +104,88 @@ pub fn build(path: &str, bytes: &[u8], elf: Elf) -> Binary {
     collect_funcs(elf.syms.iter(), &elf.strtab);
     collect_funcs(elf.dynsyms.iter(), &elf.dynstrtab);
 
+    // Import slots. Every PLT/GOT relocation binds a slot address to a dynamic
+    // symbol, and the `.plt` stub that jumps through that slot is what code
+    // actually calls. Recording the slot is what later lets a `call` land on
+    // `strcpy@plt` instead of an anonymous `sub_`. dynrelas/dynrels are
+    // included because a full-RELRO build resolves everything eagerly and has
+    // no lazy PLT relocations at all.
+    for reloc in elf
+        .pltrelocs
+        .iter()
+        .chain(elf.dynrelas.iter())
+        .chain(elf.dynrels.iter())
+    {
+        if reloc.r_offset == 0 {
+            continue;
+        }
+        let Some(sym) = elf.dynsyms.get(reloc.r_sym) else {
+            continue;
+        };
+        let name = elf.dynstrtab.get_at(sym.st_name).unwrap_or("");
+        if !name.is_empty() {
+            symbols.push(Symbol {
+                addr: reloc.r_offset,
+                name: name.to_string(),
+                kind: SymKind::Import,
+            });
+        }
+    }
+
     let stripped = !elf.section_headers.iter().any(|sh| sh.sh_type == 2); // SHT_SYMTAB present == not stripped
+
+    // Mitigation facts. PT_GNU_STACK is tri-state on purpose: present-and-
+    // writable-only is the hardened case, present-and-executable is a real
+    // finding, and absent is also a finding because the loader then falls back
+    // to an executable stack.
+    let gnu_stack_exec = elf
+        .program_headers
+        .iter()
+        .find(|ph| ph.p_type == PT_GNU_STACK)
+        .map(|ph| ph.p_flags & PF_X != 0);
+    let gnu_relro = elf
+        .program_headers
+        .iter()
+        .any(|ph| ph.p_type == PT_GNU_RELRO);
+    // Full RELRO needs the GOT resolved eagerly at load; either spelling counts.
+    let (dyn_flags, dyn_flags_1) = elf
+        .dynamic
+        .as_ref()
+        .map(|d| (d.info.flags, d.info.flags_1))
+        .unwrap_or((0, 0));
+    let bind_now = dyn_flags & DF_BIND_NOW != 0
+        || dyn_flags_1 & DF_1_NOW != 0
+        || elf.dynamic.as_ref().is_some_and(|d| {
+            d.dyns
+                .iter()
+                .any(|e| e.d_tag == goblin::elf::dynamic::DT_BIND_NOW)
+        });
+    let textrel = elf.dynamic.as_ref().is_some_and(|d| d.info.textrel);
+
+    // A stack cookie shows up as a reference to the guard/fail helpers, and
+    // FORTIFY_SOURCE as the `_chk` libc variants. Both are symbol-level facts,
+    // so they survive stripping of local symbols.
+    let sym_names = || {
+        elf.dynsyms
+            .iter()
+            .filter_map(|s| elf.dynstrtab.get_at(s.st_name))
+            .chain(elf.syms.iter().filter_map(|s| elf.strtab.get_at(s.st_name)))
+    };
+    let stack_chk = sym_names().any(|n| n.starts_with("__stack_chk"));
+    let fortify_syms = {
+        let mut v: Vec<&str> = sym_names().filter(|n| n.ends_with("_chk")).collect();
+        v.sort_unstable();
+        v.dedup();
+        // `__stack_chk_fail` also ends in `_chk`-adjacent text; count only the
+        // fortified wrappers so the number means what it claims.
+        v.iter().filter(|n| !n.starts_with("__stack_chk")).count()
+    };
+
+    // ET_DYN alone does not mean PIE: shared libraries are ET_DYN too. A PIE
+    // executable is the one that also carries an interpreter (or says DF_1_PIE).
+    let is_pie_exe = elf.header.e_type == 3
+        && (elf.interpreter.is_some() || dyn_flags_1 & DF_1_PIE != 0)
+        && elf.entry != 0;
 
     let mut notes = Vec::new();
     notes.push(format!("ELF{}", if elf.is_64 { "64" } else { "32" }));
@@ -109,7 +197,11 @@ pub fn build(path: &str, bytes: &[u8], elf: Elf) -> Binary {
     match elf.header.e_type {
         1 => notes.push("relocatable".into()),
         2 => notes.push("executable".into()),
-        3 => notes.push("shared object / PIE".into()),
+        // ET_DYN covers both PIE programs and shared libraries; an interpreter
+        // is what tells them apart, and the distinction matters enough to a
+        // reader that it is worth making here rather than lumping them.
+        3 if is_pie_exe => notes.push("PIE executable".into()),
+        3 => notes.push("shared object".into()),
         4 => notes.push("core dump".into()),
         _ => {}
     }
@@ -126,7 +218,7 @@ pub fn build(path: &str, bytes: &[u8], elf: Elf) -> Binary {
         arch,
         bits: if elf.is_64 { 64 } else { 32 },
         endian_little: elf.little_endian,
-        is_lib: elf.header.e_type == 3,
+        is_lib: elf.header.e_type == 3 && !is_pie_exe,
         is_stripped: stripped,
         entry: elf.entry,
         image_base: 0,
@@ -149,6 +241,17 @@ pub fn build(path: &str, bytes: &[u8], elf: Elf) -> Binary {
         overlay_entropy: 0.0,
         has_signature: false,
         sig_region: None,
+        hardening: HardeningFacts {
+            gnu_stack_exec,
+            gnu_relro,
+            bind_now,
+            textrel,
+            has_interp: elf.interpreter.is_some(),
+            elf_type: elf.header.e_type,
+            stack_chk,
+            fortify_syms,
+            ..Default::default()
+        },
         notes,
     }
 }

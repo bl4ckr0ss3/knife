@@ -101,6 +101,10 @@ pub enum SymKind {
     Export,
     /// An imported function; `addr` is the IAT slot it is called through.
     Import,
+    /// A forwarding stub that jumps through an import slot: an ELF `.plt` entry
+    /// or a PE `jmp [IAT]` thunk. `addr` is the stub itself, which is what a
+    /// `call` instruction targets, and `name` is the import it reaches.
+    Thunk,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,6 +113,55 @@ pub struct Symbol {
     pub addr: u64,
     pub name: String,
     pub kind: SymKind,
+}
+
+/// The PE load configuration directory, where the linker records the pointers
+/// that make stack cookies and Control Flow Guard work. Its presence is what
+/// separates "the binary was built with the flag" from "the flag is in the
+/// header but nothing backs it".
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LoadConfig {
+    pub security_cookie: u64,
+    pub seh_table: u64,
+    pub seh_count: u64,
+    pub guard_flags: u32,
+    pub guard_cf_count: u64,
+}
+
+/// Raw container facts the mitigation audit reads. These are deliberately
+/// facts, not verdicts: each format module records only what its headers
+/// actually say, and `analysis::hardening` does all the interpreting, so the
+/// exploitability reasoning lives in one place instead of three.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct HardeningFacts {
+    // ── PE ──
+    pub dll_characteristics: Option<u16>,
+    pub load_config: Option<LoadConfig>,
+
+    // ── ELF ──
+    /// PT_GNU_STACK present and marked executable. `None` means the header is
+    /// absent entirely, which is its own finding: the loader then falls back to
+    /// an executable stack.
+    pub gnu_stack_exec: Option<bool>,
+    pub gnu_relro: bool,
+    pub bind_now: bool,
+    pub textrel: bool,
+    pub has_interp: bool,
+    /// Raw `e_type`. ET_DYN (3) covers both PIE programs and shared libraries,
+    /// so the audit reads it alongside `is_lib` rather than guessing from the
+    /// load address.
+    pub elf_type: u16,
+
+    // ── Mach-O ──
+    pub macho_flags: Option<u32>,
+    pub code_signature: bool,
+    pub restrict_segment: bool,
+
+    // ── derived from the symbol surface, so cross-format ──
+    /// `__stack_chk_fail` / `__stack_chk_guard` referenced.
+    pub stack_chk: bool,
+    /// Count of `_chk` fortified libc variants (`__memcpy_chk`, `__printf_chk`).
+    pub fortify_syms: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -141,6 +194,8 @@ pub struct Binary {
     /// must be excluded from overlay detection or every signed binary looks
     /// like it has a high-entropy appended payload.
     pub sig_region: Option<(u64, u64)>,
+    /// Container facts for the exploit-mitigation audit (`knife sec`).
+    pub hardening: HardeningFacts,
     pub notes: Vec<String>,
 }
 
@@ -149,6 +204,41 @@ impl Binary {
         self.imports
             .iter()
             .flat_map(|l| l.functions.iter().map(String::as_str))
+    }
+
+    /// A minimal `Binary` for tests to fill in selectively. Adding a field to
+    /// the model should not mean editing every test fixture that happens to
+    /// construct one.
+    #[cfg(test)]
+    pub fn stub(format: Format, arch: Arch) -> Binary {
+        Binary {
+            path: "stub".into(),
+            size: 0,
+            format,
+            arch,
+            bits: arch.bits(),
+            endian_little: true,
+            is_lib: false,
+            is_stripped: false,
+            entry: 0,
+            image_base: 0,
+            subsystem: None,
+            timestamp: None,
+            sections: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
+            symbols: Vec::new(),
+            libs: Vec::new(),
+            rpaths: Vec::new(),
+            overall_entropy: 0.0,
+            overlay_off: None,
+            overlay_size: 0,
+            overlay_entropy: 0.0,
+            has_signature: false,
+            sig_region: None,
+            hardening: HardeningFacts::default(),
+            notes: Vec::new(),
+        }
     }
 
     /// The section that contains the entry point, if any.

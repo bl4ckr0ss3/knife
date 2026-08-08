@@ -1,7 +1,9 @@
 //! PE → Binary.
 
 use super::mk_section;
-use crate::model::{Arch, Binary, Format, ImportedLib, SymKind, Symbol};
+use crate::model::{
+    Arch, Binary, Format, HardeningFacts, ImportedLib, LoadConfig, SymKind, Symbol,
+};
 use goblin::pe::PE;
 use std::collections::BTreeMap;
 
@@ -18,7 +20,7 @@ pub fn build(path: &str, bytes: &[u8], pe: PE) -> Binary {
         _ => Arch::Other,
     };
 
-    let sections = pe
+    let sections: Vec<crate::model::Section> = pe
         .sections
         .iter()
         .map(|s| {
@@ -81,7 +83,11 @@ pub fn build(path: &str, bytes: &[u8], pe: PE) -> Binary {
     for imp in &pe.imports {
         let module = imp.dll.rsplit_once('.').map(|(s, _)| s).unwrap_or(imp.dll);
         symbols.push(Symbol {
-            addr: imp.rva as u64,
+            // goblin names these two fields the opposite way round from what
+            // they hold: `rva` points at the hint/name string, while `offset`
+            // is the import address table slot RVA. Code calls through the
+            // slot, so the slot is the address worth recording.
+            addr: imp.offset as u64,
             name: format!("{module}!{}", imp.name),
             kind: SymKind::Import,
         });
@@ -106,6 +112,24 @@ pub fn build(path: &str, bytes: &[u8], pe: PE) -> Binary {
         } else {
             (None, pe.image_base as u64, None, false, None)
         };
+
+    // Mitigation facts. The DLL characteristics word carries the loader's
+    // opt-ins (ASLR, DEP, CFG); the load config directory carries the data that
+    // actually backs the stack cookie and CFG, which is the part a linker flag
+    // alone does not prove.
+    let dll_characteristics = pe
+        .header
+        .optional_header
+        .map(|oh| oh.windows_fields.dll_characteristics);
+    let load_config = pe
+        .header
+        .optional_header
+        .and_then(|oh| oh.data_directories.get_load_config_table().copied())
+        .filter(|d| d.virtual_address != 0 && d.size > 0)
+        .and_then(|d| {
+            let off = rva_to_off(&sections, d.virtual_address as u64)?;
+            parse_load_config(bytes, off as usize, pe.is_64)
+        });
 
     let mut notes = Vec::new();
     if pe.is_64 {
@@ -148,8 +172,73 @@ pub fn build(path: &str, bytes: &[u8], pe: PE) -> Binary {
         overlay_entropy: 0.0,
         has_signature: has_sig,
         sig_region,
+        hardening: HardeningFacts {
+            dll_characteristics,
+            load_config,
+            ..Default::default()
+        },
         notes,
     }
+}
+
+/// RVA → file offset over the section table. Used before the `Binary` exists,
+/// so it takes the sections directly.
+fn rva_to_off(sections: &[crate::model::Section], rva: u64) -> Option<u64> {
+    sections.iter().find_map(|s| {
+        let span = s.vsize.max(s.file_size);
+        (s.vaddr != 0 && rva >= s.vaddr && rva < s.vaddr + span)
+            .then(|| s.file_off + (rva - s.vaddr))
+    })
+}
+
+/// IMAGE_LOAD_CONFIG_DIRECTORY. The 32- and 64-bit layouts differ in more than
+/// pointer width (several scalar fields change size too), so the field offsets
+/// are listed per width rather than computed. Every read is bounds-checked
+/// against the directory's own `Size`, because a truncated or hand-built
+/// directory is exactly the kind of thing worth surviving rather than panicking
+/// on.
+fn parse_load_config(bytes: &[u8], off: usize, is_64: bool) -> Option<LoadConfig> {
+    let d32 = |o: usize| -> u64 {
+        bytes
+            .get(off + o..off + o + 4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as u64)
+            .unwrap_or(0)
+    };
+    let d64 = |o: usize| -> u64 {
+        bytes
+            .get(off + o..off + o + 8)
+            .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+            .unwrap_or(0)
+    };
+
+    // The directory's declared size tells us which trailing fields exist at all;
+    // CFG fields are absent in binaries built before they were defined.
+    let size = d32(0) as usize;
+    if size < 0x40 {
+        return None;
+    }
+    // Read a field only when the directory is long enough to contain it, named
+    // by where the field *ends* so the bound reads off the layout directly.
+    let w64 = |ends: usize, at: usize| if size >= ends { d64(at) } else { 0 };
+    let w32 = |ends: usize, at: usize| if size >= ends { d32(at) } else { 0 };
+
+    Some(if is_64 {
+        LoadConfig {
+            security_cookie: w64(0x60, 0x58),
+            seh_table: w64(0x68, 0x60),
+            seh_count: w64(0x70, 0x68),
+            guard_cf_count: w64(0x90, 0x88),
+            guard_flags: w32(0x94, 0x90) as u32,
+        }
+    } else {
+        LoadConfig {
+            security_cookie: w32(0x40, 0x3c),
+            seh_table: w32(0x44, 0x40),
+            seh_count: w32(0x48, 0x44),
+            guard_cf_count: w32(0x58, 0x54),
+            guard_flags: w32(0x5c, 0x58) as u32,
+        }
+    })
 }
 
 fn subsystem_name(s: u16) -> &'static str {

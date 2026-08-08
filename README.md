@@ -24,6 +24,10 @@ one for strings and IOCs, one for imports, one for entropy, one to disassemble.
 transparent triage verdict on top. Everything is static: it reads the bytes on
 disk and never runs the file.
 
+It answers the research questions in the same place: what mitigations the target
+was built with, where its dangerous calls are, and what reaches them. See
+[for vulnerability research](#for-vulnerability-research).
+
 ## Install
 
 ```bash
@@ -47,7 +51,16 @@ One tool, many jobs, which is the point of a Swiss-army knife:
 
 | command | what you get |
 |---|---|
-| `knife FILE` | full triage: verdict, hashes, sections, capabilities, IOCs, artifacts, entry disasm |
+| `knife FILE` | full triage: verdict, hashes, sections, mitigations, capabilities, IOCs, artifacts, entry disasm |
+| `knife sec FILE` | exploit mitigations, and what each missing one buys an attacker |
+| `knife sinks FILE [--class C] [--all]` | dangerous-API call sites, grouped by bug class |
+| `knife xrefs FILE TARGET` | what references a function, import, or address |
+| `knife xrefs FILE --str TEXT` | what references the strings matching `TEXT` |
+| `knife paths FILE TARGET [--from F]` | call chains that reach a sink from entry points and exports |
+| `knife tui FILE` | interactive: functions, listing, xrefs, naming and notes |
+| `knife name FILE ADDR NAME` | name an address; every later command uses it |
+| `knife note FILE ADDR TEXT` | annotate an address; shows up in the disassembly |
+| `knife db FILE` | everything you have stored for this binary |
 | `knife funcs FILE [--by-refs]` | recover functions via control-flow analysis |
 | `knife dis FILE --func NAME` | disassemble a whole function with labels and xrefs |
 | `knife dis FILE [--vaddr X \| --off Y] [--count N]` | linear disassembly (x86/x64) |
@@ -68,6 +81,75 @@ Add `--json` to any analysis command for machine-readable output. `knife FILE`
 is shorthand for `knife info FILE`, and `knife FILE --rules DIR` folds a YARA
 pass into the verdict.
 
+## For vulnerability research
+
+Triage asks whether a binary is hostile. Research asks a different question,
+where this binary can be broken, and four commands answer it.
+
+**What is it protected by.** `knife sec` reads the mitigations out of the
+container and says what each missing one costs you. It separates a claim from a
+fact: a PE with `DYNAMIC_BASE` set but no `.reloc` section still loads at its
+preferred base, a `GUARD_CF` flag with an empty guard function table checks
+nothing, and an ELF with no `PT_GNU_STACK` header at all gets an executable
+stack rather than a hardened one. Each line carries the consequence, so
+`no __stack_chk_fail reference` is followed by what that means for a linear
+overflow.
+
+**Where the surface is.** `knife sinks` matches the binary against a catalogue
+grouped by the mistake each API enables, unbounded copies, format strings,
+input-sized stack allocation, command execution, temp-file races, weak
+randomness, then resolves every one to concrete call sites. The output is
+addresses in named functions, not an import list: on `kernel32.dll` that is 327
+call sites across 17 APIs, and on a `vmlinux` image it finds 204 `strcpy` and
+220 `sprintf` sites in named kernel functions. Statically linked targets work
+too, because a defined symbol is matched the same way an import is.
+
+**What reaches what.** `knife xrefs` answers "who calls this" for a function,
+an imported API, or an address, and `--str` answers the other direction, which
+code touches this string. `knife paths` walks the call graph backwards from a
+sink to the entry point and the exports, printing the shortest chains, which is
+the reachability question that decides whether a sink is worth your afternoon.
+
+```bash
+knife sec ./target                       # what am I up against
+knife sinks ./target --class memory      # where could the bug be
+knife xrefs ./target --str "/tmp/"       # who builds that path
+knife paths ./target system              # can anything reach it
+```
+
+**What you worked out.** Everything above is derived from the bytes and can be
+recomputed at any time. What cannot be recomputed is what you understood, so
+`knife name` and `knife note` write it down, and every later command reads it
+back. Naming an address is not cosmetic: it tells the engine there is a function
+there, which is how you make progress on a stripped binary.
+
+```bash
+knife name ./target 0x4017a0 parse_record      # sub_4017a0 is now parse_record
+knife note ./target 0x4017c4 "len from packet" # shows up beside the instruction
+knife funcs ./target | grep parse_record       # and in every other command
+knife dis  ./target --func parse_record
+```
+
+**Somewhere to do it.** `knife tui` puts the same analysis behind a keyboard:
+the function list on the left, the listing and cross-references on the right.
+`↵` opens a function or follows the call under the cursor, `⌫` returns to where
+you followed from, `/` filters, `g` goes to an address or a symbol, and `n` and
+`c` name and annotate whatever the cursor is on. Names and notes go to the same
+database the command line writes, as you make them, so quitting is not a save
+step and `knife funcs` in another terminal already agrees with you.
+
+```bash
+knife tui ./target
+```
+
+The database is keyed by the file's SHA-256, so it follows the binary rather
+than the path, and pointing knife at a different build never silently applies
+the wrong names. Addresses are stored relative to the image base, in hex, as a
+flat list, which means a database survives rebasing and can be diffed,
+hand-edited, or sent to somebody else who has the same sample. It lives under
+your platform's data directory by default; `--db PATH` puts it wherever you
+want, and `knife db FILE` says which file is in use.
+
 ## What makes it more than objdump
 
 **Cross-format, one model.** [goblin](https://github.com/m4b/goblin) parses
@@ -79,9 +161,16 @@ x86-64 Mach-O.
 seeded from the entry point and every named symbol, follows calls and branches,
 splits basic blocks, builds a control-flow graph, and counts cross-references.
 `knife dis --func` prints a whole function with `loc_` labels, resolved call
-targets, and xrefs-to. On `kernel32.dll` it recovers 2174 functions, 1430 of
+targets, and xrefs-to. On `kernel32.dll` it recovers 2218 functions, 1515 of
 them named. Everything is in virtual-address space, so the address column,
 branch operands, and symbol names all agree.
+
+**Imports resolve to names.** A call to a library function never goes there
+directly: ELF routes it through a `.plt` stub that jumps via a GOT slot, and PE
+linkers emit the same shape as `jmp [IAT]` thunks. knife follows both, so a call
+site reads `call strcpy@plt` or `call KERNELBASE!CreateFileW` instead of an
+anonymous `sub_`. That naming is what makes the sink and cross-reference
+commands point at code rather than at an import table.
 
 **Constant scanning.** `knife scan` fingerprints crypto and structure by their
 byte signatures: AES S-boxes (generated from the GF(2⁸) definition, not stored
@@ -125,8 +214,11 @@ knife iocs sample.exe --json | jq '.[] | select(.kind=="url").value'
 - [x] Crypto/packer/embedded constant scanner
 - [x] YARA (yara-x) matching
 - [x] Analysis engine: functions, CFG, xrefs
-- [ ] IAT import-name resolution in disassembly
-- [ ] Interactive TUI (function list / disasm / hex / xrefs)
+- [x] IAT and PLT import-name resolution in disassembly
+- [x] Exploit-mitigation audit (`knife sec`)
+- [x] Sink call sites, code and data xrefs, call-graph reachability
+- [x] Persistent analysis database: your names and notes, kept between sessions
+- [x] Interactive TUI (function list / listing / xrefs, naming and notes)
 - [ ] Library-function identification (FLIRT-style)
 - [ ] IR lift toward a decompiler view
 
@@ -137,8 +229,8 @@ cargo build --release        # target/release/knife
 cargo test
 ```
 
-Needs a recent stable Rust (2021 edition). No system libraries beyond the
-platform default; the YARA engine is pure Rust.
+Needs Rust 1.88 or newer (2021 edition). No system libraries beyond the
+platform default; the YARA engine and the terminal interface are both pure Rust.
 
 ## Contributing
 

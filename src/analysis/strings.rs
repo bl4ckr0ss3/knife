@@ -4,43 +4,72 @@ use regex::Regex;
 use serde::Serialize;
 use std::sync::OnceLock;
 
+/// A string together with the file offset it starts at. The offset is what
+/// lets a string be tied back to the code that references it.
+#[derive(Debug, Clone, Serialize)]
+pub struct Located {
+    pub off: u64,
+    pub text: String,
+    pub wide: bool,
+}
+
 pub fn extract(data: &[u8], min_len: usize) -> Vec<String> {
+    extract_located(data, min_len)
+        .into_iter()
+        .map(|s| s.text)
+        .collect()
+}
+
+/// Both encodings, each string tagged with where it starts.
+pub fn extract_located(data: &[u8], min_len: usize) -> Vec<Located> {
     let mut out = Vec::new();
     ascii_run(data, min_len, &mut out);
     utf16_run(data, min_len, &mut out);
     out
 }
 
-fn ascii_run(data: &[u8], min: usize, out: &mut Vec<String>) {
+fn ascii_run(data: &[u8], min: usize, out: &mut Vec<Located>) {
     let mut cur = Vec::new();
-    for &b in data {
+    let mut start = 0usize;
+    for (i, &b) in data.iter().enumerate() {
         if (0x20..0x7f).contains(&b) {
+            if cur.is_empty() {
+                start = i;
+            }
             cur.push(b);
         } else {
-            flush(&mut cur, min, out);
+            flush(&mut cur, start as u64, min, false, out);
         }
     }
-    flush(&mut cur, min, out);
+    flush(&mut cur, start as u64, min, false, out);
 }
 
-fn utf16_run(data: &[u8], min: usize, out: &mut Vec<String>) {
+fn utf16_run(data: &[u8], min: usize, out: &mut Vec<Located>) {
     let mut cur = Vec::new();
+    let mut start = 0usize;
     let mut i = 0;
     while i + 1 < data.len() {
         let (lo, hi) = (data[i], data[i + 1]);
         if hi == 0 && (0x20..0x7f).contains(&lo) {
+            if cur.is_empty() {
+                start = i;
+            }
             cur.push(lo);
         } else {
-            flush(&mut cur, min, out);
+            flush(&mut cur, start as u64, min, true, out);
         }
         i += 2;
     }
-    flush(&mut cur, min, out);
+    flush(&mut cur, start as u64, min, true, out);
 }
 
-fn flush(cur: &mut Vec<u8>, min: usize, out: &mut Vec<String>) {
+fn flush(cur: &mut Vec<u8>, off: u64, min: usize, wide: bool, out: &mut Vec<Located>) {
     if cur.len() >= min {
-        out.push(String::from_utf8_lossy(cur).into_owned());
+        out.push(Located {
+            off,
+            text: String::from_utf8_lossy(cur).into_owned(),
+            wide,
+        });
     }
     cur.clear();
 }

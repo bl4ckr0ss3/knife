@@ -12,6 +12,11 @@ pub struct FileHashes {
     pub sha256: String,
 }
 
+/// Just the SHA-256, for identifying a file without paying for the other two.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+
 pub fn file_hashes(bytes: &[u8]) -> FileHashes {
     FileHashes {
         md5: hex(&Md5::digest(bytes)),
