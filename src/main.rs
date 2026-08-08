@@ -270,13 +270,17 @@ fn cmd_info(file: &str, rules: Option<&str>, as_json: bool) -> Result<()> {
         println!("  {}", "no notable static signals".style(faint()));
     }
     for s in &tri.signals {
-        let dot = "◆".style(kind_style(s.kind));
         let w = if s.weight != 0 {
             format!(" {:+}", s.weight)
         } else {
             String::new()
         };
-        println!("  {} {}{}", dot, s.text, w.style(faint()));
+        println!(
+            "  {} {}{}",
+            marker(s.kind).style(kind_style(s.kind)),
+            s.text,
+            w.style(faint())
+        );
     }
 
     // sections
@@ -342,17 +346,22 @@ fn cmd_info(file: &str, rules: Option<&str>, as_json: bool) -> Result<()> {
             e.0 += 1;
         }
         for (name, (count, cat)) in &seen {
-            let st = match *cat {
-                "crypto" | "hash" => amber(),
-                "packer" | "embedded" => red(),
-                _ => muted(),
+            let (st, kind) = match *cat {
+                "packer" => (red(), "bad"), // packers genuinely warrant suspicion
+                "crypto" | "hash" => (amber(), "warn"),
+                _ => (mint(), "info"), // embedded formats are informational
             };
             let c = if *count > 1 {
                 format!(" ×{count}")
             } else {
                 String::new()
             };
-            println!("  {} {}{}", "◆".style(st), name.style(st), c.style(faint()));
+            println!(
+                "  {} {}{}",
+                marker(kind).style(st),
+                name.style(st),
+                c.style(faint())
+            );
         }
         println!("  {}", "run `knife scan` for offsets".style(faint()));
     }
@@ -671,7 +680,7 @@ fn cmd_map(file: &str, buckets: usize, as_json: bool) -> Result<()> {
         if e >= 7.2 {
             println!(
                 "  {} bucket {:>4} @ 0x{:08x}  {:.2}/8",
-                "◆".style(red()),
+                marker("bad").style(red()),
                 i,
                 i * step,
                 e
@@ -722,7 +731,7 @@ fn print_yara_match(m: &yara::RuleMatch) {
     };
     println!(
         "  {} {}{}",
-        "◆".style(red()),
+        marker("bad").style(red()),
         m.rule.style(red()).bold(),
         tags.style(faint())
     );
