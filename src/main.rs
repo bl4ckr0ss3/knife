@@ -1,4 +1,4 @@
-//! knife — a reverse engineer's binary Swiss-army knife.
+//! knife: a reverse engineer's binary Swiss-army knife.
 //!
 //! Parse, triage, and disassemble PE / ELF / Mach-O. One binary, no runtime.
 
@@ -322,7 +322,7 @@ fn cmd_info(file: &str, rules: Option<&str>, as_json: bool) -> Result<()> {
 
     // iocs
     if !iocs.is_empty() {
-        section_header(&format!("indicators ({}) — defanged", iocs.len()));
+        section_header(&format!("indicators ({}), defanged", iocs.len()));
         for i in iocs.iter().take(20) {
             println!(
                 "  {:<8} {}",
@@ -541,7 +541,7 @@ fn cmd_iocs(file: &str, as_json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&iocs)?);
         return Ok(());
     }
-    section_header(&format!("indicators ({}) — defanged", iocs.len()));
+    section_header(&format!("indicators ({}), defanged", iocs.len()));
     for i in &iocs {
         println!(
             "  {:<8} {}",
@@ -695,7 +695,7 @@ fn cmd_funcs(file: &str, by_refs: bool, as_json: bool) -> Result<()> {
     if an.truncated {
         println!(
             "  {}",
-            "analysis budget reached — listing is partial".style(amber())
+            "analysis budget reached, listing is partial".style(amber())
         );
     }
     Ok(())
@@ -948,7 +948,7 @@ fn cmd_yara(rules: &str, file: &str, as_json: bool) -> Result<()> {
         return Ok(());
     }
 
-    section_header(&format!("yara — {} matched", matches.len()));
+    section_header(&format!("yara: {} matched", matches.len()));
     if matches.is_empty() {
         println!(
             "  {}",

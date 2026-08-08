@@ -36,7 +36,7 @@ pub fn analyze(path: &str, bytes: &[u8]) -> Result<Binary> {
 }
 
 /// Bytes past the end of the last mapped section: appended payload / bundle.
-/// The Authenticode certificate table also lives here, so it is excluded — a
+/// The Authenticode certificate table also lives here, so it is excluded: a
 /// signature is not an overlay.
 fn detect_overlay(bin: &mut Binary, file_len: u64, bytes: &[u8]) {
     let end = bin

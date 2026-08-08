@@ -1,5 +1,5 @@
 //! The analysis engine: recursive-descent disassembly that recovers functions,
-//! basic blocks, a control-flow graph, and cross-references — the backbone of
+//! basic blocks, a control-flow graph, and cross-references, the backbone of
 //! an interactive disassembler.
 //!
 //! Everything works in **virtual-address space**. PE section vaddrs are RVAs,
@@ -332,7 +332,7 @@ fn build_function(
                 FlowControl::Call | FlowControl::UnconditionalBranch
                     if insn.is_ip_rel_memory_operand() =>
                 {
-                    // call/jmp [rip+disp] — resolve through the IAT when the slot
+                    // call/jmp [rip+disp]: resolve through the IAT when the slot
                     // is a known import. (Note: some toolchains route calls via
                     // first-thunk addresses the importer table does not expose;
                     // those resolve to sub_ names for now.)

@@ -1,1 +1,4 @@
 target
+dist
+staging
+*.bak

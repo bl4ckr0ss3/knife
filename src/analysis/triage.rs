@@ -69,7 +69,7 @@ pub fn run(bin: &Binary, matches: &[Match], yara_hits: &[String]) -> TriageResul
     {
         add(
             format!(
-                "High-entropy section '{}' ({:.2}/8) — packed or encrypted",
+                "High-entropy section '{}' ({:.2}/8): packed or encrypted",
                 s.name, s.entropy
             ),
             2,
@@ -105,7 +105,7 @@ pub fn run(bin: &Binary, matches: &[Match], yara_hits: &[String]) -> TriageResul
     let imported = bin.all_imported_functions().count();
     if imported > 0 && imported < 10 && bin.sections.iter().any(|s| s.entropy >= PACK_THRESHOLD) {
         add(
-            format!("Only {imported} imports with packed sections — resolved at runtime"),
+            format!("Only {imported} imports with packed sections, resolved at runtime"),
             2,
             "bad",
             &mut signals,
@@ -118,7 +118,7 @@ pub fn run(bin: &Binary, matches: &[Match], yara_hits: &[String]) -> TriageResul
         let w = if bad { 2 } else { 0 };
         add(
             format!(
-                "Overlay: {} past end of image ({:.2}/8) — appended data / bundle",
+                "Overlay: {} past end of image ({:.2}/8), appended data / bundle",
                 crate::output::human(bin.overlay_size),
                 bin.overlay_entropy
             ),
@@ -186,7 +186,7 @@ pub fn run(bin: &Binary, matches: &[Match], yara_hits: &[String]) -> TriageResul
         && caps.contains_key("network")
     {
         add(
-            "Networking with injection/theft — remote payload or exfil".into(),
+            "Networking with injection/theft: remote payload or exfil".into(),
             2,
             "bad",
             &mut signals,
@@ -207,7 +207,7 @@ pub fn run(bin: &Binary, matches: &[Match], yara_hits: &[String]) -> TriageResul
         let w = (3 * yara_hits.len() as i32).min(8);
         let names = yara_hits.join(", ");
         add(
-            format!("YARA: {} rule(s) matched — {names}", yara_hits.len()),
+            format!("YARA: {} rule(s) matched: {names}", yara_hits.len()),
             w,
             "bad",
             &mut signals,

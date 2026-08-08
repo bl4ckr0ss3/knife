@@ -1139,25 +1139,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "knife"
-version = "1.0.0"
-dependencies = [
- "anyhow",
- "clap",
- "goblin",
- "iced-x86",
- "md-5",
- "memmap2",
- "owo-colors",
- "regex",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "yara-x",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1732,6 +1713,25 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "reknife"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "goblin",
+ "iced-x86",
+ "md-5",
+ "memmap2",
+ "owo-colors",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "yara-x",
+]
 
 [[package]]
 name = "rfc6979"

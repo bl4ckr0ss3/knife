@@ -1,15 +1,34 @@
 [package]
-name = "knife"
+# The `knife` name is taken on crates.io, so the crate publishes as `reknife`
+# while the installed command stays `knife` (see [[bin]] below).
+name = "reknife"
 version = "1.0.0"
 edition = "2021"
 rust-version = "1.85"
-description = "A reverse engineer's binary Swiss-army knife: parse, triage, and disassemble PE/ELF/Mach-O."
+description = "A reverse engineer's binary Swiss-army knife: parse, triage, and disassemble PE/ELF/Mach-O. Installs as `knife`."
 license = "MIT"
 authors = ["0xblack"]
+repository = "https://github.com/bl4ckr0ss3/knife"
+homepage = "https://github.com/bl4ckr0ss3/knife"
+documentation = "https://docs.rs/reknife"
+readme = "README.md"
+keywords = ["reverse-engineering", "disassembler", "malware", "security", "pe"]
+categories = ["command-line-utilities", "development-tools::debugging"]
+exclude = ["assets/", ".github/", "*.png"]
 
 [[bin]]
 name = "knife"
 path = "src/main.rs"
+
+# cargo-binstall: fetch prebuilt binaries from GitHub Releases instead of
+# compiling. The release workflow produces archives matching this template.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/knife-{ target }.{ archive-format }"
+bin-dir = "knife{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
 
 [dependencies]
 goblin = "0.9"                 # PE / ELF / Mach-O / archive parsing, one crate

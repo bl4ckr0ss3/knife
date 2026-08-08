@@ -77,7 +77,7 @@ pub fn build(path: &str, bytes: &[u8], elf: Elf) -> Binary {
     };
 
     // Defined function symbols (STT_FUNC, non-zero address) seed the engine.
-    // syms use .strtab, dynsyms use .dynstrtab — keep them separate.
+    // syms use .strtab, dynsyms use .dynstrtab; keep them separate.
     let mut symbols: Vec<Symbol> = Vec::new();
     let mut collect_funcs = |it: goblin::elf::sym::SymIterator, strtab: &goblin::strtab::Strtab| {
         for sym in it {
