@@ -7,7 +7,7 @@ mod formats;
 mod model;
 mod output;
 
-use analysis::{capabilities, disasm, hashes, strings as strs, triage};
+use analysis::{capabilities, disasm, hashes, signatures, strings as strs, triage};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use model::Binary;
@@ -79,6 +79,8 @@ enum Command {
         #[arg(long, default_value_t = 64)]
         buckets: usize,
     },
+    /// Scan for crypto constants, packer markers, and embedded formats.
+    Scan { file: String },
     /// List archive (.a/.lib) members.
     Ls { file: String },
 }
@@ -105,6 +107,7 @@ fn real_main() -> Result<()> {
         "dis",
         "hex",
         "map",
+        "scan",
         "ls",
         "help",
         "-h",
@@ -134,6 +137,7 @@ fn real_main() -> Result<()> {
         } => cmd_dis(&file, count, vaddr, off),
         Command::Hex { file, off, len } => cmd_hex(&file, off, len),
         Command::Map { file, buckets } => cmd_map(&file, buckets, cli.json),
+        Command::Scan { file } => cmd_scan(&file, cli.json),
         Command::Ls { file } => cmd_ls(&file),
     }
 }
@@ -295,6 +299,34 @@ fn cmd_info(file: &str, as_json: bool) -> Result<()> {
                 format!("… and {} more", iocs.len() - 20).style(faint())
             );
         }
+    }
+
+    // crypto / packer / embedded artifacts
+    let hits = signatures::scan(&bin, &bytes);
+    if !hits.is_empty() {
+        section_header(&format!("artifacts ({})", hits.len()));
+        // one line per distinct signature name, with a count
+        let mut seen = std::collections::BTreeMap::<&str, (usize, &str)>::new();
+        for h in &hits {
+            let e = seen
+                .entry(h.name.as_str())
+                .or_insert((0, h.category.as_str()));
+            e.0 += 1;
+        }
+        for (name, (count, cat)) in &seen {
+            let st = match *cat {
+                "crypto" | "hash" => amber(),
+                "packer" | "embedded" => red(),
+                _ => muted(),
+            };
+            let c = if *count > 1 {
+                format!(" ×{count}")
+            } else {
+                String::new()
+            };
+            println!("  {} {}{}", "◆".style(st), name.style(st), c.style(faint()));
+        }
+        println!("  {}", "run `knife scan` for offsets".style(faint()));
     }
 
     // disasm teaser
@@ -617,6 +649,39 @@ fn cmd_map(file: &str, buckets: usize, as_json: bool) -> Result<()> {
                 e
             );
         }
+    }
+    Ok(())
+}
+
+fn cmd_scan(file: &str, as_json: bool) -> Result<()> {
+    let bytes = load(file)?;
+    let bin = parse(file, &bytes)?;
+    let hits = signatures::scan(&bin, &bytes);
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&hits)?);
+        return Ok(());
+    }
+    section_header(&format!("artifacts ({})", hits.len()));
+    if hits.is_empty() {
+        println!(
+            "  {}",
+            "no known crypto/packer/embedded signatures".style(faint())
+        );
+        return Ok(());
+    }
+    for h in &hits {
+        let st = match h.category.as_str() {
+            "crypto" | "hash" => amber(),
+            "packer" | "embedded" => red(),
+            _ => muted(),
+        };
+        let loc = h.section.as_deref().unwrap_or("-");
+        println!(
+            "  {}  {:<24} {}",
+            format!("0x{:08x}", h.offset).style(faint()),
+            h.name.style(st),
+            format!("[{}] {} · {}", h.category, loc, h.note).style(faint()),
+        );
     }
     Ok(())
 }

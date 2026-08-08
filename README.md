@@ -39,6 +39,7 @@ One tool, many jobs — the point of a Swiss-army knife:
 | `knife dis FILE --count N [--vaddr X\|--off Y]` | x86/x64 disassembly (iced-x86) |
 | `knife hex FILE --off O --len L` | hex dump |
 | `knife map FILE --buckets N` | whole-file entropy sparkline, packed regions flagged |
+| `knife scan FILE` | crypto constants, packer markers, embedded formats |
 | `knife ls FILE` | archive (.a/.lib) members |
 
 Add `--json` to any analysis command for machine-readable output.
@@ -51,6 +52,16 @@ three: a signed Windows DLL, a stripped RISC-V ELF, and a macOS x86-64 Mach-O.
 
 Disassembly is x86/x64 via `iced-x86`; other architectures are reported as
 unsupported rather than guessed at.
+
+## Constant scanning
+
+`knife scan` fingerprints crypto and structure by their known byte sequences,
+so you can tell what a stripped blob is doing without running it: AES S-boxes
+(generated at runtime from the GF(2⁸) definition, not hard-coded), SHA-1 /
+SHA-256 / MD5 / CRC32 constants (searched in both byte orders), Base64
+alphabets, packer markers (UPX, MPRESS), and embedded formats (zip, 7z, gzip,
+PNG, PDF, CLR metadata). Embedded PEs are confirmed by walking the DOS→PE
+header chain rather than trusting a bare `MZ`.
 
 ## Triage philosophy
 
