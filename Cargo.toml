@@ -2,7 +2,7 @@
 # The `knife` name is taken on crates.io, so the crate publishes as `reknife`
 # while the installed command stays `knife` (see [[bin]] below).
 name = "reknife"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 rust-version = "1.88"
 description = "A reverse engineer's binary Swiss-army knife: parse, triage, and disassemble PE/ELF/Mach-O. Installs as `knife`."
@@ -34,6 +34,7 @@ pkg-fmt = "zip"
 goblin = "0.9"                 # PE / ELF / Mach-O / archive parsing, one crate
 iced-x86 = "1.21"             # x86/x64 disassembler, pure Rust
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
 sha2 = "0.10"
 sha1 = "0.10"
 md-5 = "0.10"

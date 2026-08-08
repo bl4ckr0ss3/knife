@@ -1,6 +1,8 @@
-//! x86/x64 disassembly via iced-x86. Other architectures are reported as
-//! unsupported rather than guessed at.
+//! Disassembly: iced-x86 for x86/x64, the bundled AArch64 decoder for
+//! ARM64. Other architectures are reported as unsupported rather than
+//! guessed at.
 
+use crate::analysis::aarch64;
 use crate::model::{Arch, Binary};
 use iced_x86::{Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter};
 
@@ -8,6 +10,18 @@ pub struct Insn {
     pub addr: u64,
     pub bytes: Vec<u8>,
     pub text: String,
+}
+
+/// A lossless rendering of the instruction, whatever the platform.
+fn fmt_x86(insn: &Instruction) -> String {
+    let mut fmt = IntelFormatter::new();
+    fmt.options_mut().set_uppercase_hex(false);
+    fmt.options_mut().set_hex_prefix("0x");
+    fmt.options_mut().set_hex_suffix("");
+    fmt.options_mut().set_space_after_operand_separator(true);
+    let mut s = String::new();
+    fmt.format(insn, &mut s);
+    s
 }
 
 /// Map a virtual address (PE RVA / ELF VA) to a file offset via the sections.
@@ -47,31 +61,49 @@ pub fn entry_location(bin: &Binary, bytes: &[u8]) -> Option<(u64, u64)> {
 }
 
 pub fn supported(arch: Arch) -> bool {
-    arch.is_x86()
+    arch.is_x86() || arch == Arch::Aarch64
 }
 
 /// Disassemble up to `count` instructions from `file_off`, presenting addresses
 /// as if the code were loaded at `va`.
-pub fn disassemble(bytes: &[u8], file_off: u64, va: u64, bits: u32, count: usize) -> Vec<Insn> {
+pub fn disassemble(
+    bytes: &[u8],
+    file_off: u64,
+    va: u64,
+    bits: u32,
+    arch: Arch,
+    count: usize,
+) -> Vec<Insn> {
     let start = file_off as usize;
     if start >= bytes.len() {
         return Vec::new();
     }
     let code = &bytes[start..];
-    let mut decoder = Decoder::with_ip(bits, code, va, DecoderOptions::NONE);
-    let mut fmt = IntelFormatter::new();
-    fmt.options_mut().set_uppercase_hex(false);
-    fmt.options_mut().set_hex_prefix("0x");
-    fmt.options_mut().set_hex_suffix("");
-    fmt.options_mut().set_space_after_operand_separator(true);
 
+    if arch == Arch::Aarch64 {
+        let mut out = Vec::with_capacity(count);
+        let mut ip = va;
+        let mut pos = 0usize;
+        while out.len() < count && pos + 4 <= code.len() {
+            let Some(w) = aarch64::decode(&code[pos..], ip) else {
+                break;
+            };
+            out.push(Insn {
+                addr: w.addr,
+                bytes: code[pos..pos + w.len].to_vec(),
+                text: w.text,
+            });
+            pos += w.len;
+            ip += w.len as u64;
+        }
+        return out;
+    }
+
+    let mut decoder = Decoder::with_ip(bits, code, va, DecoderOptions::NONE);
     let mut out = Vec::with_capacity(count);
     let mut insn = Instruction::default();
-    let mut text = String::new();
     while out.len() < count && decoder.can_decode() {
         decoder.decode_out(&mut insn);
-        text.clear();
-        fmt.format(&insn, &mut text);
 
         let lo = (insn.ip() - va) as usize;
         let hi = lo + insn.len();
@@ -80,7 +112,7 @@ pub fn disassemble(bytes: &[u8], file_off: u64, va: u64, bits: u32, count: usize
         out.push(Insn {
             addr: insn.ip(),
             bytes: raw,
-            text: text.clone(),
+            text: fmt_x86(&insn),
         });
     }
     out

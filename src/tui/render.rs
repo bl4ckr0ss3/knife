@@ -95,25 +95,32 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
 
 fn functions(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus == Focus::Functions;
+    // The function containing whatever the listing shows is marked, so moving
+    // through code keeps the left pane in step even after following calls.
+    let current = app.cur;
     let items: Vec<ListItem> = app
         .order
         .iter()
         .map(|&i| {
             let fun = &app.an.functions[i];
-            ListItem::new(TLine::from(vec![
-                Span::styled(
-                    format!("{:>10x} ", fun.addr + app.an.display_base),
-                    Style::default().fg(faint()),
-                ),
-                Span::styled(
-                    truncate(&fun.name, 16),
-                    Style::default().fg(if fun.named { mint() } else { muted() }),
-                ),
-                Span::styled(
-                    format!(" {:>3}", fun.incoming),
-                    Style::default().fg(faint()),
-                ),
-            ]))
+            let here = current == Some(fun.addr);
+            let mut spans = Vec::new();
+            if here {
+                spans.push(Span::styled("·", Style::default().fg(amber())));
+            }
+            spans.push(Span::styled(
+                format!("{:>10x} ", fun.addr + app.an.display_base),
+                Style::default().fg(faint()),
+            ));
+            spans.push(Span::styled(
+                truncate(&fun.name, 16),
+                Style::default().fg(if fun.named { mint() } else { muted() }),
+            ));
+            spans.push(Span::styled(
+                format!(" {:>3}", fun.incoming),
+                Style::default().fg(faint()),
+            ));
+            ListItem::new(TLine::from(spans))
         })
         .collect();
 
@@ -152,6 +159,13 @@ fn listing(f: &mut Frame, area: Rect, app: &App) {
                 format!("  {text}:"),
                 Style::default().fg(amber()),
             ))),
+            Line::Data { addr, text } => ListItem::new(TLine::from(vec![
+                Span::styled(
+                    format!("{:012x}  ", addr + app.an.display_base),
+                    Style::default().fg(faint()),
+                ),
+                Span::styled(text.clone(), Style::default().fg(muted())),
+            ])),
             Line::Insn {
                 addr,
                 mnemonic,
@@ -174,6 +188,8 @@ fn listing(f: &mut Frame, area: Rect, app: &App) {
                         Annot::Note(t) => (t.clone(), amber()),
                         Annot::Symbol(t) => (t.clone(), mint()),
                         Annot::Local(t) => (t.clone(), faint()),
+                        // A string literal is a quote, so it is drawn quoted.
+                        Annot::Text(t) => (format!("\"{t}\""), amber()),
                     };
                     spans.push(Span::styled(
                         format!("  ; {text}"),
@@ -201,16 +217,16 @@ fn listing(f: &mut Frame, area: Rect, app: &App) {
 
 fn xrefs(f: &mut Frame, area: Rect, app: &App) {
     let (at, refs) = app.xrefs();
+    let focused = app.focus == Focus::Xrefs;
     let title = format!("xrefs to 0x{:x} ({})", at + app.an.display_base, refs.len());
 
-    let lines: Vec<TLine> = if refs.is_empty() {
-        vec![TLine::from(Span::styled(
+    let items: Vec<ListItem> = if refs.is_empty() {
+        vec![ListItem::new(TLine::from(Span::styled(
             " no references",
             Style::default().fg(faint()),
-        ))]
+        )))]
     } else {
         refs.iter()
-            .take(area.height.saturating_sub(2) as usize)
             .map(|x| {
                 let site = match app.an.function_at(x.from) {
                     Some(fun) => {
@@ -223,7 +239,7 @@ fn xrefs(f: &mut Frame, area: Rect, app: &App) {
                     }
                     None => "-".into(),
                 };
-                TLine::from(vec![
+                ListItem::new(TLine::from(vec![
                     Span::styled(
                         format!(" {:>12x}  ", x.from + app.an.display_base),
                         Style::default().fg(faint()),
@@ -237,12 +253,23 @@ fn xrefs(f: &mut Frame, area: Rect, app: &App) {
                         }),
                     ),
                     Span::styled(site, Style::default().fg(muted())),
-                ])
+                ]))
             })
             .collect()
     };
 
-    f.render_widget(Paragraph::new(lines).block(pane(&title, false)), area);
+    let mut state = ListState::default();
+    if !refs.is_empty() {
+        state.select(Some(app.xsel.min(refs.len() - 1)));
+    }
+    f.render_stateful_widget(
+        List::new(items)
+            .block(pane(&title, focused))
+            .highlight_style(Style::default().bg(Color::Rgb(0x2a, 0x26, 0x3a)))
+            .highlight_symbol("›"),
+        area,
+        &mut state,
+    );
 }
 
 fn footer(f: &mut Frame, area: Rect, app: &App) {
@@ -272,7 +299,15 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
 
     f.render_widget(
         Paragraph::new(TLine::from(Span::styled(
-            " ↵ open/follow   ⌫ back   / filter   g goto   n name   c note   tab pane   ? help   q quit",
+            format!(
+                " db {} · ↵ open/follow{jump} ⌫ back   / filter   g goto   n name   c note   ? help   q quit",
+                app.db.len(),
+                jump = if app.focus == Focus::Xrefs {
+                    " (jump to ref)"
+                } else {
+                    ""
+                },
+            ),
             Style::default().fg(faint()),
         ))),
         area,
@@ -283,8 +318,12 @@ fn help(f: &mut Frame, area: Rect) {
     let text = vec![
         "",
         "  ↑ ↓ / j k      move            tab            switch pane",
+        "                  (functions / listing / xrefs)",
         "  pgup pgdn      page            home end       first / last",
-        "  ↵              open a function, or follow the call under the cursor",
+        "  mouse          wheel scrolls, click picks a pane and an entry",
+        "  ↵              open a function, follow the call under the cursor,",
+        "                 or jump to a reference in the xrefs pane; following a",
+        "                 string operand opens its bytes as a hex dump",
         "  ⌫              back to where you followed from",
         "",
         "  /              filter the function list by name",

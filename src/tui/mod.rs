@@ -9,16 +9,23 @@
 mod render;
 
 use crate::analysis::engine::{self, Analysis};
+use crate::analysis::strings::Located;
 use crate::db::Db;
 use crate::listing::{self, Line};
 use crate::model::Binary;
 use anyhow::Result;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
+use std::collections::BTreeMap;
+use std::io::stdout;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Functions,
     Listing,
+    Xrefs,
 }
 
 /// What a prompt at the bottom of the screen is collecting.
@@ -76,11 +83,22 @@ pub struct App {
     pub status: String,
     pub help: bool,
     pub quit: bool,
+    /// Cursor into the cross-reference list (a separate list pane, so it has a
+    /// selection of its own like the other two).
+    pub xsel: usize,
+    /// Terminal size, refreshed before each frame so mouse coordinates from
+    /// events can be mapped onto the panes without guessing.
+    pub dims: (u16, u16),
+    /// The image's literals keyed by virtual address, built once: bytes never
+    /// change while the view is open, and rebuilding per navigation is the
+    /// kind of cost a big binary makes obvious.
+    pub strings: BTreeMap<u64, Located>,
 }
 
 impl App {
     pub fn new(bin: Binary, bytes: Vec<u8>, db: Db, an: Analysis, title: String) -> App {
         let base = engine::display_base(&bin);
+        let strings = listing::string_map(&bin, &bytes, base);
         let mut app = App {
             bin,
             bytes,
@@ -100,6 +118,9 @@ impl App {
             status: String::new(),
             help: false,
             quit: false,
+            xsel: 0,
+            dims: (0, 0),
+            strings,
         };
         app.refilter();
         // Open something immediately: an empty right-hand pane makes the tool
@@ -150,9 +171,10 @@ impl App {
     // ── listing ──
 
     /// Show a function. `push` records where we were, so `Backspace` returns.
+    /// An address that is not inside a recovered function opens as a data
+    /// dump instead, which is how following a string operand lands somewhere
+    /// you can actually look at its bytes.
     pub fn open(&mut self, addr: u64, push: bool) {
-        // Following a call can land on an address inside a function rather than
-        // at its head, so resolve to whatever actually contains it.
         let target = self
             .an
             .find_function(addr)
@@ -160,6 +182,18 @@ impl App {
             .map(|f| f.addr);
 
         let Some(faddr) = target else {
+            if self.an.xrefs_from.contains_key(&addr) || self.is_mapped(addr) {
+                if push {
+                    if let Some(prev) = self.cur {
+                        self.history.push((prev, self.cursor));
+                    }
+                }
+                self.lines = listing::data_view(&self.bin, self.base, &self.bytes, addr);
+                self.cur = Some(addr);
+                self.cursor = 0;
+                self.clamp_xsel();
+                return;
+            }
             self.status = format!(
                 "0x{:x} is not inside a recovered function",
                 addr + self.base
@@ -174,8 +208,9 @@ impl App {
         }
 
         let f = self.an.find_function(faddr).expect("just resolved");
-        self.lines = listing::function(&self.an, f, &self.db, self.base);
+        self.lines = listing::function(&self.an, f, &self.db, self.base, &self.strings);
         self.cur = Some(faddr);
+        self.clamp_xsel();
         // Land on the requested address, not merely the top of the function.
         self.cursor = self
             .lines
@@ -189,6 +224,12 @@ impl App {
         {
             self.sel = p;
         }
+    }
+
+    /// Does the address lie inside a mapped section? The data-view entry
+    /// test, kept separate from the function-lookup so the two never blur.
+    fn is_mapped(&self, addr: u64) -> bool {
+        engine::va_to_off(&self.bin, self.base, addr).is_some()
     }
 
     pub fn back(&mut self) {
@@ -214,24 +255,41 @@ impl App {
         match self.focus {
             Focus::Listing => self.lines.get(self.cursor).map(Line::addr),
             Focus::Functions => self.selected_addr(),
+            // Naming/noting want the address of interest; the xrefs pane
+            // selection is a *reference away*, so it reports nothing here.
+            Focus::Xrefs => None,
         }
     }
 
-    /// Follow the call or branch under the cursor.
+    /// Follow the call or branch under the cursor; an instruction with no
+    /// control-flow target falls back to its data operand, opening the
+    /// referenced bytes when they are not code.
     pub fn follow(&mut self) {
-        let Some(t) = self.lines.get(self.cursor).and_then(Line::target) else {
-            self.status = "nothing to follow here".into();
-            return;
-        };
-        // An import slot has a name but no body; say so rather than failing.
-        if self.an.find_function(t).is_none() && self.an.function_at(t).is_none() {
-            self.status = match self.an.imports.get(&t) {
-                Some(n) => format!("{n} is imported; there is no body to show"),
-                None => format!("0x{:x} is not a recovered function", t + self.base),
-            };
+        let line = self.lines.get(self.cursor);
+        if let Some(t) = line.and_then(Line::target) {
+            // An import slot has a name but no body; say so rather than failing.
+            if self.an.find_function(t).is_none() && self.an.function_at(t).is_none() {
+                self.status = match self.an.imports.get(&t) {
+                    Some(n) => format!("{n} is imported; there is no body to show"),
+                    None => format!("0x{:x} is not a recovered function", t + self.base),
+                };
+                return;
+            }
+            self.open(t, true);
+            self.focus = Focus::Listing;
             return;
         }
-        self.open(t, true);
+
+        // No control-flow target: a data operand, if the engine found one.
+        let at = line.map(Line::addr).unwrap_or(0);
+        let to = match self.an.xrefs_from.get(&at).map(|r| r.first().map(|r| r.to)) {
+            Some(Some(t)) => t,
+            _ => {
+                self.status = "nothing to follow here".into();
+                return;
+            }
+        };
+        self.open(to, true);
         self.focus = Focus::Listing;
     }
 
@@ -242,6 +300,45 @@ impl App {
             at,
             self.an.xrefs_to.get(&at).map(Vec::as_slice).unwrap_or(&[]),
         )
+    }
+
+    /// The reference the cursor in the xrefs pane is on.
+    pub fn selected_xref(&self) -> Option<engine::Xref> {
+        let (_, refs) = self.xrefs();
+        refs.get(self.xsel).copied()
+    }
+
+    pub fn clamp_xsel(&mut self) {
+        let n = self.xrefs().1.len();
+        if n == 0 {
+            self.xsel = 0;
+        } else {
+            self.xsel = self.xsel.min(n - 1);
+        }
+    }
+
+    pub fn move_xsel(&mut self, delta: isize) {
+        let n = self.xrefs().1.len();
+        if n == 0 {
+            self.xsel = 0;
+            return;
+        }
+        let last = n - 1;
+        self.xsel = self.xsel.saturating_add_signed(delta).min(last);
+    }
+
+    /// Follow the xref under the cursor: jump to wherever it points.
+    pub fn jump_xref(&mut self) {
+        let Some(x) = self.selected_xref() else {
+            self.status = "no reference under the cursor".into();
+            return;
+        };
+        if self.an.function_at(x.from).is_none() && self.an.find_function(x.from).is_none() {
+            self.status = format!("0x{:x} is not in a recovered function", x.from + self.base);
+            return;
+        }
+        self.open(x.from, true);
+        self.focus = Focus::Listing;
     }
 
     // ── annotations ──
@@ -330,7 +427,10 @@ impl App {
     fn relist(&mut self) {
         if let Some(addr) = self.cur {
             if let Some(f) = self.an.find_function(addr) {
-                self.lines = listing::function(&self.an, f, &self.db, self.base);
+                self.lines = listing::function(&self.an, f, &self.db, self.base, &self.strings);
+                self.cursor = self.cursor.min(self.lines.len().saturating_sub(1));
+            } else if engine::va_to_off(&self.bin, self.base, addr).is_some() {
+                self.lines = listing::data_view(&self.bin, self.base, &self.bytes, addr);
                 self.cursor = self.cursor.min(self.lines.len().saturating_sub(1));
             }
         }
@@ -392,7 +492,8 @@ impl App {
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     Focus::Functions => Focus::Listing,
-                    Focus::Listing => Focus::Functions,
+                    Focus::Listing => Focus::Xrefs,
+                    Focus::Xrefs => Focus::Functions,
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => self.step(1),
@@ -409,6 +510,7 @@ impl App {
                     }
                 }
                 Focus::Listing => self.follow(),
+                Focus::Xrefs => self.jump_xref(),
             },
             KeyCode::Backspace => self.back(),
             KeyCode::Char('/') => self.ask(Ask::Filter),
@@ -427,6 +529,7 @@ impl App {
         match self.focus {
             Focus::Functions => self.move_sel(delta),
             Focus::Listing => self.move_cursor(delta),
+            Focus::Xrefs => self.move_xsel(delta),
         }
     }
 
@@ -441,6 +544,70 @@ impl App {
             Ask::Goto => String::new(),
         };
         self.prompt = Some(Prompt { ask, input, at });
+    }
+
+    // ── mouse ──
+
+    /// The pane a terminal position belongs to, given the size stored before
+    /// the last frame. The layout mirrors `render::draw`, kept in one place so
+    /// the two cannot disagree.
+    pub fn pane_at(&self, column: u16, row: u16) -> Option<(Focus, usize)> {
+        let (w, h) = self.dims;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        // header at row 0, footer at h-1; body is rows 1..h-2.
+        if row < 1 || row >= h.saturating_sub(1) {
+            return None;
+        }
+        let body_h = h.saturating_sub(2);
+        let fns_w = 34.min(w);
+        let xrefs_h = 8u16.min(body_h);
+        let (focus, list_len, pane_row) = if column < fns_w {
+            (Focus::Functions, self.order.len(), row)
+        } else if row + xrefs_h < h.saturating_sub(1) {
+            (Focus::Listing, self.lines.len(), row)
+        } else {
+            (
+                Focus::Xrefs,
+                self.xrefs().1.len(),
+                row - (h.saturating_sub(1) - xrefs_h),
+            )
+        };
+        // row 0 of the pane is the border, row 1 the title; items start there.
+        let idx = pane_row.saturating_sub(2) as usize;
+        Some((
+            focus,
+            if list_len == 0 {
+                0
+            } else {
+                idx.min(list_len - 1)
+            },
+        ))
+    }
+
+    pub fn on_mouse(&mut self, m: MouseEvent) {
+        match m.kind {
+            MouseEventKind::ScrollUp => self.step(-1),
+            MouseEventKind::ScrollDown => self.step(1),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some((focus, idx)) = self.pane_at(m.column, m.row) else {
+                    return;
+                };
+                self.focus = focus;
+                match focus {
+                    Focus::Functions => {
+                        self.sel = idx;
+                        if let Some(a) = self.selected_addr() {
+                            self.open(a, false);
+                        }
+                    }
+                    Focus::Listing => self.cursor = idx.min(self.lines.len().saturating_sub(1)),
+                    Focus::Xrefs => self.xsel = idx,
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -458,12 +625,17 @@ pub fn run(mut app: App) -> Result<()> {
     // restores the terminal, so a crash cannot leave the shell in raw mode.
     let mut term = ratatui::try_init()
         .map_err(|e| anyhow::anyhow!("cannot start the interactive view: {e}"))?;
+    let _ = ratatui::crossterm::execute!(&mut stdout(), event::EnableMouseCapture);
     let res = loop {
+        if let Ok(area) = term.size() {
+            app.dims = (area.width, area.height);
+        }
         if let Err(e) = term.draw(|f| render::draw(f, &app)) {
             break Err(e.into());
         }
         match event::read() {
             Ok(Event::Key(k)) => app.on_key(k),
+            Ok(Event::Mouse(m)) => app.on_mouse(m),
             Ok(_) => {}
             Err(e) => break Err(e.into()),
         }
@@ -471,6 +643,7 @@ pub fn run(mut app: App) -> Result<()> {
             break Ok(());
         }
     };
+    let _ = ratatui::crossterm::execute!(&mut stdout(), event::DisableMouseCapture);
     ratatui::restore();
     res
 }
@@ -712,5 +885,160 @@ mod tests {
             KeyEventKind::Release,
         ));
         assert_eq!(app.sel, before);
+    }
+
+    // ── xrefs pane ──
+
+    #[test]
+    fn tab_cycles_through_three_panes() {
+        let mut app = two_functions();
+        assert_eq!(app.focus, Focus::Functions);
+        for _ in 0..2 {
+            app.on_key(KeyEvent::from(KeyCode::Tab));
+        }
+        assert_eq!(app.focus, Focus::Xrefs);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Functions);
+    }
+
+    #[test]
+    fn the_xref_cursor_jumps_to_the_reference_site() {
+        let mut app = two_functions();
+        // sub_100b is called once, from 0x1000.
+        app.open(0x100b, false);
+        assert_eq!(app.xrefs().1.len(), 1);
+        app.focus = Focus::Xrefs;
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.cur, Some(0x1000), "jumped to the call site");
+        assert_eq!(app.focus, Focus::Listing, "and landed in the listing");
+    }
+
+    #[test]
+    fn xsel_is_clamped_when_the_target_changes() {
+        let mut app = two_functions();
+        app.open(0x100b, false); // one reference
+        app.focus = Focus::Xrefs;
+        app.xsel = 5;
+        app.open(0x1000, false); // entry has no references
+        assert_eq!(app.xsel, 0);
+    }
+
+    #[test]
+    fn nothing_to_jump_to_says_so_instead_of_panicking() {
+        let mut app = two_functions();
+        app.open(0x1000, false); // entry has no incoming references
+        app.focus = Focus::Xrefs;
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.status.contains("no reference"));
+    }
+
+    // ── data refs ──
+
+    /// entry lea's the string and returns; the literal sits in .rodata.
+    fn data_ref_app() -> App {
+        // lea rax, [rip+0x15] at 0x1000: ends at 0x1007, targets 0x101c.
+        let mut bytes = vec![0x48, 0x8d, 0x05, 0x15, 0x00, 0x00, 0x00, 0xc3];
+        bytes.extend_from_slice(b"hi there");
+        let mut bin = Binary::stub(Format::Elf, Arch::X86_64);
+        bin.entry = 0x1000;
+        bin.sections = vec![
+            Section {
+                name: ".text".into(),
+                vaddr: 0x1000,
+                vsize: 8,
+                file_off: 0,
+                file_size: 8,
+                entropy: 0.0,
+                read: true,
+                write: false,
+                exec: true,
+            },
+            Section {
+                name: ".rodata".into(),
+                vaddr: 0x101c,
+                vsize: 8,
+                file_off: 8,
+                file_size: 8,
+                entropy: 0.0,
+                read: true,
+                write: false,
+                exec: false,
+            },
+        ];
+        let db = Db::default();
+        let an = engine::analyze(&bin, &bytes, 10_000, &db);
+        App::new(bin, bytes, db, an, "t".into())
+    }
+
+    #[test]
+    fn the_literal_is_annotated_in_the_listing() {
+        let app = data_ref_app();
+        assert!(
+            app.lines.iter().any(|l| matches!(
+                l,
+                Line::Insn {
+                    annot: Some(crate::listing::Annot::Text(t)),
+                    ..
+                } if t == "hi there"
+            )),
+            "the lea should be annotated with the literal"
+        );
+    }
+
+    #[test]
+    fn following_a_string_operand_opens_its_bytes() {
+        let mut app = data_ref_app();
+        app.focus = Focus::Listing;
+        app.cursor = 0; // the lea
+        app.follow();
+        assert_eq!(app.cur, Some(0x101c), "followed the data ref");
+        assert!(
+            app.lines.iter().all(|l| matches!(l, Line::Data { .. })),
+            "a string opens as a hex dump, not as code"
+        );
+
+        app.back();
+        assert_eq!(app.cur, Some(0x1000), "and back returns to the lea");
+        assert_eq!(app.cursor, 0);
+    }
+
+    // ── mouse ──
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_focused_pane() {
+        let mut app = data_ref_app();
+        app.focus = Focus::Listing;
+        app.cursor = 0;
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 0, 0));
+        assert_eq!(app.cursor, 1, "wheel scrolls the listing");
+
+        app.focus = Focus::Functions;
+        let before = app.sel;
+        app.on_mouse(mouse(MouseEventKind::ScrollUp, 0, 0));
+        assert_eq!(app.sel, before.saturating_sub(1), "and the function list");
+    }
+
+    #[test]
+    fn a_click_focuses_that_pane_and_selects_the_row() {
+        let mut app = data_ref_app();
+        app.dims = (110, 30);
+        // A click in the left pane lands on the function list; with a single
+        // recovered function the row index clamps to it.
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 4));
+        assert_eq!(app.focus, Focus::Functions);
+        assert_eq!(app.selected_addr(), Some(0x1000));
+
+        // A click in the bottom-right corner lands in the xrefs pane.
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 60, 26));
+        assert_eq!(app.focus, Focus::Xrefs);
     }
 }

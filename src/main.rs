@@ -20,6 +20,7 @@ use model::Binary;
 use output::*;
 use owo_colors::{OwoColorize, Style};
 use serde_json::json;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Parser)]
 #[command(
@@ -72,6 +73,13 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Find likely bugs: sink call sites whose arguments look exploitable.
+    Audit {
+        file: String,
+        /// Only show findings reachable from an entry point or export.
+        #[arg(long)]
+        reachable: bool,
+    },
     /// Extract printable strings.
     Strings {
         file: String,
@@ -82,7 +90,7 @@ enum Command {
     Iocs { file: String },
     /// File hashes and imphash.
     Hashes { file: String },
-    /// Disassemble (x86/x64) from the entry point, a location, or a function.
+    /// Disassemble (x86/x64, AArch64) from the entry point, a location, or a function.
     Dis {
         file: String,
         #[arg(long, default_value_t = 40)]
@@ -169,6 +177,11 @@ enum Command {
     Yara { rules: String, file: String },
     /// List archive (.a/.lib) members.
     Ls { file: String },
+    /// Emit a shell completion script (bash, zsh, fish, powershell, elvish).
+    Completions { shell: clap_complete::Shell },
+    /// Compare two binaries: functions, imports, and sections. Exit code 1
+    /// when anything changed.
+    Diff { a: String, b: String },
 }
 
 fn main() {
@@ -189,6 +202,7 @@ fn real_main() -> Result<()> {
         "caps",
         "sec",
         "sinks",
+        "audit",
         "strings",
         "iocs",
         "hashes",
@@ -205,6 +219,8 @@ fn real_main() -> Result<()> {
         "yara",
         "funcs",
         "ls",
+        "completions",
+        "diff",
         "help",
         "-h",
         "--help",
@@ -225,6 +241,9 @@ fn real_main() -> Result<()> {
         Command::Sec { file } => cmd_sec(&file, cli.json),
         Command::Sinks { file, class, all } => {
             cmd_sinks(&file, class.as_deref(), all, cli.json, cli.db.as_deref())
+        }
+        Command::Audit { file, reachable } => {
+            cmd_audit(&file, reachable, cli.json, cli.db.as_deref())
         }
         Command::Strings { file, min } => cmd_strings(&file, min, cli.json),
         Command::Iocs { file } => cmd_iocs(&file, cli.json),
@@ -290,6 +309,24 @@ fn real_main() -> Result<()> {
         Command::Scan { file } => cmd_scan(&file, cli.json),
         Command::Yara { rules, file } => cmd_yara(&rules, &file, cli.json),
         Command::Ls { file } => cmd_ls(&file),
+        Command::Completions { shell } => {
+            use clap::CommandFactory;
+            use std::io::Write;
+            let mut stdout = std::io::stdout();
+            let mut cmd = Cli::command();
+            clap_complete::generate(shell, &mut cmd, "knife", &mut stdout);
+            stdout.flush().context("cannot flush stdout")?;
+            Ok(())
+        }
+        Command::Diff { a, b } => {
+            let changed = cmd_diff(&a, &b)?;
+            // A diff is the kind of command scripts inspect with the exit
+            // status: 0 = no change, 1 = something changed.
+            if changed {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -716,7 +753,7 @@ fn cmd_info(file: &str, rules: Option<&str>, as_json: bool) -> Result<()> {
     if disasm::supported(bin.arch) {
         if let Some((off, va)) = disasm::entry_location(&bin, &bytes) {
             section_header("entry point");
-            let insns = disasm::disassemble(&bytes, off, va, bin.bits, 8);
+            let insns = disasm::disassemble(&bytes, off, va, bin.bits, bin.arch, 8);
             print_disasm(&insns);
             println!("  {}", "run `knife dis` for more".style(faint()));
         }
@@ -1031,6 +1068,87 @@ fn plural(n: usize) -> &'static str {
     }
 }
 
+fn cmd_audit(file: &str, reachable_only: bool, as_json: bool, db_path: Option<&str>) -> Result<()> {
+    let s = Session::open(file, db_path, 2_000_000, "the bug audit")?;
+    if !matches!(s.bin.arch, model::Arch::X86 | model::Arch::X86_64) {
+        anyhow::bail!(
+            "argument analysis is x86/x64 only; this is {}",
+            s.bin.arch.label()
+        );
+    }
+    let mut findings = analysis::audit::run(&s.an, &s.bin, &s.bytes);
+    if reachable_only {
+        findings.retain(|f| f.reachable);
+    }
+
+    if as_json {
+        let out: Vec<_> = findings
+            .iter()
+            .map(|f| {
+                json!({
+                    "addr": f.addr,
+                    "func": f.func,
+                    "api": f.api,
+                    "pattern": f.pattern,
+                    "severity": f.severity,
+                    "reachable": f.reachable,
+                    "detail": f.detail,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    section_header(&format!("audit ({} findings)", findings.len()));
+    if findings.is_empty() {
+        println!(
+            "  {}",
+            "no argument pattern looked exploitable".style(faint())
+        );
+        println!(
+            "  {}",
+            "this is not a clean bill; it is the absence of the patterns knife checks"
+                .style(faint())
+        );
+        return Ok(());
+    }
+
+    for f in &findings {
+        let (st, kind) = match f.severity {
+            3 => (red(), "bad"),
+            2 => (amber(), "warn"),
+            _ => (muted(), "info"),
+        };
+        let site = match &f.func {
+            Some(name) => name.clone(),
+            None => "-".into(),
+        };
+        let reach = if f.reachable {
+            "  ← reachable".style(red()).to_string()
+        } else {
+            String::new()
+        };
+        println!(
+            "  {} {:<16} {:<24} {}{}",
+            marker(kind).style(st),
+            f.pattern.style(st).bold(),
+            format!("{}  {}", f.api, site).style(muted()),
+            format!("@ 0x{:x}", f.addr).style(faint()),
+            reach,
+        );
+        println!("  {:<4}{}", "", f.detail.style(faint()));
+    }
+
+    if s.an.truncated {
+        println!(
+            "  {}",
+            "analysis budget reached, findings may be incomplete".style(amber())
+        );
+    }
+    Ok(())
+}
+
 fn cmd_strings(file: &str, min: usize, as_json: bool) -> Result<()> {
     let bytes = load(file)?;
     let out = strs::extract(&bytes, min);
@@ -1125,7 +1243,7 @@ fn cmd_dis(
     let bin = parse(file, &bytes)?;
     if !disasm::supported(bin.arch) {
         anyhow::bail!(
-            "disassembly supports x86/x64 only; this is {}",
+            "disassembly supports x86/x64 and AArch64; this is {}",
             bin.arch.label()
         );
     }
@@ -1143,7 +1261,7 @@ fn cmd_dis(
         disasm::entry_location(&bin, &bytes).context("cannot locate entry point")?
     };
     section_header(&format!("disassembly @ 0x{va:x}"));
-    let insns = disasm::disassemble(&bytes, foff, va, bin.bits, count);
+    let insns = disasm::disassemble(&bytes, foff, va, bin.bits, bin.arch, count);
     print_disasm(&insns);
     Ok(())
 }
@@ -1418,6 +1536,7 @@ fn cmd_funcs(file: &str, by_refs: bool, as_json: bool, db_path: Option<&str>) ->
                     "size": f.size,
                     "incoming": f.incoming,
                     "calls": f.calls.len(),
+                    "tables": f.tables.len(),
                 })
             })
             .collect();
@@ -1504,9 +1623,17 @@ fn dis_function(sess: &Session, sel: &str) -> Result<()> {
 
     // The listing model is shared with the interactive view, so the two can
     // never drift into showing different things.
-    for line in listing::function(an, func, &sess.db, engine::display_base(&sess.bin)) {
+    let strings = listing::string_map(&sess.bin, &sess.bytes, sess.an.display_base);
+    for line in listing::function(
+        an,
+        func,
+        &sess.db,
+        engine::display_base(&sess.bin),
+        &strings,
+    ) {
         match line {
             listing::Line::Label { text, .. } => println!("  {}:", text.style(amber())),
+            listing::Line::Data { text, .. } => println!("  {}", text.style(muted())),
             listing::Line::Insn {
                 addr,
                 mnemonic,
@@ -1519,6 +1646,9 @@ fn dis_function(sess: &Session, sel: &str) -> Result<()> {
                     Some(listing::Annot::Note(t)) => format!("  ; {t}").style(amber()).to_string(),
                     Some(listing::Annot::Symbol(t)) => format!("  ; {t}").style(mint()).to_string(),
                     Some(listing::Annot::Local(t)) => format!("  ; {t}").style(faint()).to_string(),
+                    Some(listing::Annot::Text(t)) => {
+                        format!("  ; \"{t}\"").style(amber()).to_string()
+                    }
                     None => String::new(),
                 };
                 println!(
@@ -1722,6 +1852,223 @@ fn cmd_ls(file: &str) -> Result<()> {
     Ok(())
 }
 
+fn cmd_diff(a: &str, b: &str) -> Result<bool> {
+    let bytes_a = load(a)?;
+    let bin_a = parse(a, &bytes_a)?;
+    let bytes_b = load(b)?;
+    let bin_b = parse(b, &bytes_b)?;
+    let (lines, changed) = diff_binaries(&bin_a, &bytes_a, &bin_b, &bytes_b);
+
+    if changed.is_empty() {
+        println!(
+            "  {}  {} and {} are identical",
+            "no change".style(mint()),
+            basename(a),
+            basename(b)
+        );
+        return Ok(false);
+    }
+
+    println!(
+        "  differences between {} and {}",
+        basename(a).style(faint()),
+        basename(b).style(faint())
+    );
+    for l in &lines {
+        let (mark, rest) = l.split_once(' ').unwrap_or(("", l.as_str()));
+        match mark {
+            "+" => println!("  {} {}", "+".style(mint()), rest.style(mint())),
+            "-" => println!("  {} {}", "-".style(red()), rest.style(red())),
+            "~" => println!("  {} {}", "~".style(amber()), rest.style(amber())),
+            _ => println!("  {l}"),
+        }
+    }
+    println!(
+        "  {} category(ies) changed: {}",
+        changed.len(),
+        changed.join(", ")
+    );
+    Ok(true)
+}
+
+/// The engine of `knife diff`, kept free of any I/O so it is unit-testable:
+/// same address → compared; same name → compared; a single edited byte inside
+/// a function body counts as a change even when nothing else moved.
+fn diff_binaries(
+    bin_a: &model::Binary,
+    bytes_a: &[u8],
+    bin_b: &model::Binary,
+    bytes_b: &[u8],
+) -> (Vec<String>, Vec<String>) {
+    let an_a = engine::analyze(bin_a, bytes_a, 500_000, &db::Db::default());
+    let an_b = engine::analyze(bin_b, bytes_b, 500_000, &db::Db::default());
+
+    // Lines of `+`/`-`/`~` marked output, plus the categories that changed.
+    let mut lines: Vec<String> = Vec::new();
+    let mut changed: Vec<String> = Vec::new();
+
+    // ── the container itself ──
+    let arch_a = format!("{:?} {}", bin_a.arch, bin_a.bits);
+    let arch_b = format!("{:?} {}", bin_b.arch, bin_b.bits);
+    if arch_a != arch_b {
+        changed.push("arch".into());
+        lines.push(format!("~ arch: {arch_a}  →  {arch_b}"));
+    }
+    let ep_a = format!("0x{:x}", bin_a.entry + bin_a.image_base);
+    let ep_b = format!("0x{:x}", bin_b.entry + bin_b.image_base);
+    if ep_a != ep_b {
+        changed.push("entry".into());
+        lines.push(format!("~ entry point: {ep_a}  →  {ep_b}"));
+    }
+
+    // ── sections, keyed by name ──
+    let sects_a: BTreeMap<&str, &model::Section> = bin_a
+        .sections
+        .iter()
+        .map(|s| (s.name.as_str(), s))
+        .collect();
+    let sects_b: BTreeMap<&str, &model::Section> = bin_b
+        .sections
+        .iter()
+        .map(|s| (s.name.as_str(), s))
+        .collect();
+    let all: BTreeSet<&str> = sects_a.keys().chain(sects_b.keys()).copied().collect();
+    for name in all {
+        match (sects_a.get(name), sects_b.get(name)) {
+            (Some(x), Some(y)) => {
+                let xk = format!("{:#x} {:#x} {}", x.vaddr, x.vsize, x.flags());
+                let yk = format!("{:#x} {:#x} {}", y.vaddr, y.vsize, y.flags());
+                if xk != yk {
+                    changed.push("section".into());
+                    lines.push(format!("~ section {name}: {xk}  →  {yk}"));
+                }
+            }
+            (Some(x), None) => {
+                changed.push("section".into());
+                lines.push(format!(
+                    "- section {name}: {:#x} {} {}",
+                    x.vsize,
+                    x.flags(),
+                    human(x.file_size)
+                ));
+            }
+            (None, Some(y)) => {
+                changed.push("section".into());
+                lines.push(format!(
+                    "+ section {name}: {:#x} {} {}",
+                    y.vsize,
+                    y.flags(),
+                    human(y.file_size)
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    // ── imports, as (library!function) pairs ──
+    let imports_a: BTreeSet<String> = bin_a
+        .imports
+        .iter()
+        .flat_map(|lib| {
+            lib.functions
+                .iter()
+                .map(move |f| format!("{}!{}", lib.name, f))
+        })
+        .collect();
+    let imports_b: BTreeSet<String> = bin_b
+        .imports
+        .iter()
+        .flat_map(|lib| {
+            lib.functions
+                .iter()
+                .map(move |f| format!("{}!{}", lib.name, f))
+        })
+        .collect();
+    for missing in imports_a.difference(&imports_b) {
+        changed.push("import".into());
+        lines.push(format!("- {missing}"));
+    }
+    for extra in imports_b.difference(&imports_a) {
+        changed.push("import".into());
+        lines.push(format!("+ {extra}"));
+    }
+
+    // ── functions ──
+    let funcs_a: BTreeMap<u64, &engine::Function> = an_a
+        .functions
+        .iter()
+        .map(|f| (f.addr + an_a.display_base, f))
+        .collect();
+    let funcs_b: BTreeMap<u64, &engine::Function> = an_b
+        .functions
+        .iter()
+        .map(|f| (f.addr + an_b.display_base, f))
+        .collect();
+    let addrs: BTreeSet<u64> = funcs_a.keys().chain(funcs_b.keys()).copied().collect();
+    for va in addrs {
+        match (funcs_a.get(&va), funcs_b.get(&va)) {
+            (None, None) => {}
+            (None, Some(f)) => {
+                changed.push("func".into());
+                lines.push(format!("+ {} at 0x{va:x}", f.name));
+            }
+            (Some(f), None) => {
+                changed.push("func".into());
+                lines.push(format!("- {} at 0x{va:x}", f.name));
+            }
+            (Some(x), Some(y)) => {
+                let renamed = x.named && y.named && x.name != y.name;
+                let body_changed = x.body_hash() != y.body_hash();
+                if x.size != y.size || renamed || body_changed {
+                    changed.push("func".into());
+                    let mut detail = format!("size {}  →  {}", x.size, y.size);
+                    if renamed {
+                        detail.push_str(&format!(" (now {})", y.name));
+                    }
+                    if body_changed {
+                        detail.push_str(", body changed");
+                    }
+                    lines.push(format!("~ {} at 0x{va:x}: {detail}", x.name));
+                }
+            }
+        }
+    }
+
+    // ── the raw bytes, as a guard when the structural picture is empty ──
+    // Files with no sections (hand-built or truncated) compare as identical
+    // even when a byte flipped; the digest below makes that a change. When
+    // sections/functions already differ this is redundant, so it stays quiet.
+    if changed.is_empty() {
+        let ra = rolling_hash_bytes(bytes_a);
+        let rb = rolling_hash_bytes(bytes_b);
+        if bytes_a.len() != bytes_b.len() {
+            changed.push("size".into());
+            lines.push(format!(
+                "~ size: {} → {} bytes",
+                bytes_a.len(),
+                bytes_b.len()
+            ));
+        } else if ra != rb {
+            changed.push("raw".into());
+            lines.push("~ raw byte content differs, outside named sections".into());
+        }
+    }
+
+    (lines, changed)
+}
+
+/// A cheap deterministic digest of the whole file, so the guard above needs
+/// no new crate. Collisions are irrelevant here: it pairs two files only.
+fn rolling_hash_bytes(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for (i, &b) in bytes.iter().enumerate() {
+        h ^= u64::from(b);
+        h = h.rotate_left(13);
+        h ^= (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+    h
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────
 
 fn parse_num(s: &str) -> Result<u64> {
@@ -1744,5 +2091,88 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let t: String = s.chars().take(max - 1).collect();
         format!("{t}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formats::fixture;
+
+    /// A raw x86-64 code blob mapped at `vaddr`, exec, nothing else — the
+    /// minimal shape both sides of a diff can share.
+    fn code_at(vaddr: u64, code: &[u8]) -> (model::Binary, Vec<u8>) {
+        let mut bin = model::Binary::stub(model::Format::Elf, model::Arch::X86_64);
+        bin.entry = vaddr;
+        bin.sections = vec![model::Section {
+            name: ".text".into(),
+            vaddr,
+            vsize: code.len() as u64,
+            file_off: vaddr,
+            file_size: code.len() as u64,
+            entropy: 0.0,
+            read: true,
+            write: false,
+            exec: true,
+        }];
+        let mut bytes = vec![0u8; vaddr as usize];
+        bytes.extend_from_slice(code);
+        (bin, bytes)
+    }
+
+    #[test]
+    fn identical_binaries_report_no_change() {
+        let code = [0x90, 0x90, 0xc3]; // nop; nop; ret
+        let (a, ba) = code_at(0x1000, &code);
+        let (b, bb) = code_at(0x1000, &code);
+        let (lines, changed) = diff_binaries(&a, &ba, &b, &bb);
+        assert!(changed.is_empty(), "unexpected: {changed:?}");
+        assert!(lines.is_empty(), "unexpected: {lines:?}");
+    }
+
+    #[test]
+    fn a_single_edited_byte_flags_the_body_even_when_the_size_matches() {
+        // Same length, same frames: only one nop became an int3.
+        let a = [0x90, 0x90, 0x90, 0xc3];
+        let b = [0x90, 0xcc, 0x90, 0xc3];
+        let (x, bx) = code_at(0x1000, &a);
+        let (y, by) = code_at(0x1000, &b);
+        let (lines, changed) = diff_binaries(&x, &bx, &y, &by);
+        let func_lines: Vec<_> = lines.iter().filter(|l| l.starts_with('~')).collect();
+        assert_eq!(func_lines.len(), 1, "one function moved: {lines:?}");
+        assert!(func_lines[0].contains("body changed"), "{func_lines:?}");
+        assert!(changed.contains(&"func".to_string()), "{changed:?}");
+    }
+
+    #[test]
+    fn a_byte_flip_outside_any_sections_is_still_a_change() {
+        // No sections at all, no bytes decoded into functions: only the raw
+        // guard can see this difference.
+        let mut a =
+            crate::model::Binary::stub(crate::model::Format::Elf, crate::model::Arch::X86_64);
+        let mut b =
+            crate::model::Binary::stub(crate::model::Format::Elf, crate::model::Arch::X86_64);
+        a.entry = 0x1000;
+        b.entry = 0x1000;
+        let (lines, changed) = diff_binaries(&a, b"\x90\xc3", &b, b"\xcc\xc3");
+        assert!(changed.contains(&"raw".to_string()), "{changed:?}");
+        assert!(
+            lines.iter().any(|l| l.contains("raw byte content differs")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn imports_are_compared_across_formats() {
+        let a_bytes = fixture::pe_with_iat_call();
+        let b_bytes = fixture::elf_with_plt_call();
+        let a = crate::formats::analyze("a", &a_bytes).unwrap();
+        let b = crate::formats::analyze("b", &b_bytes).unwrap();
+        let (lines, changed) = diff_binaries(&a, &a_bytes, &b, &b_bytes);
+        assert!(!changed.is_empty(), "a PE and an ELF must differ");
+        let all = lines.join("\n");
+        assert!(all.contains("kernel32.dll!ExitProcess"), "{all}");
+        assert!(all.contains("strcpy"), "{all}");
+        assert!(all.contains("section .text"), "{all}");
     }
 }

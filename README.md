@@ -54,6 +54,7 @@ One tool, many jobs, which is the point of a Swiss-army knife:
 | `knife FILE` | full triage: verdict, hashes, sections, mitigations, capabilities, IOCs, artifacts, entry disasm |
 | `knife sec FILE` | exploit mitigations, and what each missing one buys an attacker |
 | `knife sinks FILE [--class C] [--all]` | dangerous-API call sites, grouped by bug class |
+| `knife audit FILE [--reachable]` | sink call sites whose arguments look exploitable |
 | `knife xrefs FILE TARGET` | what references a function, import, or address |
 | `knife xrefs FILE --str TEXT` | what references the strings matching `TEXT` |
 | `knife paths FILE TARGET [--from F]` | call chains that reach a sink from entry points and exports |
@@ -63,7 +64,7 @@ One tool, many jobs, which is the point of a Swiss-army knife:
 | `knife db FILE` | everything you have stored for this binary |
 | `knife funcs FILE [--by-refs]` | recover functions via control-flow analysis |
 | `knife dis FILE --func NAME` | disassemble a whole function with labels and xrefs |
-| `knife dis FILE [--vaddr X \| --off Y] [--count N]` | linear disassembly (x86/x64) |
+| `knife dis FILE [--vaddr X \| --off Y] [--count N]` | linear disassembly (x86/x64, AArch64) |
 | `knife sections FILE` | sections/segments with per-section entropy bars |
 | `knife imports FILE` | imported libs and functions, suspicious APIs flagged |
 | `knife exports FILE` | exported symbols |
@@ -76,6 +77,8 @@ One tool, many jobs, which is the point of a Swiss-army knife:
 | `knife map FILE` | whole-file entropy sparkline, packed regions flagged |
 | `knife hex FILE --off O --len L` | hex dump |
 | `knife ls FILE` | archive (.a/.lib) members |
+| `knife completions SHELL` | shell completion script (bash, zsh, fish, powershell, elvish) |
+| `knife diff A B` | compare two binaries' functions, imports, sections; exit 1 on any change |
 
 Add `--json` to any analysis command for machine-readable output. `knife FILE`
 is shorthand for `knife info FILE`, and `knife FILE --rules DIR` folds a YARA
@@ -104,6 +107,20 @@ call sites across 17 APIs, and on a `vmlinux` image it finds 204 `strcpy` and
 220 `sprintf` sites in named kernel functions. Statically linked targets work
 too, because a defined symbol is matched the same way an import is.
 
+**Which ones are actually wrong.** `knife sinks` still leaves you reading every
+call. `knife audit` reads them first: for each catalogued call it recovers where
+the interesting argument came from, and keeps only the sites whose provenance
+matches a bug pattern. A `memcpy` whose length was just computed by a
+subtraction (underflow to a huge size), an allocation sized by a multiply
+(integer overflow), a `printf` whose format string is loaded from memory rather
+than pointed at a constant, an unbounded `strcpy` reachable from an export.
+Each finding names the function, the address, and what is wrong, ranked so the
+exploitable-looking ones come first. The provenance is an intra-block backward
+walk over the argument registers (x86/x64): shallow on purpose, it stops at the
+previous call and stays quiet when it cannot see an origin, so a finding is
+worth the look. On a signed, hardened `kernel32.dll` it surfaces a dozen sites,
+not a thousand.
+
 **What reaches what.** `knife xrefs` answers "who calls this" for a function,
 an imported API, or an address, and `--str` answers the other direction, which
 code touches this string. `knife paths` walks the call graph backwards from a
@@ -113,6 +130,7 @@ the reachability question that decides whether a sink is worth your afternoon.
 ```bash
 knife sec ./target                       # what am I up against
 knife sinks ./target --class memory      # where could the bug be
+knife audit ./target --reachable         # which sites look actually exploitable
 knife xrefs ./target --str "/tmp/"       # who builds that path
 knife paths ./target system              # can anything reach it
 ```
@@ -134,9 +152,14 @@ knife dis  ./target --func parse_record
 the function list on the left, the listing and cross-references on the right.
 `↵` opens a function or follows the call under the cursor, `⌫` returns to where
 you followed from, `/` filters, `g` goes to an address or a symbol, and `n` and
-`c` name and annotate whatever the cursor is on. Names and notes go to the same
-database the command line writes, as you make them, so quitting is not a save
-step and `knife funcs` in another terminal already agrees with you.
+`c` name and annotate whatever the cursor is on. The xrefs pane is a list of
+its own: tab into it, and `↵` jumps to the reference's site. Operands that
+point at a literal are annotated with the string itself, in the listing and in
+the printed `dis --func`, and following one opens its bytes as a hex dump. The
+mouse works too: the wheel scrolls the focused pane, a click focuses and
+selects. Names and notes go to the same database the command line writes, as
+you make them, so quitting is not a save step and `knife funcs` in another
+terminal already agrees with you.
 
 ```bash
 knife tui ./target
@@ -219,7 +242,9 @@ knife iocs sample.exe --json | jq '.[] | select(.kind=="url").value'
 - [x] Sink call sites, code and data xrefs, call-graph reachability
 - [x] Persistent analysis database: your names and notes, kept between sessions
 - [x] Interactive TUI (function list / listing / xrefs, naming and notes)
-- [ ] Library-function identification (FLIRT-style)
+- [x] Library-function identification (FLIRT-style)
+- [x] AArch64 disassembly and PLT-veneer resolution
+- [x] Argument-provenance bug audit (`knife audit`)
 - [ ] IR lift toward a decompiler view
 
 ## Build from source

@@ -1,7 +1,10 @@
+pub mod aarch64;
+pub mod audit;
 pub mod capabilities;
 pub mod disasm;
 pub mod engine;
 pub mod entropy;
+pub mod flirt;
 pub mod hardening;
 pub mod hashes;
 pub mod signatures;

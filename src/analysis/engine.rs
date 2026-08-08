@@ -10,7 +10,7 @@ use crate::model::{Binary, Format, SymKind};
 use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Formatter, Instruction, IntelFormatter, Mnemonic,
 };
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 // Several fields here (instruction length/flow, block end/successors, xref
 // kind) are part of the CFG model for the upcoming interactive/graph views and
@@ -19,12 +19,40 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub struct EngineInsn {
     pub addr: u64,
     pub len: usize,
-    pub text: String,
+    /// The instruction's raw bytes. Formatting is deferred to `text`, because
+    /// most commands (function lists, sinks, xrefs) never print an operand,
+    /// and formatting every instruction of a kernel image only to count it
+    /// twice is the kind of waste that shows up as seconds.
+    pub bytes: Vec<u8>,
     /// A resolved symbolic target (function name / import), if any.
     pub target_name: Option<String>,
     /// A branch/call target address, if this instruction has one.
     pub target: Option<u64>,
     pub flow: FlowControl,
+}
+
+impl EngineInsn {
+    /// Render the instruction, formatted on demand from the stored bytes.
+    pub fn text(&self, bits: u32, arch: crate::model::Arch) -> String {
+        if arch.is_x86() {
+            let mut fmt = IntelFormatter::new();
+            fmt.options_mut().set_uppercase_hex(false);
+            fmt.options_mut().set_hex_prefix("0x");
+            fmt.options_mut().set_hex_suffix("");
+            fmt.options_mut().set_space_after_operand_separator(true);
+
+            let mut decoder = Decoder::with_ip(bits, &self.bytes, self.addr, DecoderOptions::NONE);
+            if !decoder.can_decode() {
+                return String::new();
+            }
+            let insn = decoder.decode();
+            let mut s = String::new();
+            fmt.format(&insn, &mut s);
+            s
+        } else {
+            crate::analysis::aarch64::text(&self.bytes, self.addr)
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -43,15 +71,40 @@ pub struct Function {
     pub incoming: usize,
     pub calls: Vec<u64>,
     pub named: bool,
+    /// Virtual addresses of jump tables this function dispatches through.
+    pub tables: Vec<u64>,
+}
+
+impl Function {
+    /// A deterministic fingerprint of the function's raw instruction bytes.
+    /// Blocks are visited in address order and every instruction contributes
+    /// its address and bytes, so two otherwise-identical functions that differ
+    /// by a single edited byte hash differently — `knife diff` uses this to
+    /// flag a changed body even when the size lines up.
+    pub fn body_hash(&self) -> u64 {
+        let mut h = 0x9e37_79b9_7f4a_7c15u64;
+        for b in &self.blocks {
+            h = h.rotate_left(5) ^ b.start.wrapping_mul(0x8000_0000_0000_0000);
+            h ^= b.end;
+            for i in &b.insns {
+                for byte in &i.bytes {
+                    h = h.rotate_left(1) ^ u64::from(*byte);
+                }
+                h ^= i.addr;
+            }
+        }
+        h
+    }
 }
 
 #[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Xref {
     pub from: u64,
     pub kind: XrefKind,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XrefKind {
     Call,
     Jump,
@@ -59,6 +112,15 @@ pub enum XrefKind {
     /// An instruction that names an address without transferring control to it:
     /// `lea rax, [rip+str]`, a global load, a function pointer being taken.
     Data,
+}
+
+/// A reference *from* an instruction: what it reaches. The mirror of `Xref`,
+/// kept because "what does this line point at" is the question the listing and
+/// the interactive view ask at every cursor stop.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Ref {
+    pub to: u64,
+    pub kind: XrefKind,
 }
 
 impl XrefKind {
@@ -75,6 +137,9 @@ impl XrefKind {
 pub struct Analysis {
     pub functions: Vec<Function>,
     pub xrefs_to: BTreeMap<u64, Vec<Xref>>,
+    /// The reverse lookup: instruction address -> what it references, whether
+    /// that is a call, a branch, or a data operand pointing at a string.
+    pub xrefs_from: BTreeMap<u64, Vec<Ref>>,
     pub names: BTreeMap<u64, String>,
     /// Every address that reaches an imported function, whether it is a PLT/ILT
     /// stub or the import slot itself, mapped to its full decorated name. This
@@ -83,8 +148,8 @@ pub struct Analysis {
     pub imports: BTreeMap<u64, String>,
     /// Kept for API symmetry; addresses are already absolute, so this is 0.
     pub display_base: u64,
-    #[allow(dead_code)]
     pub bits: u32,
+    pub arch: crate::model::Arch,
     pub truncated: bool,
 }
 
@@ -237,7 +302,9 @@ pub fn display_base(bin: &Binary) -> u64 {
 }
 
 /// VA → file offset (subtract the base to get an RVA, then walk sections).
-fn va_to_off(bin: &Binary, base: u64, va: u64) -> Option<usize> {
+/// Public because the listing and the interactive view turn addresses back
+/// into bytes the same way the disassembler does.
+pub fn va_to_off(bin: &Binary, base: u64, va: u64) -> Option<usize> {
     let rva = va.checked_sub(base)?;
     for s in &bin.sections {
         let span = s.vsize.max(s.file_size);
@@ -307,6 +374,44 @@ fn data_ref(bin: &Binary, base: u64, insn: &Instruction) -> Option<u64> {
     None
 }
 
+/// The start address of a jump table if `insn` is an indexed branch into one.
+///
+/// x86 has no RIP-relative indexed addressing, so a switch works in exactly
+/// two shapes, both resolved here:
+///
+/// * `jmp qword ptr [kind*8 + disp32]` — the displacement is the table's
+///   absolute address (non-PIE);
+/// * `lea rax, [rip+disp]; jmp qword ptr [rax*8]` — the LEA wrote the table
+///   address into `regs`, MSVC's favorite for PIE.
+///
+/// Anything else (bare `jmp rax`, unindexed memory jumps) has no table.
+fn jump_table_base(
+    bin: &Binary,
+    insn: &iced_x86::Instruction,
+    regs: &HashMap<iced_x86::Register, u64>,
+) -> Option<u64> {
+    if !matches!(
+        bin.arch,
+        crate::model::Arch::X86 | crate::model::Arch::X86_64
+    ) {
+        return None;
+    }
+    let idx = insn.memory_index();
+    if idx == iced_x86::Register::None {
+        return None;
+    }
+    let disp = insn.memory_displacement64();
+    if let Some(t) = regs.get(&idx) {
+        // The base came from an earlier `lea [rip+x]`, with an optional small
+        // displacement folded into the addressing (rare but real).
+        return Some(t.wrapping_add(disp));
+    }
+    if insn.memory_base() == iced_x86::Register::None && disp != 0 {
+        return Some(disp);
+    }
+    None
+}
+
 pub fn analyze(bin: &Binary, bytes: &[u8], max_insns: usize, db: &crate::db::Db) -> Analysis {
     let base = display_base(bin);
 
@@ -371,6 +476,7 @@ pub fn analyze(bin: &Binary, bytes: &[u8], max_insns: usize, db: &crate::db::Db)
 
     let mut functions: Vec<Function> = Vec::new();
     let mut xrefs_to: BTreeMap<u64, Vec<Xref>> = BTreeMap::new();
+    let mut xrefs_from: BTreeMap<u64, Vec<Ref>> = BTreeMap::new();
     let mut done: BTreeSet<u64> = BTreeSet::new();
     let mut budget = max_insns;
     let mut truncated = false;
@@ -394,6 +500,7 @@ pub fn analyze(bin: &Binary, bytes: &[u8], max_insns: usize, db: &crate::db::Db)
             &import_slots,
             &boundaries,
             &mut xrefs_to,
+            &mut xrefs_from,
             budget,
         );
         budget = budget.saturating_sub(spent);
@@ -414,6 +521,10 @@ pub fn analyze(bin: &Binary, bytes: &[u8], max_insns: usize, db: &crate::db::Db)
         refs.sort_by_key(|x| (x.from, x.kind as u8));
         refs.dedup_by_key(|x| (x.from, x.kind as u8));
     }
+    for refs in xrefs_from.values_mut() {
+        refs.sort_by_key(|x| (x.to, x.kind as u8));
+        refs.dedup_by_key(|x| (x.to, x.kind as u8));
+    }
 
     let mut incoming: BTreeMap<u64, usize> = BTreeMap::new();
     for (target, refs) in &xrefs_to {
@@ -423,6 +534,17 @@ pub fn analyze(bin: &Binary, bytes: &[u8], max_insns: usize, db: &crate::db::Db)
         f.incoming = incoming.get(&f.addr).copied().unwrap_or(0);
         f.named = names.contains_key(&f.addr);
         if !f.named {
+            // A nameless function whose opening bytes match a known helper
+            // gets the helper's name instead of a flow-graph serial number.
+            if let Some(off) = va_to_off(bin, base, f.addr) {
+                if let Some(sig) = crate::analysis::flirt::identify(bytes, off, f.size as usize) {
+                    names.insert(f.addr, sig.to_string());
+                    f.name = sig.to_string();
+                    f.named = true;
+                }
+            }
+        }
+        if !f.named {
             f.name = format!("sub_{:x}", f.addr);
         }
     }
@@ -431,10 +553,12 @@ pub fn analyze(bin: &Binary, bytes: &[u8], max_insns: usize, db: &crate::db::Db)
     Analysis {
         functions,
         xrefs_to,
+        xrefs_from,
         names,
         imports,
         display_base: 0,
         bits: bin.bits,
+        arch: bin.arch,
         truncated,
     }
 }
@@ -449,15 +573,22 @@ fn build_function(
     import_slots: &BTreeMap<u64, String>,
     boundaries: &BTreeSet<u64>,
     xrefs_to: &mut BTreeMap<u64, Vec<Xref>>,
+    xrefs_from: &mut BTreeMap<u64, Vec<Ref>>,
     budget: usize,
 ) -> (Function, Vec<u64>, usize) {
     let mut blocks: BTreeMap<u64, BasicBlock> = BTreeMap::new();
     let mut worklist: VecDeque<u64> = VecDeque::new();
     let mut seen: BTreeSet<u64> = BTreeSet::new();
     let mut calls: Vec<u64> = Vec::new();
+    let mut tables: Vec<u64> = Vec::new();
     let mut spent = 0usize;
     let mut min_start = entry;
     let mut max_end = entry;
+    // Addresses the code is known to have written into registers (only ever
+    // via `lea r64,[rip+x]` / `mov r64, imm`), which is what makes a switch's
+    // table address knowable. Inaccurate across conditional paths by design —
+    // a stale entry can only *miss* a table, never invent one.
+    let mut regs: HashMap<iced_x86::Register, u64> = HashMap::new();
 
     // A block target inside this function that is not another function's entry.
     let queue_block = |t: u64, seen: &mut BTreeSet<u64>, wl: &mut VecDeque<u64>| -> bool {
@@ -487,72 +618,143 @@ fn build_function(
         min_start = min_start.min(block_start);
         let mut decoder =
             Decoder::with_ip(bin.bits, &bytes[off..], block_start, DecoderOptions::NONE);
+        // AArch64 has no variable-width decoding: the cursor is just +4 each
+        // instruction.
+        let mut apos = 0usize;
+        let is_a64 = bin.arch == crate::model::Arch::Aarch64;
         let mut insns = Vec::new();
         let mut succ = Vec::new();
         let mut end = block_start;
 
         loop {
-            if !decoder.can_decode() || spent >= budget {
+            if spent >= budget {
                 break;
             }
-            let insn = decoder.decode();
-            if insn.is_invalid() {
-                break;
-            }
-            spent += 1;
-            let addr = insn.ip();
-            let len = insn.len();
+            // One decoded instruction, normalized to what the flow handling
+            // needs, plus the iced view for the x86-only bits (IAT slots,
+            // jump tables, register tracking).
+            let mut ice: Option<Instruction> = None;
+            let (addr, len, raw, flow, dtarget) = if is_a64 {
+                let at = block_start + apos as u64;
+                let Some(w) = crate::analysis::aarch64::decode(&bytes[off + apos..], at) else {
+                    break;
+                };
+                spent += 1;
+                let raw = bytes[off + apos..off + apos + w.len].to_vec();
+                apos += w.len;
+                (w.addr, w.len, raw, w.flow, w.target)
+            } else {
+                if !decoder.can_decode() {
+                    break;
+                }
+                let pos = decoder.position();
+                let insn = decoder.decode();
+                if insn.is_invalid() {
+                    break;
+                }
+                spent += 1;
+                let flow = insn.flow_control();
+                let dtarget = if matches!(
+                    flow,
+                    FlowControl::Call
+                        | FlowControl::UnconditionalBranch
+                        | FlowControl::ConditionalBranch
+                ) && matches!(
+                    insn.op0_kind(),
+                    iced_x86::OpKind::NearBranch16
+                        | iced_x86::OpKind::NearBranch32
+                        | iced_x86::OpKind::NearBranch64
+                ) {
+                    Some(insn.near_branch_target())
+                } else {
+                    None
+                };
+                let addr = insn.ip();
+                let len = insn.len();
+                let raw = bytes[off + pos..off + pos + len].to_vec();
+                ice = Some(insn);
+                (addr, len, raw, flow, dtarget)
+            };
             end = addr + len as u64;
             max_end = max_end.max(end);
-
-            let flow = insn.flow_control();
-            let mut target = None;
+            let mut target = dtarget;
             let mut target_name = None;
 
-            let is_near_branch = matches!(
-                insn.op0_kind(),
-                iced_x86::OpKind::NearBranch16
-                    | iced_x86::OpKind::NearBranch32
-                    | iced_x86::OpKind::NearBranch64
-            );
-
-            match flow {
-                FlowControl::Call if is_near_branch => {
-                    let t = insn.near_branch_target();
-                    target = Some(t);
-                    target_name = names.get(&t).cloned();
-                    calls.push(t);
-                    xrefs_to.entry(t).or_default().push(Xref {
-                        from: addr,
-                        kind: XrefKind::Call,
-                    });
-                }
-                FlowControl::UnconditionalBranch if is_near_branch => {
-                    let t = insn.near_branch_target();
-                    target = Some(t);
-                    target_name = names.get(&t).cloned();
-                    let kind = XrefKind::Jump;
-                    xrefs_to
-                        .entry(t)
-                        .or_default()
-                        .push(Xref { from: addr, kind });
-                    // tail-call to another function, or an intra-function jump?
-                    if boundaries.contains(&t) && t != entry {
-                        calls.push(t); // treat as a tail call
-                    } else if queue_block(t, &mut seen, &mut worklist) {
-                        succ.push(t);
+            // Constant register tracking (see `regs`), general-case limited to
+            // the two shapes real compilers use to address switch tables.
+            if let Some(insn) = &ice {
+                if insn.op0_kind() == iced_x86::OpKind::Register {
+                    let reg = insn.op0_register();
+                    let known = if insn.mnemonic() == iced_x86::Mnemonic::Lea
+                        && insn.is_ip_rel_memory_operand()
+                    {
+                        let t = insn.ip_rel_memory_address();
+                        is_mapped(bin, base, t).then_some(t)
+                    } else if insn.mnemonic() == iced_x86::Mnemonic::Mov
+                        && insn.op_count() == 2
+                        && insn.op1_kind() == iced_x86::OpKind::Immediate64
+                    {
+                        let t = insn.immediate64();
+                        is_mapped(bin, base, t).then_some(t)
+                    } else {
+                        None
+                    };
+                    if let Some(t) = known {
+                        regs.insert(reg, t);
                     }
                 }
-                FlowControl::ConditionalBranch if is_near_branch => {
-                    let t = insn.near_branch_target();
-                    target = Some(t);
-                    target_name = names.get(&t).cloned();
-                    xrefs_to.entry(t).or_default().push(Xref {
-                        from: addr,
-                        kind: XrefKind::Branch,
-                    });
-                    if queue_block(t, &mut seen, &mut worklist) {
-                        succ.push(t);
+            }
+
+            match flow {
+                FlowControl::Call => {
+                    if let Some(t) = target {
+                        target_name = names.get(&t).cloned();
+                        calls.push(t);
+                        xrefs_to.entry(t).or_default().push(Xref {
+                            from: addr,
+                            kind: XrefKind::Call,
+                        });
+                        xrefs_from.entry(addr).or_default().push(Ref {
+                            to: t,
+                            kind: XrefKind::Call,
+                        });
+                    }
+                }
+                FlowControl::UnconditionalBranch => {
+                    if let Some(t) = target {
+                        target_name = names.get(&t).cloned();
+                        let kind = XrefKind::Jump;
+                        xrefs_to
+                            .entry(t)
+                            .or_default()
+                            .push(Xref { from: addr, kind });
+                        xrefs_from
+                            .entry(addr)
+                            .or_default()
+                            .push(Ref { to: t, kind });
+                        // tail-call to another function, or an intra-function
+                        // jump?
+                        if boundaries.contains(&t) && t != entry {
+                            calls.push(t); // treat as a tail call
+                        } else if queue_block(t, &mut seen, &mut worklist) {
+                            succ.push(t);
+                        }
+                    }
+                }
+                FlowControl::ConditionalBranch => {
+                    if let Some(t) = target {
+                        target_name = names.get(&t).cloned();
+                        xrefs_to.entry(t).or_default().push(Xref {
+                            from: addr,
+                            kind: XrefKind::Branch,
+                        });
+                        xrefs_from.entry(addr).or_default().push(Ref {
+                            to: t,
+                            kind: XrefKind::Branch,
+                        });
+                        if queue_block(t, &mut seen, &mut worklist) {
+                            succ.push(t);
+                        }
                     }
                 }
                 // `call [rip+disp]` / `jmp [rip+disp]` through an import slot.
@@ -560,36 +762,87 @@ fn build_function(
                 // reason they have to be matched separately from the near-branch
                 // arms above.
                 FlowControl::IndirectCall | FlowControl::IndirectBranch => {
-                    let slot = if insn.is_ip_rel_memory_operand() {
-                        Some(insn.ip_rel_memory_address())
-                    } else if insn.memory_base() == iced_x86::Register::None
-                        && insn.memory_index() == iced_x86::Register::None
-                        && insn.memory_displacement64() != 0
-                    {
-                        // 32-bit builds address the IAT absolutely rather than
-                        // relative to the instruction pointer.
-                        Some(insn.memory_displacement64())
-                    } else {
-                        None
-                    };
-                    if let Some(slot) = slot {
-                        if let Some(n) = import_slots.get(&slot) {
-                            target = Some(slot);
-                            target_name = Some(n.clone());
-                            // The slot is a call-graph edge like any other, and
-                            // without it every path that runs through an import
-                            // is invisible. It is never seeded as a function:
-                            // an import slot lives in data, and the executable
-                            // check below filters it out.
-                            calls.push(slot);
-                            xrefs_to.entry(slot).or_default().push(Xref {
-                                from: addr,
-                                kind: if flow == FlowControl::IndirectCall {
+                    // AArch64 register branches (br/blr) have the same flow
+                    // class but nothing resolvable here; the x86 slot and
+                    // table machinery needs the iced view, which is absent.
+                    if let Some(insn) = &ice {
+                        let slot = if insn.is_ip_rel_memory_operand() {
+                            Some(insn.ip_rel_memory_address())
+                        } else if insn.memory_base() == iced_x86::Register::None
+                            && insn.memory_index() == iced_x86::Register::None
+                            && insn.memory_displacement64() != 0
+                        {
+                            // 32-bit builds address the IAT absolutely rather
+                            // than relative to the instruction pointer.
+                            Some(insn.memory_displacement64())
+                        } else {
+                            None
+                        };
+                        if let Some(slot) = slot {
+                            if let Some(n) = import_slots.get(&slot) {
+                                target = Some(slot);
+                                target_name = Some(n.clone());
+                                // The slot is a call-graph edge like any other,
+                                // and without it every path that runs through
+                                // an import is invisible. It is never seeded
+                                // as a function: an import slot lives in data,
+                                // and the executable check below filters it.
+                                calls.push(slot);
+                                let kind = if flow == FlowControl::IndirectCall {
                                     XrefKind::Call
                                 } else {
                                     XrefKind::Jump
-                                },
-                            });
+                                };
+                                xrefs_to
+                                    .entry(slot)
+                                    .or_default()
+                                    .push(Xref { from: addr, kind });
+                                xrefs_from
+                                    .entry(addr)
+                                    .or_default()
+                                    .push(Ref { to: slot, kind });
+                            }
+                        }
+                        // An indexed branch that no import slot explains is a
+                        // switch: `jmp [table + i*8]`. The table entries are
+                        // real control-flow edges, and without them the cases
+                        // look unreachable.
+                        if target.is_none() && flow == FlowControl::IndirectBranch {
+                            if let Some(table) = jump_table_base(bin, insn, &regs) {
+                                let width = if bin.bits == 64 { 8usize } else { 4 };
+                                let mut at = table;
+                                for read in 0..4096usize {
+                                    let Some(off) = va_to_off(bin, base, at) else {
+                                        break;
+                                    };
+                                    let Some(e) = bytes.get(off..off + width) else {
+                                        break;
+                                    };
+                                    let t = if bin.bits == 64 {
+                                        u64::from_le_bytes(e.try_into().unwrap())
+                                    } else {
+                                        u32::from_le_bytes(e.try_into().unwrap()) as u64
+                                    };
+                                    if t == 0 || !in_exec(bin, base, t) {
+                                        break;
+                                    }
+                                    if read == 0 {
+                                        tables.push(table);
+                                    }
+                                    xrefs_to.entry(t).or_default().push(Xref {
+                                        from: addr,
+                                        kind: XrefKind::Jump,
+                                    });
+                                    xrefs_from.entry(addr).or_default().push(Ref {
+                                        to: t,
+                                        kind: XrefKind::Jump,
+                                    });
+                                    if queue_block(t, &mut seen, &mut worklist) {
+                                        succ.push(t);
+                                    }
+                                    at += width as u64;
+                                }
+                            }
                         }
                     }
                 }
@@ -600,19 +853,24 @@ fn build_function(
             // the address, as long as the flow handling above did not already
             // account for it (an import slot is a control-flow edge, not data).
             if target.is_none() {
-                if let Some(t) = data_ref(bin, base, &insn) {
-                    xrefs_to.entry(t).or_default().push(Xref {
-                        from: addr,
-                        kind: XrefKind::Data,
-                    });
+                if let Some(insn) = &ice {
+                    if let Some(t) = data_ref(bin, base, insn) {
+                        xrefs_to.entry(t).or_default().push(Xref {
+                            from: addr,
+                            kind: XrefKind::Data,
+                        });
+                        xrefs_from.entry(addr).or_default().push(Ref {
+                            to: t,
+                            kind: XrefKind::Data,
+                        });
+                    }
                 }
             }
 
-            let text = format_insn(&insn);
             insns.push(EngineInsn {
                 addr,
                 len,
-                text,
+                bytes: raw,
                 target_name,
                 target,
                 flow,
@@ -634,7 +892,9 @@ fn build_function(
                     | FlowControl::UnconditionalBranch
                     | FlowControl::IndirectBranch
                     | FlowControl::Interrupt
-            ) || insn.mnemonic() == Mnemonic::Int3
+            ) || ice
+                .as_ref()
+                .is_some_and(|i| i.mnemonic() == Mnemonic::Int3)
                 // stop if we are about to run into another function's entry
                 || boundaries.contains(&end) && end != entry;
             if stop {
@@ -689,19 +949,9 @@ fn build_function(
         incoming: 0,
         calls,
         named: names.contains_key(&entry),
+        tables,
     };
     (func, discovered, spent)
-}
-
-fn format_insn(insn: &Instruction) -> String {
-    let mut fmt = IntelFormatter::new();
-    fmt.options_mut().set_uppercase_hex(false);
-    fmt.options_mut().set_hex_prefix("0x");
-    fmt.options_mut().set_hex_suffix("");
-    fmt.options_mut().set_space_after_operand_separator(true);
-    let mut s = String::new();
-    fmt.format(insn, &mut s);
-    s
 }
 
 #[cfg(test)]
@@ -772,6 +1022,70 @@ mod tests {
     }
 
     #[test]
+    fn a_signature_match_names_the_function() {
+        let code = [
+            0xe8, 0x00, 0x00, 0x00, 0x00, // 0x1000  call 0x1005 (the helper)
+            0x48, 0x8b, 0x05, 0x12, 0x34, 0x56, 0x78, 0x48, 0x3b, 0x04, 0x24, 0x75, 0x02, 0xf3,
+            0xc3, // 0x1005  the cookie check itself
+            0xc3, // 0x1014  trailing ret
+        ];
+        let (bin, bytes) = code_at(0x1000, &code);
+        let an = analyze(&bin, &bytes, 1000, &Db::default());
+        let helper = an
+            .functions
+            .iter()
+            .find(|f| f.addr == 0x1005)
+            .expect("helper recovered");
+        assert!(helper.named);
+        assert_eq!(helper.name, "__security_check_cookie");
+    }
+
+    #[test]
+    fn a_jump_table_brings_the_cases_in() {
+        // MSVC PIE switch shape:
+        //   0x4000: lea rax, [rip+0xff9]        -> rax = 0x5000 (the table)
+        //   0x4007: jmp qword ptr [rax*8 + 0]   (ff 24 c5 00 00 00 00)
+        // table at 0x5000: 0x6000, 0x6007, 0x600e, 0 (all code, zero ends)
+        let mut code = vec![0u8; 0x5018];
+        code[0x0000] = 0x48; // lea rax, [rip + 0xff9]   (0x4007 -> 0x5000)
+        code[0x0001] = 0x8d;
+        code[0x0002] = 0x05;
+        code[0x0003..0x0007].copy_from_slice(&0xff9i32.to_le_bytes());
+        code[0x0007] = 0xff; // jmp qword ptr [rax*8 + 0]
+        code[0x0008] = 0x24;
+        code[0x0009] = 0xc5;
+        // table
+        code[0x1000..0x1008].copy_from_slice(&0x6000u64.to_le_bytes());
+        code[0x1008..0x1010].copy_from_slice(&0x6007u64.to_le_bytes());
+        code[0x1010..0x1018].copy_from_slice(&0x600eu64.to_le_bytes());
+        // cases
+        code[0x2000] = 0xc3;
+        code[0x2007] = 0xc3;
+        code[0x200e] = 0xc3;
+
+        let (bin, bytes) = code_at(0x4000, &code);
+        let an = analyze(&bin, &bytes, 10_000, &Db::default());
+        let sw = an.find_function(0x4000).expect("entry recovered");
+        assert_eq!(sw.tables, vec![0x5000], "the table is attributed");
+        for case in [0x6000u64, 0x6007, 0x600e] {
+            assert!(
+                an.xrefs_from.get(&0x4007).is_some_and(|r| r
+                    .iter()
+                    .any(|x| x.to == case && matches!(x.kind, XrefKind::Jump))),
+                "case {case:#x} reachable from the dispatch"
+            );
+        }
+        // the cases were decoded as real code: they are blocks of the switch
+        // function, not dangling pointers that never got decoded
+        for case in [0x6000u64, 0x6007, 0x600e] {
+            assert!(
+                sw.blocks.iter().any(|b| b.start == case),
+                "case {case:#x} became a block"
+            );
+        }
+    }
+
+    #[test]
     fn a_note_annotates_without_renaming() {
         // Notes are for the reader. Only a name changes what things are called,
         // so a note must leave the entry point's own label alone.
@@ -791,5 +1105,114 @@ mod tests {
         db.set_name(0x1000, "parse_header");
         let an = analyze(&bin, &bytes, 1000, &db);
         assert_eq!(an.label(0x1000), "parse_header");
+    }
+
+    #[test]
+    fn xrefs_from_mirrors_the_call_edges() {
+        // entry calls sub at 0x1006, both return.
+        let code = [
+            0xe8, 0x01, 0x00, 0x00, 0x00, // 0x1000 call 0x1006
+            0xc3, // 0x1005 ret
+            0xc3, // 0x1006 ret
+        ];
+        let (bin, bytes) = code_at(0x1000, &code);
+        let an = analyze(&bin, &bytes, 1000, &Db::default());
+        let refs = an.xrefs_from.get(&0x1000).expect("call recorded");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].to, 0x1006);
+        assert_eq!(refs[0].kind, XrefKind::Call);
+        // and the reverse index agrees with the forward one.
+        assert!(an.xrefs_to.get(&0x1006).is_some_and(|r| r
+            .iter()
+            .any(|x| x.from == 0x1000 && x.kind == XrefKind::Call)));
+    }
+
+    #[test]
+    fn xrefs_from_records_a_string_operand() {
+        // lea rax, [rip+0x17] at 0x1000 ends at 0x1007, so it names 0x101e,
+        // which is where the literal sits in the read-only section.
+        let mut bin = Binary::stub(Format::Elf, Arch::X86_64);
+        bin.entry = 0x1000;
+        bin.sections = vec![
+            Section {
+                name: ".text".into(),
+                vaddr: 0x1000,
+                vsize: 8,
+                file_off: 0,
+                file_size: 8,
+                entropy: 0.0,
+                read: true,
+                write: false,
+                exec: true,
+            },
+            Section {
+                name: ".rodata".into(),
+                vaddr: 0x101e,
+                vsize: 5,
+                file_off: 8,
+                file_size: 5,
+                entropy: 0.0,
+                read: true,
+                write: false,
+                exec: false,
+            },
+        ];
+        let mut bytes = vec![0x48, 0x8d, 0x05, 0x17, 0x00, 0x00, 0x00, 0xc3];
+        bytes.extend_from_slice(b"hello");
+        let an = analyze(&bin, &bytes, 1000, &Db::default());
+        let refs = an.xrefs_from.get(&0x1000).expect("operand recorded");
+        assert!(refs
+            .iter()
+            .any(|r| r.to == 0x101e && r.kind == XrefKind::Data));
+    }
+
+    #[test]
+    fn the_aarch64_fixture_flows_without_x86() {
+        let bytes = crate::formats::fixture::elf_aarch64_call();
+        let bin = crate::formats::analyze("stub", &bytes).expect("parses");
+        assert_eq!(bin.arch, Arch::Aarch64);
+
+        let an = analyze(&bin, &bytes, 1000, &Db::default());
+        let entry = an.find_function(bin.entry).expect("entry recovered");
+        assert!(entry.blocks.iter().any(|b| b.start == bin.entry));
+        // the `bl` resolved to an internal helper, with the xref recorded
+        let helper = bin.entry + 0x10;
+        assert!(
+            an.xrefs_from.get(&bin.entry).is_some_and(|rs| rs
+                .iter()
+                .any(|r| r.to == helper && r.kind == XrefKind::Call)),
+            "call edge into the helper"
+        );
+        let h = an.find_function(helper).expect("helper recovered");
+        assert_eq!(h.blocks.len(), 1);
+        assert_eq!(h.blocks[0].insns.len(), 3);
+
+        // formatting comes from the A64 renderer, not iced's x86 decoder
+        let insns = &entry.blocks[0].insns;
+        assert!(
+            insns[0].text(bin.bits, bin.arch).starts_with("bl"),
+            "{}",
+            insns[0].text(bin.bits, bin.arch)
+        );
+        assert_eq!(h.blocks[0].insns[2].text(bin.bits, bin.arch), "ret");
+    }
+
+    #[test]
+    fn the_aarch64_linear_disassembler_names_the_common_forms() {
+        let bytes = crate::formats::fixture::elf_aarch64_call();
+        let bin = crate::formats::analyze("stub", &bytes).unwrap();
+        let insns = crate::analysis::disasm::disassemble(
+            &bytes, bin.entry, bin.entry, bin.bits, bin.arch, 8,
+        );
+        let texts: Vec<&str> = insns.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts.len(), 8, "{texts:?}");
+        assert!(texts[0].starts_with("bl"), "{texts:?}");
+        assert_eq!(texts[1], "movz    x0, #0x2a", "{texts:?}");
+        assert_eq!(texts[2], "ret", "{texts:?}");
+        assert_eq!(texts[3], "nop", "{texts:?}");
+        assert_eq!(texts[4], "add     x0, x1, x2", "{texts:?}");
+        assert_eq!(texts[5], "ldr     x1, [x0, #0]", "{texts:?}");
+        assert_eq!(texts[6], "ret", "{texts:?}");
+        assert!(texts[7].starts_with("dword"), "{texts:?}");
     }
 }

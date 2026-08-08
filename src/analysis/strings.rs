@@ -11,6 +11,9 @@ pub struct Located {
     pub off: u64,
     pub text: String,
     pub wide: bool,
+    /// Raw byte length, so a consumer can ask "does address X fall inside
+    /// this literal" (UTF-16 strings are two bytes per character).
+    pub len: u64,
 }
 
 pub fn extract(data: &[u8], min_len: usize) -> Vec<String> {
@@ -65,10 +68,12 @@ fn utf16_run(data: &[u8], min: usize, out: &mut Vec<Located>) {
 
 fn flush(cur: &mut Vec<u8>, off: u64, min: usize, wide: bool, out: &mut Vec<Located>) {
     if cur.len() >= min {
+        let len = cur.len() as u64;
         out.push(Located {
             off,
             text: String::from_utf8_lossy(cur).into_owned(),
             wide,
+            len,
         });
     }
     cur.clear();
