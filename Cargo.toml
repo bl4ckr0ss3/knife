@@ -1,0 +1,33 @@
+[package]
+name = "knife"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.85"
+description = "A reverse engineer's binary Swiss-army knife: parse, triage, and disassemble PE/ELF/Mach-O."
+license = "MIT"
+authors = ["0xblack"]
+
+[[bin]]
+name = "knife"
+path = "src/main.rs"
+
+[dependencies]
+goblin = "0.9"                 # PE / ELF / Mach-O / archive parsing, one crate
+iced-x86 = "1.21"             # x86/x64 disassembler, pure Rust
+clap = { version = "4.5", features = ["derive"] }
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+memmap2 = "0.9"
+owo-colors = "4"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+panic = "abort"
+codegen-units = 1

@@ -1,0 +1,657 @@
+//! knife — a reverse engineer's binary Swiss-army knife.
+//!
+//! Parse, triage, and disassemble PE / ELF / Mach-O. One binary, no runtime.
+
+mod analysis;
+mod formats;
+mod model;
+mod output;
+
+use analysis::{capabilities, disasm, hashes, strings as strs, triage};
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use model::Binary;
+use output::*;
+use owo_colors::{OwoColorize, Style};
+use serde_json::json;
+
+#[derive(Parser)]
+#[command(
+    name = "knife",
+    version,
+    about = "A reverse engineer's binary Swiss-army knife (PE / ELF / Mach-O)",
+    disable_help_subcommand = true
+)]
+struct Cli {
+    /// Emit machine-readable JSON instead of the terminal report.
+    #[arg(long, global = true)]
+    json: bool,
+
+    #[command(subcommand)]
+    cmd: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Full triage report (default).
+    Info { file: String },
+    /// List sections/segments with entropy.
+    Sections { file: String },
+    /// List imported libraries and functions.
+    Imports { file: String },
+    /// List exported symbols.
+    Exports { file: String },
+    /// Capabilities inferred from imports/symbols.
+    Caps { file: String },
+    /// Extract printable strings.
+    Strings {
+        file: String,
+        #[arg(long, default_value_t = 5)]
+        min: usize,
+    },
+    /// Extract indicators of compromise (defanged).
+    Iocs { file: String },
+    /// File hashes and imphash.
+    Hashes { file: String },
+    /// Disassemble (x86/x64) from the entry point or a given location.
+    Dis {
+        file: String,
+        #[arg(long, default_value_t = 40)]
+        count: usize,
+        /// Virtual address to start at (default: entry point).
+        #[arg(long)]
+        vaddr: Option<String>,
+        /// File offset to start at.
+        #[arg(long)]
+        off: Option<String>,
+    },
+    /// Hex dump a range.
+    Hex {
+        file: String,
+        #[arg(long, default_value_t = 0)]
+        off: u64,
+        #[arg(long, default_value_t = 256)]
+        len: usize,
+    },
+    /// Whole-file entropy map.
+    Map {
+        file: String,
+        #[arg(long, default_value_t = 64)]
+        buckets: usize,
+    },
+    /// List archive (.a/.lib) members.
+    Ls { file: String },
+}
+
+fn main() {
+    if let Err(e) = real_main() {
+        eprintln!("{} {:#}", "error:".style(red()).bold(), e);
+        std::process::exit(1);
+    }
+}
+
+fn real_main() -> Result<()> {
+    // Allow `knife <file>` as shorthand for `knife info <file>`.
+    let mut args: Vec<String> = std::env::args().collect();
+    let known = [
+        "info",
+        "sections",
+        "imports",
+        "exports",
+        "caps",
+        "strings",
+        "iocs",
+        "hashes",
+        "dis",
+        "hex",
+        "map",
+        "ls",
+        "help",
+        "-h",
+        "--help",
+        "-V",
+        "--version",
+    ];
+    if args.len() >= 2 && !known.contains(&args[1].as_str()) && !args[1].starts_with('-') {
+        args.insert(1, "info".into());
+    }
+
+    let cli = Cli::parse_from(args);
+    match cli.cmd {
+        Command::Info { file } => cmd_info(&file, cli.json),
+        Command::Sections { file } => cmd_sections(&file, cli.json),
+        Command::Imports { file } => cmd_imports(&file, cli.json),
+        Command::Exports { file } => cmd_exports(&file, cli.json),
+        Command::Caps { file } => cmd_caps(&file, cli.json),
+        Command::Strings { file, min } => cmd_strings(&file, min, cli.json),
+        Command::Iocs { file } => cmd_iocs(&file, cli.json),
+        Command::Hashes { file } => cmd_hashes(&file, cli.json),
+        Command::Dis {
+            file,
+            count,
+            vaddr,
+            off,
+        } => cmd_dis(&file, count, vaddr, off),
+        Command::Hex { file, off, len } => cmd_hex(&file, off, len),
+        Command::Map { file, buckets } => cmd_map(&file, buckets, cli.json),
+        Command::Ls { file } => cmd_ls(&file),
+    }
+}
+
+fn load(file: &str) -> Result<Vec<u8>> {
+    std::fs::read(file).with_context(|| format!("cannot read {file}"))
+}
+
+fn parse(file: &str, bytes: &[u8]) -> Result<Binary> {
+    formats::analyze(file, bytes)
+}
+
+// ── info ─────────────────────────────────────────────────────────────────
+
+fn cmd_info(file: &str, as_json: bool) -> Result<()> {
+    let bytes = load(file)?;
+    let bin = parse(file, &bytes)?;
+    let all_syms: Vec<&str> = bin
+        .all_imported_functions()
+        .chain(bin.exports.iter().map(String::as_str))
+        .collect();
+    let caps = capabilities::matches(all_syms.into_iter());
+    let cluster = capabilities::cluster(&caps);
+    let tri = triage::run(&bin, &caps);
+    let fh = hashes::file_hashes(&bytes);
+    let imphash = hashes::imphash(&bin);
+    let all_strings = strs::extract(&bytes, 5);
+    let iocs = strs::find_iocs(&all_strings);
+
+    if as_json {
+        let out = json!({
+            "file": bin.path,
+            "format": bin.format.label(),
+            "arch": bin.arch.label(),
+            "bits": bin.bits,
+            "size": bin.size,
+            "is_lib": bin.is_lib,
+            "stripped": bin.is_stripped,
+            "entry": bin.entry,
+            "image_base": bin.image_base,
+            "subsystem": bin.subsystem,
+            "overall_entropy": bin.overall_entropy,
+            "overlay": bin.overlay_off.map(|o| json!({"off": o, "size": bin.overlay_size, "entropy": bin.overlay_entropy})),
+            "has_signature": bin.has_signature,
+            "md5": fh.md5, "sha1": fh.sha1, "sha256": fh.sha256, "imphash": imphash,
+            "sections": bin.sections,
+            "imports": bin.imports,
+            "exports_count": bin.exports.len(),
+            "libs": bin.libs,
+            "capabilities": cluster,
+            "iocs": iocs,
+            "verdict": tri.verdict,
+            "score": tri.score,
+            "signals": tri.signals,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    // header
+    println!();
+    println!("  {}", basename(&bin.path).style(accent()).bold());
+    let kind = format!(
+        "{} · {} · {}{} · {}",
+        bin.format.label(),
+        bin.arch.label(),
+        if bin.is_lib { "library" } else { "program" },
+        if bin.is_stripped { " · stripped" } else { "" },
+        bin.notes.join(", ")
+    );
+    println!("  {}", kind.style(muted()));
+
+    verdict_banner(&tri);
+
+    section_header("file");
+    kv("size", human(bin.size));
+    kv("entropy", format!("{:.2} / 8", bin.overall_entropy));
+    if let Some(sub) = &bin.subsystem {
+        kv("subsystem", sub);
+    }
+    kv("entry", format!("0x{:x}", bin.entry));
+    if bin.image_base != 0 {
+        kv("imagebase", format!("0x{:x}", bin.image_base));
+    }
+    kv("md5", fh.md5);
+    kv("sha256", fh.sha256);
+    if let Some(ih) = &imphash {
+        kv("imphash", ih);
+    }
+    if let Some(off) = bin.overlay_off {
+        kv_styled(
+            "overlay",
+            format!(
+                "{} @ 0x{:x}  H={:.2}",
+                human(bin.overlay_size),
+                off,
+                bin.overlay_entropy
+            ),
+            if bin.overlay_entropy >= 7.2 {
+                red()
+            } else {
+                muted()
+            },
+        );
+    }
+
+    // signals
+    section_header("signals");
+    if tri.signals.is_empty() {
+        println!("  {}", "no notable static signals".style(faint()));
+    }
+    for s in &tri.signals {
+        let dot = "◆".style(kind_style(s.kind));
+        let w = if s.weight != 0 {
+            format!(" {:+}", s.weight)
+        } else {
+            String::new()
+        };
+        println!("  {} {}{}", dot, s.text, w.style(faint()));
+    }
+
+    // sections
+    print_sections(&bin);
+
+    // capabilities
+    if !caps.is_empty() {
+        section_header("capabilities");
+        let line: Vec<String> = cluster.iter().map(|(k, v)| format!("{k} ×{v}")).collect();
+        println!("  {}", line.join("   ").style(amber()));
+        for m in caps.iter().take(10) {
+            let st = if m.weight >= 3 { red() } else { amber() };
+            println!(
+                "  {:<26} {}",
+                m.api.style(st),
+                format!("{} · {}", m.category, m.why).style(faint())
+            );
+        }
+        if caps.len() > 10 {
+            println!(
+                "  {}",
+                format!("… and {} more", caps.len() - 10).style(faint())
+            );
+        }
+    }
+
+    // iocs
+    if !iocs.is_empty() {
+        section_header(&format!("indicators ({}) — defanged", iocs.len()));
+        for i in iocs.iter().take(20) {
+            println!(
+                "  {:<8} {}",
+                i.kind.style(faint()),
+                strs::defang(&i.kind, &i.value)
+            );
+        }
+        if iocs.len() > 20 {
+            println!(
+                "  {}",
+                format!("… and {} more", iocs.len() - 20).style(faint())
+            );
+        }
+    }
+
+    // disasm teaser
+    if disasm::supported(bin.arch) {
+        if let Some((off, va)) = disasm::entry_location(&bin, &bytes) {
+            section_header("entry point");
+            let insns = disasm::disassemble(&bytes, off, va, bin.bits, 8);
+            print_disasm(&insns);
+            println!("  {}", "run `knife dis` for more".style(faint()));
+        }
+    }
+
+    println!();
+    println!(
+        "  {}",
+        format!(
+            "{} sections · {} imports · {} strings · {} IOCs",
+            bin.sections.len(),
+            bin.all_imported_functions().count(),
+            all_strings.len(),
+            iocs.len()
+        )
+        .style(faint())
+    );
+    Ok(())
+}
+
+// ── sub-commands ──────────────────────────────────────────────────────────
+
+fn print_sections(bin: &Binary) {
+    section_header("sections");
+    println!(
+        "  {:<20} {:<5} {:>10} {:>10}  {:<24} {}",
+        "name".style(faint()),
+        "flags".style(faint()),
+        "vsize".style(faint()),
+        "rawsize".style(faint()),
+        "entropy".style(faint()),
+        "".style(faint())
+    );
+    for s in &bin.sections {
+        let name_style = if s.is_wx() { red() } else { Style::new() };
+        let est = entropy_style(s.entropy);
+        println!(
+            "  {:<20} {:<5} {:>10} {:>10}  {} {}",
+            truncate(&s.name, 20).style(name_style),
+            s.flags(),
+            s.vsize,
+            s.file_size,
+            entropy_bar(s.entropy, 20).style(est),
+            format!("{:.2}", s.entropy).style(est),
+        );
+    }
+}
+
+fn cmd_sections(file: &str, as_json: bool) -> Result<()> {
+    let bytes = load(file)?;
+    let bin = parse(file, &bytes)?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&bin.sections)?);
+    } else {
+        print_sections(&bin);
+    }
+    Ok(())
+}
+
+fn cmd_imports(file: &str, as_json: bool) -> Result<()> {
+    let bytes = load(file)?;
+    let bin = parse(file, &bytes)?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&bin.imports)?);
+        return Ok(());
+    }
+    let flagged: std::collections::HashMap<&str, &capabilities::ApiFlag> =
+        capabilities::CATALOG.iter().map(|f| (f.api, f)).collect();
+    for lib in &bin.imports {
+        section_header(&format!("{} ({})", lib.name, lib.functions.len()));
+        for f in &lib.functions {
+            let bare = f.strip_prefix('_').unwrap_or(f);
+            if let Some(fl) = flagged.get(bare) {
+                let st = if fl.weight >= 3 { red() } else { amber() };
+                println!(
+                    "  {:<28} {}",
+                    f.style(st),
+                    format!("← {}: {}", fl.category, fl.why).style(faint())
+                );
+            } else {
+                println!("  {}", f.style(muted()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_exports(file: &str, as_json: bool) -> Result<()> {
+    let bytes = load(file)?;
+    let bin = parse(file, &bytes)?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&bin.exports)?);
+        return Ok(());
+    }
+    section_header(&format!("exports ({})", bin.exports.len()));
+    for e in &bin.exports {
+        println!("  {}", e.style(muted()));
+    }
+    Ok(())
+}
+
+fn cmd_caps(file: &str, as_json: bool) -> Result<()> {
+    let bytes = load(file)?;
+    let bin = parse(file, &bytes)?;
+    let syms: Vec<&str> = bin
+        .all_imported_functions()
+        .chain(bin.exports.iter().map(String::as_str))
+        .collect();
+    let caps = capabilities::matches(syms.into_iter());
+    let cluster = capabilities::cluster(&caps);
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({"clusters": cluster}))?
+        );
+        return Ok(());
+    }
+    section_header("capabilities");
+    if caps.is_empty() {
+        println!("  {}", "none from the catalogue".style(faint()));
+        return Ok(());
+    }
+    let line: Vec<String> = cluster.iter().map(|(k, v)| format!("{k} ×{v}")).collect();
+    println!("  {}", line.join("   ").style(amber()));
+    println!();
+    for m in &caps {
+        let st = if m.weight >= 3 { red() } else { amber() };
+        println!(
+            "  {:<26} {}",
+            m.api.style(st),
+            format!("{} · {}", m.category, m.why).style(faint())
+        );
+    }
+    Ok(())
+}
+
+fn cmd_strings(file: &str, min: usize, as_json: bool) -> Result<()> {
+    let bytes = load(file)?;
+    let out = strs::extract(&bytes, min);
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        for s in &out {
+            println!("{s}");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_iocs(file: &str, as_json: bool) -> Result<()> {
+    let bytes = load(file)?;
+    let all = strs::extract(&bytes, 5);
+    let iocs = strs::find_iocs(&all);
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&iocs)?);
+        return Ok(());
+    }
+    section_header(&format!("indicators ({}) — defanged", iocs.len()));
+    for i in &iocs {
+        println!(
+            "  {:<8} {}",
+            i.kind.style(faint()),
+            strs::defang(&i.kind, &i.value)
+        );
+    }
+    Ok(())
+}
+
+fn cmd_hashes(file: &str, as_json: bool) -> Result<()> {
+    let bytes = load(file)?;
+    let bin = parse(file, &bytes).ok();
+    let fh = hashes::file_hashes(&bytes);
+    let imphash = bin.as_ref().and_then(hashes::imphash);
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "md5": fh.md5, "sha1": fh.sha1, "sha256": fh.sha256, "imphash": imphash
+            }))?
+        );
+        return Ok(());
+    }
+    section_header("hashes");
+    kv("md5", fh.md5);
+    kv("sha1", fh.sha1);
+    kv("sha256", fh.sha256);
+    if let Some(ih) = imphash {
+        kv("imphash", ih);
+    }
+    Ok(())
+}
+
+fn print_disasm(insns: &[disasm::Insn]) {
+    for i in insns {
+        let raw: String = i
+            .bytes
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (mn, rest) = i.text.split_once(' ').unwrap_or((i.text.as_str(), ""));
+        println!(
+            "  {}  {:<20} {} {}",
+            format!("{:012x}", i.addr).style(faint()),
+            raw.style(faint()),
+            mn.style(accent()),
+            rest.style(muted()),
+        );
+    }
+}
+
+fn cmd_dis(file: &str, count: usize, vaddr: Option<String>, off: Option<String>) -> Result<()> {
+    let bytes = load(file)?;
+    let bin = parse(file, &bytes)?;
+    if !disasm::supported(bin.arch) {
+        anyhow::bail!(
+            "disassembly supports x86/x64 only; this is {}",
+            bin.arch.label()
+        );
+    }
+    let (foff, va) = if let Some(o) = off {
+        let o = parse_num(&o)?;
+        (o, o)
+    } else if let Some(v) = vaddr {
+        let v = parse_num(&v)?;
+        (
+            disasm::vaddr_to_off(&bin, v).context("vaddr not in any section")?,
+            v,
+        )
+    } else {
+        disasm::entry_location(&bin, &bytes).context("cannot locate entry point")?
+    };
+    section_header(&format!("disassembly @ 0x{va:x}"));
+    let insns = disasm::disassemble(&bytes, foff, va, bin.bits, count);
+    print_disasm(&insns);
+    Ok(())
+}
+
+fn cmd_hex(file: &str, off: u64, len: usize) -> Result<()> {
+    let bytes = load(file)?;
+    let start = off as usize;
+    if start >= bytes.len() {
+        anyhow::bail!("offset 0x{off:x} past end of file ({})", bytes.len());
+    }
+    let end = (start + len).min(bytes.len());
+    section_header(&format!("hex 0x{:x}..0x{:x}", start, end));
+    for (row, chunk) in bytes[start..end].chunks(16).enumerate() {
+        let addr = start + row * 16;
+        let hex: String = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                let sep = if i == 7 { "  " } else { " " };
+                format!("{:02x}{}", b, if i == 15 { "" } else { sep })
+            })
+            .collect();
+        let ascii: String = chunk
+            .iter()
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        println!(
+            "  {}  {:<48} {}",
+            format!("{:08x}", addr).style(faint()),
+            hex,
+            ascii.style(muted())
+        );
+    }
+    Ok(())
+}
+
+fn cmd_map(file: &str, buckets: usize, as_json: bool) -> Result<()> {
+    let bytes = load(file)?;
+    let map = analysis::entropy::entropy_map(&bytes, buckets);
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&map)?);
+        return Ok(());
+    }
+    section_header("entropy map");
+    let step = (bytes.len() / buckets.max(1)).max(1);
+    let blocks = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    // one row of sparkline
+    let spark: String = map
+        .iter()
+        .map(|&e| {
+            let idx = ((e / 8.0) * 8.0).round() as usize;
+            blocks[idx.min(8)]
+        })
+        .collect();
+    println!("  {}", spark.style(accent()));
+    println!(
+        "  {}",
+        format!(
+            "{} buckets · {} bytes each · █ = high entropy (packed/encrypted)",
+            map.len(),
+            step
+        )
+        .style(faint())
+    );
+    // flag the hot buckets
+    for (i, &e) in map.iter().enumerate() {
+        if e >= 7.2 {
+            println!(
+                "  {} bucket {:>4} @ 0x{:08x}  {:.2}/8",
+                "◆".style(red()),
+                i,
+                i * step,
+                e
+            );
+        }
+    }
+    Ok(())
+}
+
+fn cmd_ls(file: &str) -> Result<()> {
+    let bytes = load(file)?;
+    let members = formats::list_archive(&bytes)?;
+    section_header(&format!("archive members ({})", members.len()));
+    for (name, size) in members {
+        println!("  {:>10}  {}", human(size).style(faint()), name);
+    }
+    Ok(())
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────
+
+fn parse_num(s: &str) -> Result<u64> {
+    let s = s.trim();
+    let v = if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(h, 16)?
+    } else {
+        s.parse::<u64>()?
+    };
+    Ok(v)
+}
+
+fn basename(p: &str) -> &str {
+    p.rsplit(['/', '\\']).next().unwrap_or(p)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(max - 1).collect();
+        format!("{t}…")
+    }
+}
