@@ -363,6 +363,12 @@ fn provenance(
     arg: u8,
     win64: bool,
 ) -> Prov {
+    // 32-bit x86 passes arguments on the stack, not in registers, so the
+    // register walk finds nothing and every legacy binary reads as unknown.
+    // There the Nth argument is the Nth `push` before the call.
+    if an.bits == 32 {
+        return provenance_32(an, bin, bytes, func, block, call_idx, arg);
+    }
     let Some(target) = arg_register(arg, win64) else {
         return Prov {
             origin: Origin::Unknown,
@@ -379,6 +385,80 @@ fn provenance(
         target.full_register(),
         0,
     )
+}
+
+/// Provenance for the 32-bit stack calling convention: find the `push` that
+/// supplies argument `arg` (they go right-to-left, so arg 1 is the last push
+/// before the call), then classify what it pushed. A pushed register is traced
+/// back like any other value.
+fn provenance_32(
+    an: &Analysis,
+    bin: &Binary,
+    bytes: &[u8],
+    func: &crate::analysis::engine::Function,
+    block: &crate::analysis::engine::BasicBlock,
+    call_idx: usize,
+    arg: u8,
+) -> Prov {
+    let unknown = Prov {
+        origin: Origin::Unknown,
+        bounded: false,
+    };
+    // Walk back counting pushes; the arg-th one is our argument.
+    let mut seen = 0u8;
+    for j in (0..call_idx).rev() {
+        let ins = &block.insns[j];
+        let Some(d) = decode_one(&ins.bytes, ins.addr, an.bits) else {
+            continue;
+        };
+        // Arguments are pushed after any earlier call returns, so an
+        // intervening call means the push we want is not in this run.
+        if matches!(d.mnemonic(), Mnemonic::Call) {
+            return unknown;
+        }
+        if d.mnemonic() != Mnemonic::Push {
+            continue;
+        }
+        seen += 1;
+        if seen != arg {
+            continue;
+        }
+        // This push supplies the argument. Classify what it pushes.
+        return match d.op0_kind() {
+            OpKind::Register => {
+                // `push eax` where eax was `lea eax,[ebp-0x28]` or a load: trace
+                // the register back from just before this push.
+                resolve_reg(
+                    an,
+                    bin,
+                    bytes,
+                    func,
+                    block,
+                    j,
+                    d.op0_register().full_register(),
+                    0,
+                )
+            }
+            OpKind::Memory => Prov {
+                origin: Origin::Dynamic,
+                bounded: false,
+            },
+            _ => {
+                // A pushed immediate: a constant, or a fixed pointer if it lands
+                // on a string (`push offset "literal"`).
+                let imm = d.immediate(0);
+                Prov {
+                    origin: if points_at_string(bin, an, bytes, imm) {
+                        Origin::Fixed
+                    } else {
+                        Origin::Constant
+                    },
+                    bounded: false,
+                }
+            }
+        };
+    }
+    unknown
 }
 
 /// Resolve register `want` by walking backward from index `upto` in `block`,
@@ -684,6 +764,40 @@ mod tests {
             Harness { bin, bytes }
         }
 
+        /// A 32-bit variant: `sink` is imported at slot 0x4000 and called via
+        /// `call dword [0x4000]` (the absolute-indirect form 32-bit uses), so
+        /// arguments come from `push`es, not registers.
+        fn new_x86(sink: &str, mut code: Vec<u8>) -> Harness {
+            let va = 0x1000u64;
+            let slot = 0x4000u64;
+            code.push(0xff); // call dword ptr [slot]
+            code.push(0x15);
+            code.extend_from_slice(&(slot as u32).to_le_bytes());
+            code.push(0xc3); // ret
+
+            let mut bin = Binary::stub(Format::Pe, Arch::X86);
+            bin.entry = va;
+            bin.sections = vec![Section {
+                name: ".text".into(),
+                vaddr: va,
+                vsize: code.len() as u64,
+                file_off: va,
+                file_size: code.len() as u64,
+                entropy: 0.0,
+                read: true,
+                write: false,
+                exec: true,
+            }];
+            bin.symbols = vec![Symbol {
+                addr: slot,
+                name: sink.into(),
+                kind: SymKind::Import,
+            }];
+            let mut bytes = vec![0u8; va as usize];
+            bytes.extend_from_slice(&code);
+            Harness { bin, bytes }
+        }
+
         fn findings(&self) -> Vec<Finding> {
             let an = engine::analyze(&self.bin, &self.bytes, 10_000, &Db::default());
             run(&an, &self.bin, &self.bytes)
@@ -827,6 +941,28 @@ mod tests {
         let f = Harness::new("strcpy", code).findings();
         assert!(f.iter().any(|x| x.pattern == "unbounded-copy"));
         assert!(!f.iter().any(|x| x.pattern == "stack-overflow"));
+    }
+
+    #[test]
+    fn a_32bit_stack_copy_reads_its_pushed_arguments() {
+        // The CVE-2017-11882 shape, 32-bit: an attacker field is copied into a
+        // fixed stack buffer via lstrcpyA, with both arguments on the stack.
+        //   mov eax,[ebp+8] ; add eax,0x1c ; push eax   (src: attacker record)
+        //   lea eax,[ebp-0x28] ; push eax               (dst: stack buffer)
+        //   call [lstrcpyA]
+        let code = vec![
+            0x8b, 0x45, 0x08, // mov eax, [ebp+8]
+            0x83, 0xc0, 0x1c, // add eax, 0x1c
+            0x50, // push eax          (arg2 = src)
+            0x8d, 0x45, 0xd8, // lea eax, [ebp-0x28]
+            0x50, // push eax          (arg1 = dst, stack buffer)
+        ];
+        let f = Harness::new_x86("lstrcpyA", code).findings();
+        let hit = f
+            .iter()
+            .find(|x| x.pattern == "stack-overflow")
+            .expect("expected stack-overflow from 32-bit pushed args");
+        assert_eq!(hit.severity, 3, "runtime source into a stack buffer");
     }
 
     #[test]
