@@ -907,6 +907,16 @@ fn build_function(
                 }
                 break;
             }
+            // If the next instruction begins a block we already know about, this
+            // block falls through into it. Stop here and record the edge rather
+            // than decoding the shared tail again: without this, a run with many
+            // branch targets gets re-decoded once per target, which turns a
+            // dense function into near-quadratic work and silently exhausts the
+            // instruction budget on real binaries.
+            if end != block_start && seen.contains(&end) {
+                succ.push(end);
+                break;
+            }
             // An indirect branch ends the block just as firmly as a direct one:
             // its successors are unknown, so decoding past it walks into bytes
             // that are not necessarily instructions.
