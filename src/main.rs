@@ -332,6 +332,12 @@ fn real_main() -> Result<()> {
     }
 }
 
+/// The analysis instruction budget, shared by every command that recovers the
+/// CFG. Keeping it uniform is what guarantees that a site `audit` reports can
+/// always be shown by `dis --func`: a smaller budget here would let one command
+/// find code another cannot display.
+const ANALYSIS_BUDGET: usize = 2_000_000;
+
 fn load(file: &str) -> Result<Vec<u8>> {
     std::fs::read(file).with_context(|| format!("cannot read {file}"))
 }
@@ -429,7 +435,7 @@ fn cmd_annotate(
 }
 
 fn cmd_tui(file: &str, db_path: Option<&str>) -> Result<()> {
-    let sess = Session::open(file, db_path, 2_000_000, "the interactive view")?;
+    let sess = Session::open(file, db_path, ANALYSIS_BUDGET, "the interactive view")?;
     if sess.an.functions.is_empty() {
         anyhow::bail!("no functions were recovered, so there is nothing to browse");
     }
@@ -955,7 +961,7 @@ fn cmd_sinks(
     as_json: bool,
     db_path: Option<&str>,
 ) -> Result<()> {
-    let s = Session::open(file, db_path, 2_000_000, "call-site recovery")?;
+    let s = Session::open(file, db_path, ANALYSIS_BUDGET, "call-site recovery")?;
     let an = &s.an;
     let mut hits = sinks::find(an);
     if let Some(c) = class {
@@ -1071,7 +1077,7 @@ fn plural(n: usize) -> &'static str {
 }
 
 fn cmd_audit(file: &str, reachable_only: bool, as_json: bool, db_path: Option<&str>) -> Result<()> {
-    let s = Session::open(file, db_path, 2_000_000, "the bug audit")?;
+    let s = Session::open(file, db_path, ANALYSIS_BUDGET, "the bug audit")?;
     if !matches!(s.bin.arch, model::Arch::X86 | model::Arch::X86_64) {
         anyhow::bail!(
             "argument analysis is x86/x64 only; this is {}",
@@ -1237,7 +1243,7 @@ fn cmd_dis(
     // Function mode: recover the CFG and print the whole function with labels,
     // resolved call targets, cross-references, and your notes.
     if let Some(sel) = func {
-        let sess = Session::open(file, db_path, 500_000, "disassembly")?;
+        let sess = Session::open(file, db_path, ANALYSIS_BUDGET, "disassembly")?;
         return dis_function(&sess, &sel);
     }
 
@@ -1302,7 +1308,7 @@ fn cmd_xrefs(
     as_json: bool,
     db_path: Option<&str>,
 ) -> Result<()> {
-    let sess = Session::open(file, db_path, 2_000_000, "cross-references")?;
+    let sess = Session::open(file, db_path, ANALYSIS_BUDGET, "cross-references")?;
     let (an, bin, bytes) = (&sess.an, &sess.bin, &sess.bytes);
     let base = engine::display_base(bin);
 
@@ -1430,7 +1436,7 @@ fn cmd_paths(
     as_json: bool,
     db_path: Option<&str>,
 ) -> Result<()> {
-    let sess = Session::open(file, db_path, 2_000_000, "call-graph search")?;
+    let sess = Session::open(file, db_path, ANALYSIS_BUDGET, "call-graph search")?;
     let (an, bin) = (&sess.an, &sess.bin);
 
     let targets = an.resolve(target, parse_num(target).ok());
@@ -1518,7 +1524,7 @@ fn cmd_paths(
 }
 
 fn cmd_funcs(file: &str, by_refs: bool, as_json: bool, db_path: Option<&str>) -> Result<()> {
-    let sess = Session::open(file, db_path, 500_000, "control-flow analysis")?;
+    let sess = Session::open(file, db_path, ANALYSIS_BUDGET, "control-flow analysis")?;
     let an = &sess.an;
 
     let mut funcs: Vec<&engine::Function> = an.functions.iter().collect();
