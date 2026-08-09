@@ -234,13 +234,16 @@ site reads `call strcpy@plt` or `call KERNELBASE!CreateFileW` instead of an
 anonymous `sub_`. That naming is what makes the sink and cross-reference
 commands point at code rather than at an import table.
 
-**A pseudocode view.** `knife pseudo --func NAME` lifts a function to C-like
-statements, propagating expressions within each block so a run of
-`mov`/`lea`/`add` collapses into what it computes and a call shows its arguments:
-the CVE-2017-11882 overflow reads as the single line `lstrcpyA(ebp - 0x28,
-*(ebp + 8) + 0x1c)`. It is not a full decompiler, and it does not pretend to be:
-there is no type recovery or cross-block value flow, and any instruction it does
-not model is printed verbatim so you always see where the clean lift stops.
+**A decompiler engine.** `knife pseudo --func NAME` runs a small IR over each
+function: it lifts every instruction, propagates expressions so a run of
+`mov`/`lea`/`add` collapses into what it computes, eliminates the dead
+intermediate assignments with a whole-function liveness pass, and folds
+constants. The CVE-2017-11882 overflow comes out as the single line
+`lstrcpyA(&(ebp - 0x28), *(ebp + 8) + 0x1c);` with nothing around it. It is not
+a full decompiler and does not pretend to be: no type recovery, control flow
+stays `if`/`goto` rather than reconstructed loops, and any instruction the
+lifter does not model is printed verbatim so you always see where the clean lift
+stops.
 
 **Constant scanning.** `knife scan` fingerprints crypto and structure by their
 byte signatures: AES S-boxes (generated from the GF(2⁸) definition, not stored

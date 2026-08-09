@@ -2,10 +2,11 @@
 
 ## Unreleased
 
-- `pseudo`: a pseudocode view of a function. Not a decompiler: it lifts each
-  instruction to a C-like statement and propagates expressions within a block,
-  so a call renders with its recovered arguments (`lstrcpyA(ebp - 0x28,
-  *(ebp+8) + 0x1c)`) and control flow reads as `if`/`goto`. Unmodelled
+- `pseudo`: a decompiler engine built on a typed IR. It lifts each instruction,
+  propagates expressions, eliminates dead stores with a whole-function liveness
+  pass, and folds constants, so a call renders with its recovered arguments
+  (`lstrcpyA(&(ebp - 0x28), *(ebp+8) + 0x1c)`) and the noise around it is gone.
+  Control flow reads as `if`/`goto` (structuring is a later phase); unmodelled
   instructions are shown verbatim rather than guessed at.
 - The engine no longer re-decodes shared block tails, so analysis of real
   binaries is complete rather than budget-truncated (EQNEDT32.EXE: 537 to 930
