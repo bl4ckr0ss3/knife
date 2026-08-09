@@ -65,6 +65,19 @@ fn checks(api: &str) -> &'static [Check] {
     }
 }
 
+/// The source argument of a two-operand string copy, so a constant source can
+/// be told from an attacker-controlled one. `gets` reads stdin (always
+/// attacker-controlled, no pointer argument) and the `sprintf` family expands a
+/// format rather than copying a single source, so both return `None` and keep
+/// their finding as-is.
+fn source_arg(api: &str) -> Option<u8> {
+    match api {
+        "strcpy" | "strcat" | "wcscpy" | "wcscat" | "lstrcpyA" | "lstrcpyW" | "lstrcatA"
+        | "lstrcatW" | "StrCpyA" | "StrCpyW" => Some(2),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Finding {
     /// Address of the calling instruction.
@@ -128,7 +141,7 @@ pub fn run(an: &Analysis, bin: &Binary, bytes: &[u8]) -> Vec<Finding> {
                 }
                 for check in cs {
                     if let Some(mut fnd) =
-                        classify(*check, api, an, bin, bytes, block, i, win64, from_entry)
+                        classify(*check, api, an, bin, bytes, f, block, i, win64, from_entry)
                     {
                         fnd.func = Some(f.name.clone());
                         out.push(fnd);
@@ -154,6 +167,7 @@ fn classify(
     an: &Analysis,
     bin: &Binary,
     bytes: &[u8],
+    func: &crate::analysis::engine::Function,
     block: &crate::analysis::engine::BasicBlock,
     call_idx: usize,
     win64: bool,
@@ -174,18 +188,34 @@ fn classify(
     // into a fixed-size stack buffer is the classic overflow, so it is worth
     // knowing whichever length pattern applies.
     let dest_is_stack =
-        provenance(an, bin, bytes, block, call_idx, 1, win64).origin == Origin::Stack;
+        provenance(an, bin, bytes, func, block, call_idx, 1, win64).origin == Origin::Stack;
 
     match check {
         Check::Unbounded => {
             // An unbounded copy into a stack buffer is the textbook stack
-            // overflow; that is a stronger, more specific finding than a bare
-            // unbounded copy, and it is high severity on its own merit.
+            // overflow, but only if the source is attacker-controlled. Copying a
+            // constant string into a stack buffer is the compiler's own doing
+            // and cannot overflow it, so a fixed source drops the finding to the
+            // bottom band. This is exactly the false positive a run against real
+            // software surfaces: `strcpy(local, "some literal")`.
             if dest_is_stack {
+                let src_fixed = source_arg(api).is_some_and(|s| {
+                    provenance(an, bin, bytes, func, block, call_idx, s, win64).origin
+                        == Origin::Fixed
+                });
+                if src_fixed {
+                    return Some(mk(
+                        "stack-overflow",
+                        1,
+                        "copy into a stack buffer, but from a constant string, likely safe"
+                            .to_string(),
+                    ));
+                }
                 return Some(mk(
                     "stack-overflow",
                     3,
-                    "unbounded copy into a stack buffer (classic stack overflow)".to_string(),
+                    "unbounded copy of a runtime value into a stack buffer (classic overflow)"
+                        .to_string(),
                 ));
             }
             // No length argument to inspect; the finding is the call plus reach.
@@ -201,7 +231,7 @@ fn classify(
             // A format pointer that is a fixed constant is the normal, safe
             // case; a runtime pointer is the format-string bug. Anything we
             // could not resolve is left alone rather than guessed at.
-            match provenance(an, bin, bytes, block, call_idx, arg, win64).origin {
+            match provenance(an, bin, bytes, func, block, call_idx, arg, win64).origin {
                 Origin::Dynamic => Some(mk(
                     "format-string",
                     3,
@@ -214,7 +244,7 @@ fn classify(
         // an extreme, so the finding is kept but ranked well below the raw ones:
         // still worth a glance, no longer worth an afternoon.
         Check::AllocSize(arg) => {
-            let p = provenance(an, bin, bytes, block, call_idx, arg, win64);
+            let p = provenance(an, bin, bytes, func, block, call_idx, arg, win64);
             match p.origin {
                 Origin::Multiply => Some(sized(
                     &mk,
@@ -234,7 +264,7 @@ fn classify(
             }
         }
         Check::CopySize(arg) => {
-            let p = provenance(an, bin, bytes, block, call_idx, arg, win64);
+            let p = provenance(an, bin, bytes, func, block, call_idx, arg, win64);
             // A stack destination turns an attacker-influenced length into a
             // stack-smash rather than a heap one, worth saying in the finding.
             let dst = if dest_is_stack {
@@ -314,12 +344,20 @@ struct Prov {
     bounded: bool,
 }
 
-/// Walk backward through the block from the call to find where the argument
-/// register was last written, classify it, and note any clamp on the way.
+/// Where an argument's value came from, and whether it was bounded on the way.
+///
+/// The walk is backward from the call over the argument register. When it runs
+/// off the top of the call's own block without an answer, it continues into the
+/// predecessor blocks: the "a switch picks a value, a common tail makes the
+/// call" shape is everywhere, and without following it a value set one block
+/// earlier reads as unknown. Predecessors must agree, or the result is unknown;
+/// the depth is capped so a loop or a fan-in cannot run away.
+#[allow(clippy::too_many_arguments)]
 fn provenance(
     an: &Analysis,
     bin: &Binary,
     bytes: &[u8],
+    func: &crate::analysis::engine::Function,
     block: &crate::analysis::engine::BasicBlock,
     call_idx: usize,
     arg: u8,
@@ -331,20 +369,43 @@ fn provenance(
             bounded: false,
         };
     };
-    // The register we are currently tracing. A plain register-to-register move
-    // retargets it to the source, so a value that was computed in one register
-    // and moved into the argument register is followed to its real origin.
-    let mut want = target.full_register();
-    let mut bounded = false;
+    resolve_reg(
+        an,
+        bin,
+        bytes,
+        func,
+        block,
+        call_idx,
+        target.full_register(),
+        0,
+    )
+}
 
+/// Resolve register `want` by walking backward from index `upto` in `block`,
+/// descending into predecessor blocks up to a small depth.
+#[allow(clippy::too_many_arguments)]
+fn resolve_reg(
+    an: &Analysis,
+    bin: &Binary,
+    bytes: &[u8],
+    func: &crate::analysis::engine::Function,
+    block: &crate::analysis::engine::BasicBlock,
+    upto: usize,
+    want_in: Register,
+    depth: u32,
+) -> Prov {
+    let mut want = want_in;
+    let mut bounded = false;
     let mut info = InstructionInfoFactory::new();
-    for j in (0..call_idx).rev() {
+
+    for j in (0..upto).rev() {
         let ins = &block.insns[j];
         let Some(d) = decode_one(&ins.bytes, ins.addr, an.bits) else {
             continue;
         };
         // Argument registers do not survive an intervening call, so a value set
-        // before one is not the value passed here.
+        // before one is not the value passed here, and there is no point
+        // chasing it into predecessors either.
         if matches!(d.mnemonic(), Mnemonic::Call) {
             return Prov {
                 origin: Origin::Unknown,
@@ -362,8 +423,7 @@ fn provenance(
             continue;
         }
 
-        let writes = writes_reg(&mut info, &d, want);
-        if !writes {
+        if !writes_reg(&mut info, &d, want) {
             continue;
         }
         // A mask bounds the value to the immediate, which is the other way a
@@ -385,9 +445,46 @@ fn provenance(
             bounded,
         };
     }
+
+    // Not written in this block. Follow the predecessors, which must agree.
+    if depth >= 2 {
+        return Prov {
+            origin: Origin::Unknown,
+            bounded,
+        };
+    }
+    let preds: Vec<&crate::analysis::engine::BasicBlock> = func
+        .blocks
+        .iter()
+        .filter(|b| b.start != block.start && b.succ.contains(&block.start))
+        .collect();
+    if preds.is_empty() {
+        return Prov {
+            origin: Origin::Unknown,
+            bounded,
+        };
+    }
+
+    let mut agreed: Option<Origin> = None;
+    let mut all_bounded = true;
+    for p in preds {
+        let r = resolve_reg(an, bin, bytes, func, p, p.insns.len(), want, depth + 1);
+        all_bounded &= r.bounded;
+        match agreed {
+            None => agreed = Some(r.origin),
+            Some(o) if o == r.origin => {}
+            // Predecessors disagree on where the value came from; do not guess.
+            Some(_) => {
+                return Prov {
+                    origin: Origin::Unknown,
+                    bounded,
+                }
+            }
+        }
+    }
     Prov {
-        origin: Origin::Unknown,
-        bounded,
+        origin: agreed.unwrap_or(Origin::Unknown),
+        bounded: bounded || all_bounded,
     }
 }
 
@@ -663,6 +760,63 @@ mod tests {
             .expect("expected stack-overflow");
         assert_eq!(hit.severity, 3);
         assert!(hit.detail.contains("stack buffer"));
+    }
+
+    #[test]
+    fn strcpy_of_a_constant_into_a_stack_buffer_is_downgraded() {
+        // lea rsi, [rip+0x10] ; lea rdi, [rsp+0x20] ; call strcpy
+        // The source (rsi, SysV arg2) is a constant string, so this cannot
+        // overflow the buffer: the exact false positive a real binary surfaces.
+        let code = vec![
+            0x48, 0x8d, 0x35, 0x10, 0x00, 0x00, 0x00, // lea rsi, [rip+0x10]
+            0x48, 0x8d, 0x7c, 0x24, 0x20, // lea rdi, [rsp+0x20]
+        ];
+        let f = Harness::new("strcpy", code).findings();
+        let hit = f
+            .iter()
+            .find(|x| x.pattern == "stack-overflow")
+            .expect("still reported");
+        assert_eq!(hit.severity, 1, "a constant source cannot overflow");
+        assert!(hit.detail.contains("constant string"));
+    }
+
+    #[test]
+    fn a_constant_source_set_in_a_predecessor_block_is_resolved() {
+        // The 7z shape: the source is a constant set in an earlier block, then a
+        // common tail does `lea dst,[rsp+..]; strcpy`. The walk must follow the
+        // predecessor to see the source is constant and downgrade the finding.
+        //   lea rsi,[rip+0] ; jmp +0 ; lea rdi,[rsp+0x20] ; call strcpy
+        // The jmp forces a block split so the source lands in a predecessor.
+        let code = vec![
+            0x48, 0x8d, 0x35, 0x00, 0x00, 0x00, 0x00, // lea rsi, [rip+0]  (const src)
+            0xeb, 0x00, // jmp +0  (block boundary; target is the next insn)
+            0x48, 0x8d, 0x7c, 0x24, 0x20, // lea rdi, [rsp+0x20]  (stack dst)
+        ];
+        let f = Harness::new("strcpy", code).findings();
+        let hit = f
+            .iter()
+            .find(|x| x.pattern == "stack-overflow")
+            .expect("still reported");
+        assert_eq!(
+            hit.severity, 1,
+            "a constant source one block back is resolved and downgraded"
+        );
+    }
+
+    #[test]
+    fn strcpy_of_a_runtime_value_into_a_stack_buffer_stays_high() {
+        // mov rsi, [rbx] ; lea rdi, [rsp+0x20] ; call strcpy
+        // The source is a loaded (runtime) pointer, so the overflow is real.
+        let code = vec![
+            0x48, 0x8b, 0x33, // mov rsi, [rbx]
+            0x48, 0x8d, 0x7c, 0x24, 0x20, // lea rdi, [rsp+0x20]
+        ];
+        let f = Harness::new("strcpy", code).findings();
+        let hit = f
+            .iter()
+            .find(|x| x.pattern == "stack-overflow")
+            .expect("expected stack-overflow");
+        assert_eq!(hit.severity, 3, "a runtime source is the real overflow");
     }
 
     #[test]
