@@ -9,10 +9,14 @@
 //! folding tidies the arithmetic. What survives is one statement per thing the
 //! code actually does.
 //!
-//! It is still not a full decompiler: there is no type recovery, and control
-//! flow is rendered as `if`/`goto` over the recovered labels rather than
-//! reconstructed loops. The honest rule holds throughout: an instruction the
-//! lifter does not model becomes an opaque `asm(...)` statement, never a guess.
+//! Control flow is then structured: dominators and post-dominators drive a
+//! recursive emitter that reconstructs `if`/`else` and `while` from the graph.
+//! The reducible skeleton reads as nested C; the few edges that break nesting
+//! (shared `switch` tails, a jump into a common handler) become an explicit
+//! `goto` to a labelled block, so the flow is preserved exactly rather than
+//! approximated. It is still not a full decompiler: there is no type recovery.
+//! The honest rule holds throughout: an instruction the lifter does not model
+//! becomes an opaque `asm(...)` statement, never a guess.
 
 use crate::analysis::engine::{Analysis, Function};
 use crate::model::{Binary, Format};
@@ -125,7 +129,10 @@ pub fn decompile(an: &Analysis, bin: &Binary, f: &Function) -> Vec<Line> {
         }
     }
 
-    render(an, f, &blocks)
+    // Structure the control flow into nested if/else and while, with a goto for
+    // the few edges that break nesting. The flat rendering is the fallback for a
+    // graph structuring cannot accept at all (an unreachable or empty block).
+    structure(an, f, &blocks).unwrap_or_else(|| render(an, f, &blocks))
 }
 
 // ── lifting ─────────────────────────────────────────────────────────────────
@@ -637,6 +644,527 @@ fn render(an: &Analysis, f: &Function, blocks: &[IrBlock]) -> Vec<Line> {
     out
 }
 
+// ── control-flow structuring ────────────────────────────────────────────────
+//
+// The flat rendering above is always correct but reads as goto spaghetti. This
+// recovers `if`/`else` and `while` from the control-flow graph so it reads like
+// C. The contract is strict: it emits a structured form only for flow it can
+// prove reconverges (via post-dominators for conditionals and dominators for
+// loops), and returns `None` on anything else, so the caller falls back to the
+// flat form. A wrong structure would be worse than a plain goto, so it never
+// guesses.
+
+/// A block's terminator, over block indices.
+#[derive(Debug)]
+enum Term {
+    Ret,
+    Goto(usize),
+    Fall(usize),
+    Cond {
+        cond: Expr,
+        taken: usize,
+        fall: usize,
+    },
+    End,
+}
+
+struct Cfg {
+    body: Vec<Vec<Stmt>>,
+    term: Vec<Term>,
+    succ: Vec<Vec<usize>>,
+    /// The virtual address each node starts at, for labels and `goto` targets.
+    start: Vec<u64>,
+}
+
+fn build_cfg(blocks: &[IrBlock]) -> Cfg {
+    let idx: BTreeMap<u64, usize> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.start, i))
+        .collect();
+    let n = blocks.len();
+    let mut body = Vec::with_capacity(n);
+    let mut term = Vec::with_capacity(n);
+    for (i, b) in blocks.iter().enumerate() {
+        let mut stmts = b.stmts.clone();
+        let next = (i + 1 < n).then_some(i + 1);
+        // The trailing branch/goto becomes the terminator; it is popped from the
+        // body only when its target is a block we can place. When it is not (an
+        // out-of-function jump), it stays in the body and renders verbatim, so no
+        // control transfer is ever silently lost.
+        let t = match stmts.last() {
+            Some(Stmt::Ret(_)) => Term::Ret,
+            Some(Stmt::Goto(a)) => match idx.get(a) {
+                Some(&j) => {
+                    stmts.pop();
+                    Term::Goto(j)
+                }
+                None => Term::End,
+            },
+            Some(Stmt::Branch(cond, a)) => {
+                let (cond, a) = (cond.clone(), *a);
+                match (idx.get(&a), next) {
+                    (Some(&taken), Some(fall)) => {
+                        stmts.pop();
+                        Term::Cond { cond, taken, fall }
+                    }
+                    _ => Term::End,
+                }
+            }
+            _ => next.map(Term::Fall).unwrap_or(Term::End),
+        };
+        body.push(stmts);
+        term.push(t);
+    }
+    let succ = term
+        .iter()
+        .map(|t| match t {
+            Term::Goto(a) | Term::Fall(a) => vec![*a],
+            Term::Cond { taken, fall, .. } => vec![*taken, *fall],
+            Term::Ret | Term::End => vec![],
+        })
+        .collect();
+    let start = blocks.iter().map(|b| b.start).collect();
+    Cfg {
+        body,
+        term,
+        succ,
+        start,
+    }
+}
+
+/// Reverse postorder from `entry`, and each node's position in it.
+fn reverse_postorder(succ: &[Vec<usize>], entry: usize) -> Vec<usize> {
+    let n = succ.len();
+    let mut seen = vec![false; n];
+    let mut post = Vec::new();
+    // Iterative DFS to avoid deep recursion on large functions.
+    let mut stack = vec![(entry, 0usize)];
+    seen[entry] = true;
+    while let Some((node, ci)) = stack.pop() {
+        if ci < succ[node].len() {
+            stack.push((node, ci + 1));
+            let s = succ[node][ci];
+            if !seen[s] {
+                seen[s] = true;
+                stack.push((s, 0));
+            }
+        } else {
+            post.push(node);
+        }
+    }
+    post.reverse();
+    post
+}
+
+/// Immediate dominators (Cooper-Harvey-Kennedy). `idom[entry] == entry`.
+fn dominators(succ: &[Vec<usize>], entry: usize) -> Vec<usize> {
+    let n = succ.len();
+    let rpo = reverse_postorder(succ, entry);
+    let mut order = vec![usize::MAX; n];
+    for (i, &b) in rpo.iter().enumerate() {
+        order[b] = i;
+    }
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (u, ss) in succ.iter().enumerate() {
+        for &v in ss {
+            preds[v].push(u);
+        }
+    }
+    let mut idom = vec![usize::MAX; n];
+    idom[entry] = entry;
+    let intersect = |mut a: usize, mut b: usize, idom: &[usize], order: &[usize]| {
+        while a != b {
+            while order[a] > order[b] {
+                a = idom[a];
+            }
+            while order[b] > order[a] {
+                b = idom[b];
+            }
+        }
+        a
+    };
+    loop {
+        let mut changed = false;
+        for &b in rpo.iter() {
+            if b == entry {
+                continue;
+            }
+            let mut new = usize::MAX;
+            for &p in &preds[b] {
+                if idom[p] == usize::MAX {
+                    continue;
+                }
+                new = if new == usize::MAX {
+                    p
+                } else {
+                    intersect(p, new, &idom, &order)
+                };
+            }
+            if new != usize::MAX && idom[b] != new {
+                idom[b] = new;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    idom
+}
+
+/// Immediate post-dominators. A virtual exit (index `n`) collects every
+/// returning or terminal block; post-dominators are the dominators of the
+/// reversed graph from that exit. `ipdom[b] >= n` means no real block
+/// post-dominates `b` (it reaches the function exit directly).
+fn post_dominators(cfg: &Cfg) -> Vec<usize> {
+    let n = cfg.succ.len();
+    let mut rsucc: Vec<Vec<usize>> = vec![Vec::new(); n + 1];
+    for (u, ss) in cfg.succ.iter().enumerate() {
+        for &v in ss {
+            rsucc[v].push(u); // reversed edge
+        }
+    }
+    for (i, t) in cfg.term.iter().enumerate() {
+        if matches!(t, Term::Ret | Term::End) || cfg.succ[i].is_empty() {
+            rsucc[n].push(i);
+        }
+    }
+    let idom_r = dominators(&rsucc, n);
+    idom_r[..n].to_vec()
+}
+
+/// Does `a` dominate `b`?
+fn dominates(a: usize, b: usize, idom: &[usize]) -> bool {
+    let mut x = b;
+    loop {
+        if x == a {
+            return true;
+        }
+        if x == 0 || idom[x] == usize::MAX {
+            return a == 0 && b != usize::MAX;
+        }
+        if idom[x] == x {
+            return false;
+        }
+        x = idom[x];
+    }
+}
+
+/// Render the function as structured C. The reducible skeleton becomes nested
+/// `if`/`else` and `while`; the handful of edges that break nesting (shared
+/// join blocks in a `switch`, a jump into a common tail) become an explicit
+/// `goto` to a labelled block. Every node is emitted exactly once, so the
+/// control flow is preserved exactly: this is a faithful rendering, not a guess.
+/// Returns `None` only when the graph is not amenable at all (an unreachable
+/// block, or an empty function).
+fn structure(an: &Analysis, f: &Function, blocks: &[IrBlock]) -> Option<Vec<Line>> {
+    let cfg = build_cfg(blocks);
+    let n = cfg.body.len();
+    if n == 0 {
+        return None;
+    }
+    let idom = dominators(&cfg.succ, 0);
+    // Every node must be reachable from entry; an unreachable block means the
+    // recovered graph is inconsistent, so leave it to the flat form.
+    if (1..n).any(|i| idom[i] == usize::MAX) {
+        return None;
+    }
+    let ipdom = post_dominators(&cfg);
+
+    // A back edge (u -> h with h dominating u) marks h as a loop header and u as
+    // one of its latches. A header may have several latches; they all belong to
+    // the one loop.
+    let mut latches: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for (u, ss) in cfg.succ.iter().enumerate() {
+        for &v in ss {
+            if dominates(v, u, &idom) {
+                latches.entry(v).or_default().push(u);
+            }
+        }
+    }
+    let headers: BTreeSet<usize> = latches.keys().copied().collect();
+
+    // The node set of each natural loop, so `emit_loop` can tell the edge that
+    // stays in the loop from the one that leaves it. Dominance alone cannot: a
+    // loop's only exit block is still dominated by the header. The natural loop
+    // of a back edge (latch -> header) is the header plus every node that can
+    // reach a latch without passing through the header.
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (u, ss) in cfg.succ.iter().enumerate() {
+        for &v in ss {
+            preds[v].push(u);
+        }
+    }
+    let mut loop_body: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+    for (&h, ls) in &latches {
+        let mut body: BTreeSet<usize> = BTreeSet::new();
+        body.insert(h);
+        let mut work = ls.clone();
+        while let Some(x) = work.pop() {
+            if body.insert(x) {
+                work.extend_from_slice(&preds[x]);
+            }
+        }
+        loop_body.insert(h, body);
+    }
+
+    let base = an.display_base;
+    let mut out = Ir {
+        cfg: &cfg,
+        ipdom: &ipdom,
+        loops: &headers,
+        loop_body: &loop_body,
+        base,
+        lines: Vec::new(),
+        emitted: vec![false; n],
+        node_line: vec![usize::MAX; n],
+        node_indent: vec![1; n],
+        label_needed: BTreeSet::new(),
+    };
+    out.lines.push(Line {
+        label: true,
+        text: format!("sub_{:x}() {{", f.addr + base),
+    });
+    out.emit(0, None, None, 1);
+    out.lines.push(Line {
+        label: true,
+        text: "}".to_string(),
+    });
+
+    // Insert a label before each block a `goto` targets. Done back to front so
+    // earlier insertions do not shift the positions still to come.
+    let mut labels: Vec<(usize, usize, u64)> = out
+        .label_needed
+        .iter()
+        .filter(|&&nd| out.node_line[nd] != usize::MAX)
+        .map(|&nd| (out.node_line[nd], out.node_indent[nd], cfg.start[nd] + base))
+        .collect();
+    labels.sort_by_key(|&(at, ..)| std::cmp::Reverse(at));
+    for (at, indent, addr) in labels {
+        out.lines.insert(
+            at,
+            Line {
+                label: true,
+                text: format!("{}loc_{addr:x}:", "    ".repeat(indent - 1)),
+            },
+        );
+    }
+    Some(out.lines)
+}
+
+struct Ir<'a> {
+    cfg: &'a Cfg,
+    ipdom: &'a [usize],
+    /// Loop headers.
+    loops: &'a BTreeSet<usize>,
+    loop_body: &'a BTreeMap<usize, BTreeSet<usize>>,
+    base: u64,
+    lines: Vec<Line>,
+    emitted: Vec<bool>,
+    /// The line index at which each node's first statement was emitted, so a
+    /// label can be inserted there afterwards. `usize::MAX` until emitted.
+    node_line: Vec<usize>,
+    /// The indent each node was emitted at, so its label lines up with it.
+    node_indent: Vec<usize>,
+    /// Blocks that a `goto` jumps to and therefore need a label.
+    label_needed: BTreeSet<usize>,
+}
+
+impl Ir<'_> {
+    fn push(&mut self, indent: usize, text: String) {
+        self.lines.push(Line {
+            label: false,
+            text: format!("{}{}", "    ".repeat(indent - 1), text),
+        });
+    }
+
+    /// Emit a `goto` to an already-placed block, recording that the block needs
+    /// a label.
+    fn emit_goto(&mut self, indent: usize, target: usize) {
+        self.label_needed.insert(target);
+        let addr = self.cfg.start[target] + self.base;
+        self.push(indent, format!("goto loc_{addr:x};"));
+    }
+
+    /// If `h` is a `while`-shaped header (a conditional with exactly one edge
+    /// inside the loop body and one leaving it), return the loop test, the body
+    /// entry, and the follow block. The test is negated when the loop is entered
+    /// on the fall edge, so `while (cond)` always means "stay in the loop".
+    fn while_shape(&self, h: usize) -> Option<(Expr, usize, usize)> {
+        let Term::Cond { cond, taken, fall } = &self.cfg.term[h] else {
+            return None;
+        };
+        let (taken, fall) = (*taken, *fall);
+        let body = self.loop_body.get(&h)?;
+        match (body.contains(&taken), body.contains(&fall)) {
+            (true, false) => Some((cond.clone(), taken, fall)),
+            (false, true) => Some((not(cond), fall, taken)),
+            _ => None,
+        }
+    }
+
+    /// Emit the region starting at `n`, stopping before `stop`, inside an
+    /// optional enclosing loop `(header, follow)`. Each block is emitted exactly
+    /// once; an edge that cannot be a fall-through, a `break`, or a `continue`
+    /// becomes a `goto`, so the flow is always preserved.
+    fn emit(
+        &mut self,
+        mut n: usize,
+        stop: Option<usize>,
+        loopc: Option<(usize, usize)>,
+        indent: usize,
+    ) {
+        loop {
+            if Some(n) == stop {
+                return;
+            }
+            if let Some((hdr, follow)) = loopc {
+                // Leaving or re-entering the enclosing loop is a `break` /
+                // `continue`, not a jump to a placed block.
+                if n == follow {
+                    self.push(indent, "break;".into());
+                    return;
+                }
+                if n == hdr {
+                    self.push(indent, "continue;".into());
+                    return;
+                }
+            }
+            if self.emitted[n] {
+                self.emit_goto(indent, n);
+                return;
+            }
+
+            // A `while`-shaped loop header we are entering (not the enclosing
+            // one) becomes a `while`. A header of any other shape falls through
+            // to ordinary emission, and its back edges render as `goto`.
+            if self.loops.contains(&n) && loopc.map(|c| c.0) != Some(n) {
+                if let Some(shape) = self.while_shape(n) {
+                    n = self.emit_loop(n, shape, indent);
+                    continue;
+                }
+            }
+
+            self.node_line[n] = self.lines.len();
+            self.node_indent[n] = indent;
+            self.emitted[n] = true;
+            for s in &self.cfg.body[n] {
+                self.push(indent, render_stmt(s, self.base));
+            }
+
+            match &self.cfg.term[n] {
+                // The `return ...;` (or a verbatim out-of-function jump) is
+                // already in this block's body, so the path ends here.
+                Term::Ret | Term::End => return,
+                Term::Goto(t) | Term::Fall(t) => n = *t,
+                Term::Cond { cond, taken, fall } => {
+                    let (cond, taken, fall) = (cond.clone(), *taken, *fall);
+                    match self.emit_if(n, cond, taken, fall, stop, loopc, indent) {
+                        Some(follow) => n = follow,
+                        None => return,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Emit an `if`/`else` whose branches reconverge at the conditional's
+    /// immediate post-dominator, and return that follow block to continue from.
+    /// `None` means both arms terminate (a `return` or `break` on each side), so
+    /// there is nothing after the `if`.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_if(
+        &mut self,
+        node: usize,
+        cond: Expr,
+        taken: usize,
+        fall: usize,
+        stop: Option<usize>,
+        loopc: Option<(usize, usize)>,
+        indent: usize,
+    ) -> Option<usize> {
+        // The reconvergence point of the two arms is the conditional's immediate
+        // post-dominator. If it has none inside the function (both arms end in a
+        // return, say), the arms run to their own ends.
+        let n_nodes = self.cfg.body.len();
+        let ipd = self.ipdom.get(node).copied().unwrap_or(usize::MAX);
+        let follow = (ipd < n_nodes).then_some(ipd);
+        let arm_stop = follow.or(stop);
+        let is_follow = |arm: usize| Some(arm) == follow;
+
+        // When an arm target is the follow, that arm is empty and the code
+        // simply continues after the `if`; otherwise the arm has a body.
+        match (is_follow(taken), is_follow(fall)) {
+            (false, true) => {
+                self.push(indent, format!("if ({}) {{", render_expr(&cond)));
+                self.emit(taken, arm_stop, loopc, indent + 1);
+                self.push(indent, "}".into());
+            }
+            (true, false) => {
+                self.push(indent, format!("if ({}) {{", render_expr(&not(&cond))));
+                self.emit(fall, arm_stop, loopc, indent + 1);
+                self.push(indent, "}".into());
+            }
+            (false, false) => {
+                self.push(indent, format!("if ({}) {{", render_expr(&cond)));
+                self.emit(taken, arm_stop, loopc, indent + 1);
+                self.push(indent, "} else {".into());
+                self.emit(fall, arm_stop, loopc, indent + 1);
+                self.push(indent, "}".into());
+            }
+            // Both arms are the follow: the branch has no observable effect on
+            // structure, so continue at the follow.
+            (true, true) => {}
+        }
+        follow
+    }
+
+    /// Emit a `while` loop for header `h` given its recovered shape; return the
+    /// loop's follow block.
+    fn emit_loop(&mut self, h: usize, shape: (Expr, usize, usize), indent: usize) -> usize {
+        let (cond, body_entry, follow) = shape;
+        self.node_line[h] = self.lines.len();
+        self.node_indent[h] = indent;
+        self.emitted[h] = true;
+        // The header's own body statements are the loop condition test; emit
+        // them before the `while` so any side effects are preserved.
+        for s in &self.cfg.body[h] {
+            self.push(indent, render_stmt(s, self.base));
+        }
+        self.push(indent, format!("while ({}) {{", render_expr(&cond)));
+        self.emit(body_entry, None, Some((h, follow)), indent + 1);
+        // A `continue;` as the loop's very last statement is redundant with
+        // falling off the end, so drop it.
+        if self
+            .lines
+            .last()
+            .is_some_and(|l| !l.label && l.text.trim() == "continue;")
+        {
+            self.lines.pop();
+        }
+        self.push(indent, "}".into());
+        follow
+    }
+}
+
+/// Logical negation of a branch condition, for rendering the inverted arm.
+fn not(cond: &Expr) -> Expr {
+    if let Expr::Bin(op, l, r) = cond {
+        let inv = match *op {
+            "==" => "!=",
+            "!=" => "==",
+            "<" => ">=",
+            ">=" => "<",
+            ">" => "<=",
+            "<=" => ">",
+            _ => return Expr::Opaque(format!("!({})", render_expr(cond))),
+        };
+        return Expr::Bin(inv, l.clone(), r.clone());
+    }
+    Expr::Opaque(format!("!({})", render_expr(cond)))
+}
+
 fn render_stmt(s: &Stmt, base: u64) -> String {
     match s {
         Stmt::Set(dst, src) => format!("{} = {};", render_expr(dst), render_expr(src)),
@@ -855,6 +1383,81 @@ mod tests {
         assert!(lines
             .iter()
             .any(|l| l.text.contains("/*") && l.text.contains("cpuid")));
+    }
+
+    /// Build a 32-bit function from raw code that supplies its own control flow
+    /// and `ret`, with no appended call. For structuring tests.
+    fn lines_x86_raw(code: Vec<u8>) -> Vec<Line> {
+        let va = 0x1000u64;
+        let mut bin = Binary::stub(Format::Pe, Arch::X86);
+        bin.entry = va;
+        bin.sections = vec![Section {
+            name: ".text".into(),
+            vaddr: va,
+            vsize: code.len() as u64,
+            file_off: va,
+            file_size: code.len() as u64,
+            entropy: 0.0,
+            read: true,
+            write: false,
+            exec: true,
+        }];
+        let mut bytes = vec![0u8; va as usize];
+        bytes.extend_from_slice(&code);
+        let an = engine::analyze(&bin, &bytes, 10_000, &Db::default());
+        let f = an.find_function(va).unwrap();
+        decompile(&an, &bin, f)
+    }
+
+    #[test]
+    fn an_if_else_is_structured() {
+        // cmp [ebp+8],0 ; je else ; mov eax,1 ; jmp end ; else: mov eax,2 ; end: ret
+        // Two arms that reconverge at the return: this must become a real
+        // if/else, not a goto chain.
+        let code = vec![
+            0x83, 0x7d, 0x08, 0x00, // cmp dword [ebp+8], 0
+            0x74, 0x07, // je +7  -> else block
+            0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0xeb, 0x05, // jmp +5 -> end
+            0xb8, 0x02, 0x00, 0x00, 0x00, // mov eax, 2   (else)
+            0xc3, // ret
+        ];
+        let text: Vec<String> = lines_x86_raw(code).into_iter().map(|l| l.text).collect();
+        let joined = text.join("\n");
+        assert!(
+            joined.contains("if (*(ebp + 0x8) == 0x0) {") && joined.contains("} else {"),
+            "expected a structured if/else, got:\n{joined}"
+        );
+        // Structured output never falls back to labels or gotos.
+        assert!(
+            !joined.contains("goto") && !text.iter().any(|l| l.ends_with(':')),
+            "structured output must be goto-free, got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn a_counting_loop_is_structured() {
+        // mov eax,0 ; head: cmp eax,0xa ; jge end ; add eax,1 ; jmp head ; end: ret
+        // The back edge must be recovered as a `while`, with the exit block as
+        // the loop follow even though the header dominates it.
+        let code = vec![
+            0xb8, 0x00, 0x00, 0x00, 0x00, // mov eax, 0
+            0x83, 0xf8, 0x0a, // cmp eax, 0xa   (header)
+            0x7d, 0x05, // jge +5 -> end
+            0x83, 0xc0, 0x01, // add eax, 1
+            0xeb, 0xf6, // jmp -10 -> header
+            0xc3, // ret
+        ];
+        let text: Vec<String> = lines_x86_raw(code).into_iter().map(|l| l.text).collect();
+        let joined = text.join("\n");
+        assert!(
+            joined.contains("while (eax < 0xa) {"),
+            "expected a structured while loop, got:\n{joined}"
+        );
+        assert!(
+            !joined.contains("goto") && !text.iter().any(|l| l.ends_with(':')),
+            "structured output must be goto-free, got:\n{joined}"
+        );
     }
 
     #[test]

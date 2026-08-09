@@ -3,11 +3,17 @@
 ## Unreleased
 
 - `pseudo`: a decompiler engine built on a typed IR. It lifts each instruction,
-  propagates expressions, eliminates dead stores with a whole-function liveness
-  pass, and folds constants, so a call renders with its recovered arguments
-  (`lstrcpyA(&(ebp - 0x28), *(ebp+8) + 0x1c)`) and the noise around it is gone.
-  Control flow reads as `if`/`goto` (structuring is a later phase); unmodelled
-  instructions are shown verbatim rather than guessed at.
+  propagates expressions (across block boundaries too), eliminates dead stores
+  with a whole-function liveness pass, and folds constants, so a call renders
+  with its recovered arguments (`lstrcpyA(&(ebp - 0x28), *(ebp+8) + 0x1c)`) and
+  the noise around it is gone.
+- `pseudo`: control-flow structuring. Dominators and post-dominators drive a
+  recursive emitter that rebuilds nested `if`/`else` and `while` from the graph,
+  so output reads as C rather than a goto chain. The few edges that break
+  nesting (shared `switch` tails, a jump into a common handler) become an
+  explicit `goto` to a labelled block, so the flow is preserved exactly rather
+  than approximated. There is no type recovery, and an unmodelled instruction is
+  shown verbatim rather than guessed at.
 - The engine no longer re-decodes shared block tails, so analysis of real
   binaries is complete rather than budget-truncated (EQNEDT32.EXE: 537 to 930
   functions), and the budget is raised so normal targets finish.
