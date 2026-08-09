@@ -181,7 +181,7 @@ fn classify(
             // A format pointer that is a fixed constant is the normal, safe
             // case; a runtime pointer is the format-string bug. Anything we
             // could not resolve is left alone rather than guessed at.
-            match provenance(an, bin, bytes, block, call_idx, arg, win64) {
+            match provenance(an, bin, bytes, block, call_idx, arg, win64).origin {
                 Origin::Dynamic => Some(mk(
                     "format-string",
                     3,
@@ -190,33 +190,71 @@ fn classify(
                 _ => None,
             }
         }
-        Check::AllocSize(arg) => match provenance(an, bin, bytes, block, call_idx, arg, win64) {
-            Origin::Multiply => Some(mk(
-                "alloc-overflow",
-                3,
-                "allocation size computed by multiplication (integer overflow?)".to_string(),
-            )),
-            Origin::Subtract => Some(mk(
-                "alloc-underflow",
-                2,
-                "allocation size computed by subtraction".to_string(),
-            )),
-            _ => None,
-        },
-        Check::CopySize(arg) => match provenance(an, bin, bytes, block, call_idx, arg, win64) {
-            Origin::Subtract => Some(mk(
-                "copy-underflow",
-                3,
-                "copy length computed by subtraction (integer underflow to a huge size?)"
-                    .to_string(),
-            )),
-            Origin::Multiply => Some(mk(
-                "copy-overflow",
-                2,
-                "copy length computed by multiplication (integer overflow?)".to_string(),
-            )),
-            _ => None,
-        },
+        // A size that is clamped or masked before the call cannot actually reach
+        // an extreme, so the finding is kept but ranked well below the raw ones:
+        // still worth a glance, no longer worth an afternoon.
+        Check::AllocSize(arg) => {
+            let p = provenance(an, bin, bytes, block, call_idx, arg, win64);
+            match p.origin {
+                Origin::Multiply => Some(sized(
+                    &mk,
+                    "alloc-overflow",
+                    3,
+                    "allocation size computed by multiplication (integer overflow?)",
+                    p.bounded,
+                )),
+                Origin::Subtract => Some(sized(
+                    &mk,
+                    "alloc-underflow",
+                    2,
+                    "allocation size computed by subtraction",
+                    p.bounded,
+                )),
+                _ => None,
+            }
+        }
+        Check::CopySize(arg) => {
+            let p = provenance(an, bin, bytes, block, call_idx, arg, win64);
+            match p.origin {
+                Origin::Subtract => Some(sized(
+                    &mk,
+                    "copy-underflow",
+                    3,
+                    "copy length computed by subtraction (integer underflow to a huge size?)",
+                    p.bounded,
+                )),
+                Origin::Multiply => Some(sized(
+                    &mk,
+                    "copy-overflow",
+                    2,
+                    "copy length computed by multiplication (integer overflow?)",
+                    p.bounded,
+                )),
+                _ => None,
+            }
+        }
+    }
+}
+
+/// Build a size-argument finding, downgrading it a band and annotating it when
+/// the value was clamped or masked before the call.
+fn sized(
+    mk: &dyn Fn(&'static str, u8, String) -> Finding,
+    pattern: &'static str,
+    severity: u8,
+    detail: &str,
+    bounded: bool,
+) -> Finding {
+    if bounded {
+        // A clamped or masked size is likely safe, so it sinks to the bottom
+        // band rather than merely one step down.
+        mk(
+            pattern,
+            1,
+            format!("{detail}; but clamped or masked before the call, likely safe"),
+        )
+    } else {
+        mk(pattern, severity, detail.to_string())
     }
 }
 
@@ -237,8 +275,18 @@ fn arg_register(n: u8, win64: bool) -> Option<Register> {
     table.get((n as usize).checked_sub(1)?).copied()
 }
 
+/// What the backward walk found about an argument: where its value came from,
+/// and whether it was bounded before the call.
+struct Prov {
+    origin: Origin,
+    /// A clamp (`cmp` + `cmov`) or a mask (`and reg, imm`) was applied to the
+    /// value between its computation and the call, so a raw subtraction or
+    /// multiply cannot actually reach an extreme.
+    bounded: bool,
+}
+
 /// Walk backward through the block from the call to find where the argument
-/// register was last written, and classify that instruction.
+/// register was last written, classify it, and note any clamp on the way.
 fn provenance(
     an: &Analysis,
     bin: &Binary,
@@ -247,14 +295,18 @@ fn provenance(
     call_idx: usize,
     arg: u8,
     win64: bool,
-) -> Origin {
+) -> Prov {
     let Some(target) = arg_register(arg, win64) else {
-        return Origin::Unknown;
+        return Prov {
+            origin: Origin::Unknown,
+            bounded: false,
+        };
     };
     // The register we are currently tracing. A plain register-to-register move
     // retargets it to the source, so a value that was computed in one register
     // and moved into the argument register is followed to its real origin.
     let mut want = target.full_register();
+    let mut bounded = false;
 
     let mut info = InstructionInfoFactory::new();
     for j in (0..call_idx).rev() {
@@ -265,16 +317,30 @@ fn provenance(
         // Argument registers do not survive an intervening call, so a value set
         // before one is not the value passed here.
         if matches!(d.mnemonic(), Mnemonic::Call) {
-            return Origin::Unknown;
+            return Prov {
+                origin: Origin::Unknown,
+                bounded,
+            };
         }
-        let writes = info
-            .info(&d)
-            .used_registers()
-            .iter()
-            .filter(|u| matches!(u.access(), OpAccess::Write | OpAccess::ReadWrite))
-            .any(|u| u.register().is_gpr() && u.register().full_register() == want);
+
+        // A conditional move into the tracked register is the min/max clamp
+        // idiom (`cmp size, limit; cmova size, limit`). It writes the register
+        // only conditionally, so the backward walk would otherwise step past it
+        // to the raw arithmetic and call a bounded value dangerous. Record the
+        // clamp and keep following the kept value.
+        if is_cmov(&d) && writes_reg(&mut info, &d, want) {
+            bounded = true;
+            continue;
+        }
+
+        let writes = writes_reg(&mut info, &d, want);
         if !writes {
             continue;
+        }
+        // A mask bounds the value to the immediate, which is the other way a
+        // subtraction or product is made safe.
+        if d.mnemonic() == Mnemonic::And && d.op1_kind() != OpKind::Register {
+            bounded = true;
         }
         // Follow a copy: `mov edi, eax` means the value's real origin is
         // whatever last wrote eax, so keep walking with that register.
@@ -285,9 +351,35 @@ fn provenance(
             want = d.op1_register().full_register();
             continue;
         }
-        return origin_of(&d, bin, an, bytes);
+        return Prov {
+            origin: origin_of(&d, bin, an, bytes),
+            bounded,
+        };
     }
-    Origin::Unknown
+    Prov {
+        origin: Origin::Unknown,
+        bounded,
+    }
+}
+
+/// Does this instruction write (or conditionally write) the given 64-bit reg?
+fn writes_reg(info: &mut InstructionInfoFactory, d: &Instruction, want: Register) -> bool {
+    info.info(d)
+        .used_registers()
+        .iter()
+        .filter(|u| {
+            matches!(
+                u.access(),
+                OpAccess::Write | OpAccess::ReadWrite | OpAccess::CondWrite
+            )
+        })
+        .any(|u| u.register().is_gpr() && u.register().full_register() == want)
+}
+
+/// Every conditional-move variant, without listing all sixteen: their debug
+/// names all begin with `Cmov`.
+fn is_cmov(d: &Instruction) -> bool {
+    format!("{:?}", d.mnemonic()).starts_with("Cmov")
 }
 
 /// Classify the instruction that defined an argument register.
@@ -474,11 +566,51 @@ mod tests {
             0x29, 0xc2, // sub edx, eax
         ];
         let f = Harness::new("memcpy", code).findings();
-        assert!(
-            f.iter().any(|x| x.pattern == "copy-underflow"),
-            "expected copy-underflow, got {:?}",
-            f.iter().map(|x| x.pattern).collect::<Vec<_>>()
-        );
+        let hit = f
+            .iter()
+            .find(|x| x.pattern == "copy-underflow")
+            .expect("expected copy-underflow");
+        assert_eq!(hit.severity, 3, "an unclamped subtraction is high severity");
+    }
+
+    #[test]
+    fn a_clamped_subtraction_is_downgraded_not_dropped() {
+        // sub edx, eax ; cmp edx, ecx ; cmova edx, ecx ; call memcpy
+        // The length (rdx, SysV arg3) is a subtraction, but the cmov clamps it,
+        // so it is the safe min()/max() idiom, not an underflow. The finding
+        // should survive but drop below the raw ones.
+        let code = vec![
+            0x29, 0xc2, // sub edx, eax
+            0x39, 0xca, // cmp edx, ecx
+            0x0f, 0x47, 0xd1, // cmova edx, ecx
+        ];
+        let f = Harness::new("memcpy", code).findings();
+        let hit = f
+            .iter()
+            .find(|x| x.pattern == "copy-underflow")
+            .expect("still reported");
+        assert_eq!(hit.severity, 1, "a clamped subtraction is downgraded");
+        assert!(hit.detail.contains("clamped or masked"));
+    }
+
+    #[test]
+    fn a_clamp_through_a_move_hop_is_detected() {
+        // The exact shape seen in 7z.dll: the length is computed in one 64-bit
+        // register, clamped there with a cmov, then moved into the argument
+        // register. The walk must follow the move and still see the clamp.
+        //   sub r12, rax ; cmp r12, rcx ; cmova r12, rcx ; mov rdx, r12 ; call
+        let code = vec![
+            0x49, 0x29, 0xc4, // sub r12, rax
+            0x49, 0x39, 0xcc, // cmp r12, rcx
+            0x4c, 0x0f, 0x47, 0xe1, // cmova r12, rcx
+            0x4c, 0x89, 0xe2, // mov rdx, r12   (rdx = SysV arg3)
+        ];
+        let f = Harness::new("memcpy", code).findings();
+        let hit = f
+            .iter()
+            .find(|x| x.pattern == "copy-underflow")
+            .expect("still reported");
+        assert_eq!(hit.severity, 1, "the clamp is seen through the move hop");
     }
 
     #[test]
