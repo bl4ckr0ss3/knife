@@ -51,5 +51,7 @@ ratatui = "0.30"
 opt-level = 3
 lto = "thin"
 strip = true
-panic = "abort"
+# Not `panic = "abort"`: knife parses hostile binaries, and its dependencies can
+# panic on malformed input. Unwinding lets the parse boundary catch that and
+# report a clean error instead of taking the whole process down.
 codegen-units = 1

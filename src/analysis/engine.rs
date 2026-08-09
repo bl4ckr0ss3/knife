@@ -309,7 +309,12 @@ pub fn va_to_off(bin: &Binary, base: u64, va: u64) -> Option<usize> {
     for s in &bin.sections {
         let span = s.vsize.max(s.file_size);
         if s.vaddr != 0 && rva >= s.vaddr && rva < s.vaddr + span {
-            return Some((s.file_off + (rva - s.vaddr)) as usize);
+            let delta = rva - s.vaddr;
+            // Only the file-backed part of a section has an offset; an address
+            // in the virtual-only tail (a .bss, or a vsize larger than the raw
+            // data) has no bytes to point at. Sections are clamped to the file
+            // at parse time, so `file_off + delta` here is always in bounds.
+            return (delta < s.file_size).then_some((s.file_off + delta) as usize);
         }
     }
     None
@@ -626,9 +631,14 @@ fn build_function(
         let Some(off) = va_to_off(bin, base, block_start) else {
             continue;
         };
+        // A corrupted section header can map a valid-looking address to an
+        // offset past the end of the file; the bounds check keeps that from
+        // becoming a crash on a hostile binary.
+        let Some(code) = bytes.get(off..) else {
+            continue;
+        };
         min_start = min_start.min(block_start);
-        let mut decoder =
-            Decoder::with_ip(bin.bits, &bytes[off..], block_start, DecoderOptions::NONE);
+        let mut decoder = Decoder::with_ip(bin.bits, code, block_start, DecoderOptions::NONE);
         // AArch64 has no variable-width decoding: the cursor is just +4 each
         // instruction.
         let mut apos = 0usize;
@@ -647,11 +657,14 @@ fn build_function(
             let mut ice: Option<Instruction> = None;
             let (addr, len, raw, flow, dtarget) = if is_a64 {
                 let at = block_start + apos as u64;
-                let Some(w) = crate::analysis::aarch64::decode(&bytes[off + apos..], at) else {
+                let Some(chunk) = bytes.get(off + apos..) else {
+                    break;
+                };
+                let Some(w) = crate::analysis::aarch64::decode(chunk, at) else {
                     break;
                 };
                 spent += 1;
-                let raw = bytes[off + apos..off + apos + w.len].to_vec();
+                let raw = chunk[..w.len].to_vec();
                 apos += w.len;
                 (w.addr, w.len, raw, w.flow, w.target)
             } else {

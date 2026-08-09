@@ -24,17 +24,42 @@ pub fn detect(bytes: &[u8]) -> Format {
 }
 
 pub fn analyze(path: &str, bytes: &[u8]) -> Result<Binary> {
-    let mut bin = match Object::parse(bytes) {
-        Ok(Object::PE(pe)) => pe::build(path, bytes, pe),
-        Ok(Object::Elf(elf)) => elf::build(path, bytes, elf),
-        Ok(Object::Mach(mach)) => macho::build(path, bytes, mach)?,
-        Ok(Object::Archive(_)) => bail!("archive files are listed, not analyzed (try `knife ls`)"),
-        _ => bail!("unrecognized format: not PE, ELF, or Mach-O"),
-    };
-
+    // goblin parses fully untrusted input, and on some malformed files it
+    // panics (an unchecked subtraction on a crafted Mach-O, for one) rather
+    // than returning an error. Since the whole job here is hostile input, the
+    // parse runs inside a catch so a dependency panic becomes a clean rejection
+    // instead of taking the process down. Our own analysis stays outside the
+    // catch, so a bug in knife still surfaces as a panic in tests.
+    let mut bin = catch_parse(path, bytes)?;
     bin.overall_entropy = entropy(bytes);
     detect_overlay(&mut bin, bytes.len() as u64, bytes);
     Ok(bin)
+}
+
+fn catch_parse(path: &str, bytes: &[u8]) -> Result<Binary> {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    // Suppress the default hook for the duration: a caught, expected panic on a
+    // hostile file should not spray a backtrace across the user's terminal.
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = catch_unwind(AssertUnwindSafe(|| build_from_object(path, bytes)));
+    std::panic::set_hook(prev);
+
+    match result {
+        Ok(inner) => inner,
+        Err(_) => bail!("malformed binary: the parser could not make sense of it"),
+    }
+}
+
+fn build_from_object(path: &str, bytes: &[u8]) -> Result<Binary> {
+    match Object::parse(bytes) {
+        Ok(Object::PE(pe)) => Ok(pe::build(path, bytes, pe)),
+        Ok(Object::Elf(elf)) => Ok(elf::build(path, bytes, elf)),
+        Ok(Object::Mach(mach)) => macho::build(path, bytes, mach),
+        Ok(Object::Archive(_)) => bail!("archive files are listed, not analyzed (try `knife ls`)"),
+        _ => bail!("unrecognized format: not PE, ELF, or Mach-O"),
+    }
 }
 
 /// Bytes past the end of the last mapped section: appended payload / bundle.
@@ -107,6 +132,16 @@ pub(crate) fn mk_section(
     exec: bool,
     bytes: &[u8],
 ) -> Section {
+    // Clamp the file-backed range to what the file actually contains. A crafted
+    // header can claim a section that runs past EOF; if that claim is trusted,
+    // every later offset computed from it walks off the end of the buffer. Once
+    // clamped here, an offset derived from `file_off`/`file_size` is always in
+    // bounds, which is what lets the rest of the tool index without a guard at
+    // every site.
+    let len = bytes.len() as u64;
+    let file_off = file_off.min(len);
+    let file_size = file_size.min(len - file_off);
+
     Section {
         name: name.into(),
         vaddr,

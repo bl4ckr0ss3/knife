@@ -29,7 +29,10 @@ pub fn vaddr_to_off(bin: &Binary, vaddr: u64) -> Option<u64> {
     for s in &bin.sections {
         let span = s.vsize.max(s.file_size);
         if s.vaddr != 0 && vaddr >= s.vaddr && vaddr < s.vaddr + span {
-            return Some(s.file_off + (vaddr - s.vaddr));
+            let delta = vaddr - s.vaddr;
+            // Only the file-backed part of a section maps to bytes; sections are
+            // clamped to the file at parse time, so this offset is in bounds.
+            return (delta < s.file_size).then_some(s.file_off + delta);
         }
     }
     None

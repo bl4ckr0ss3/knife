@@ -8,6 +8,8 @@ mod formats;
 mod listing;
 mod model;
 mod output;
+#[cfg(test)]
+mod robustness;
 mod tui;
 
 use analysis::{
