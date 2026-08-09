@@ -94,6 +94,10 @@ enum Origin {
     Subtract,
     /// A small constant immediate (a length known at compile time).
     Constant,
+    /// A pointer into the stack frame: `lea reg, [rsp+k]` / `[rbp-k]`. As a copy
+    /// destination this is a fixed-size stack buffer, so an unbounded write into
+    /// it is the classic stack overflow.
+    Stack,
     /// No defining instruction was found in the block before the call.
     Unknown,
 }
@@ -166,9 +170,25 @@ fn classify(
         reachable,
     };
 
+    // The copy destination is the first argument of every copy sink. A write
+    // into a fixed-size stack buffer is the classic overflow, so it is worth
+    // knowing whichever length pattern applies.
+    let dest_is_stack =
+        provenance(an, bin, bytes, block, call_idx, 1, win64).origin == Origin::Stack;
+
     match check {
         Check::Unbounded => {
-            // No argument to inspect; the finding is the call plus its reach.
+            // An unbounded copy into a stack buffer is the textbook stack
+            // overflow; that is a stronger, more specific finding than a bare
+            // unbounded copy, and it is high severity on its own merit.
+            if dest_is_stack {
+                return Some(mk(
+                    "stack-overflow",
+                    3,
+                    "unbounded copy into a stack buffer (classic stack overflow)".to_string(),
+                ));
+            }
+            // No length argument to inspect; the finding is the call plus reach.
             let sev = if reachable { 3 } else { 2 };
             let detail = if reachable {
                 "unbounded copy reachable from an entry point or export".to_string()
@@ -215,19 +235,28 @@ fn classify(
         }
         Check::CopySize(arg) => {
             let p = provenance(an, bin, bytes, block, call_idx, arg, win64);
+            // A stack destination turns an attacker-influenced length into a
+            // stack-smash rather than a heap one, worth saying in the finding.
+            let dst = if dest_is_stack {
+                " into a stack buffer"
+            } else {
+                ""
+            };
             match p.origin {
                 Origin::Subtract => Some(sized(
                     &mk,
                     "copy-underflow",
                     3,
-                    "copy length computed by subtraction (integer underflow to a huge size?)",
+                    &format!(
+                        "copy length computed by subtraction (integer underflow to a huge size?){dst}"
+                    ),
                     p.bounded,
                 )),
                 Origin::Multiply => Some(sized(
                     &mk,
                     "copy-overflow",
                     2,
-                    "copy length computed by multiplication (integer overflow?)",
+                    &format!("copy length computed by multiplication (integer overflow?){dst}"),
                     p.bounded,
                 )),
                 _ => None,
@@ -391,9 +420,17 @@ fn origin_of(d: &Instruction, bin: &Binary, an: &Analysis, bytes: &[u8]) -> Orig
         Mnemonic::Shl | Mnemonic::Sal => Origin::Multiply,
         Mnemonic::Sub | Mnemonic::Sbb => Origin::Subtract,
         // `lea reg, [base + index*scale]` with a real index is a multiply; a
-        // plain `lea reg, [rip+k]` is a fixed address.
+        // frame-relative lea is a stack buffer; a plain `lea reg, [rip+k]` is a
+        // fixed address.
         Mnemonic::Lea => {
-            if d.memory_index() != Register::None {
+            let base = d.memory_base();
+            if matches!(
+                base,
+                Register::RSP | Register::ESP | Register::RBP | Register::EBP
+            ) && d.memory_index() == Register::None
+            {
+                Origin::Stack
+            } else if d.memory_index() != Register::None {
                 Origin::Multiply
             } else {
                 Origin::Fixed
@@ -611,6 +648,31 @@ mod tests {
             .find(|x| x.pattern == "copy-underflow")
             .expect("still reported");
         assert_eq!(hit.severity, 1, "the clamp is seen through the move hop");
+    }
+
+    #[test]
+    fn strcpy_into_a_stack_buffer_is_a_stack_overflow() {
+        // lea rdi, [rsp+0x20] ; call strcpy
+        // The destination (rdi, SysV arg1) is a stack buffer, so an unbounded
+        // strcpy into it is the textbook stack overflow, not a generic one.
+        let code = vec![0x48, 0x8d, 0x7c, 0x24, 0x20]; // lea rdi, [rsp+0x20]
+        let f = Harness::new("strcpy", code).findings();
+        let hit = f
+            .iter()
+            .find(|x| x.pattern == "stack-overflow")
+            .expect("expected stack-overflow");
+        assert_eq!(hit.severity, 3);
+        assert!(hit.detail.contains("stack buffer"));
+    }
+
+    #[test]
+    fn strcpy_into_a_heap_pointer_is_a_plain_unbounded_copy() {
+        // mov rdi, [rbx] ; call strcpy — the destination is a loaded pointer,
+        // not a stack buffer, so it stays the generic unbounded-copy finding.
+        let code = vec![0x48, 0x8b, 0x3b]; // mov rdi, [rbx]
+        let f = Harness::new("strcpy", code).findings();
+        assert!(f.iter().any(|x| x.pattern == "unbounded-copy"));
+        assert!(!f.iter().any(|x| x.pattern == "stack-overflow"));
     }
 
     #[test]
