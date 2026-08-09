@@ -36,21 +36,23 @@ it is why this bug was so reliably exploitable.
 ```
 $ knife audit EQNEDT32.EXE
 
-§ AUDIT (3 FINDINGS)
+§ AUDIT (7 FINDINGS)
   [-] stack-overflow   lstrcpyA  FMDFontListEnum @ 0x4212c2  ← reachable
       unbounded copy of a runtime value into a stack buffer (classic overflow)
   [-] stack-overflow   lstrcpyA  sub_41264b      @ 0x412803  ← reachable
       unbounded copy of a runtime value into a stack buffer (classic overflow)
-  [-] unbounded-copy   lstrcpyA  sub_41264b      @ 0x4126e2  ← reachable
-      unbounded copy reachable from an entry point or export
+  [-] stack-overflow   lstrcpyA  sub_41388b      @ 0x413935  ← reachable
+      unbounded copy of a runtime value into a stack buffer (classic overflow)
+  [-] alloc-overflow   ...       sub_44db10      @ 0x44dcbb  ← reachable
+  ... 7 findings, all high severity ...
 ```
 
 `audit` reads each dangerous call's arguments and keeps only the sites whose
-provenance matches a bug pattern. Here it finds three `lstrcpyA` calls that copy
-a runtime value into a fixed stack buffer, all reachable from an entry point.
-The first is in a function whose own name, `FMDFontListEnum`, survived
-stripping, and CVE-2017-11882 is a font-name overflow. That is the one to read
-first.
+provenance matches a bug pattern. On this binary all seven findings are high
+severity: three `lstrcpyA` calls copying a runtime value into a fixed stack
+buffer, and more. The first is in a function whose own name, `FMDFontListEnum`,
+survived stripping, and CVE-2017-11882 is a font-name overflow. That is the one
+to read first.
 
 ## 3. Confirm it
 
