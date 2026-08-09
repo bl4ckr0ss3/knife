@@ -2,19 +2,41 @@
 
 # knife
 
-**A reverse engineer's binary Swiss-army knife, in Rust.**
+**Find the bug, not just the binary.** A reverse engineer's toolkit in Rust.
 
-Parse, triage, and disassemble **PE, ELF, and Mach-O** from one small binary.
-No runtime, no services, the target is never executed.
+Parse, triage, disassemble, and audit **PE, ELF, and Mach-O** from one small
+binary. Static only: it reads the bytes on disk and never runs the target.
 
 [![ci](https://github.com/bl4ckr0ss3/knife/actions/workflows/ci.yml/badge.svg)](https://github.com/bl4ckr0ss3/knife/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/reknife.svg)](https://crates.io/crates/reknife)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![platforms](https://img.shields.io/badge/platform-linux%20%C2%B7%20macos%20%C2%B7%20windows-informational)
 
-<img src="assets/hero.png" alt="knife triage output" width="820">
-
 </div>
+
+Most tools tell you a binary imports `memcpy`. `knife` reads the call sites and
+tells you which one takes its length from a subtraction:
+
+```text
+$ knife sec 7z.dll
+  [-] stack cookies (/GS)  disabled   no __security_cookie in the load config
+      linear stack overflows reach the saved return address unchecked
+  [-] CFG                  disabled   GUARD_CF clear
+  WEAK   exposure score 7 · 3 of 6 mitigations missing or weakened
+
+$ knife audit 7z.dll
+  § AUDIT (145 FINDINGS)
+  [-] copy-underflow   memcpy  sub_1000a6b4     @ 0x1000a72a
+      copy length computed by subtraction (integer underflow to a huge size?)
+  [-] copy-underflow   memset  sub_1000b028     @ 0x1000b0a2
+      copy length computed by subtraction (integer underflow to a huge size?)
+```
+
+Those addresses are real functions in a stripped C++ parser that most
+disassemblers never even recover: `knife` seeds function discovery from the PE
+exception directory, taking `7z.dll` from 87 functions to 6472, and reads the
+argument that reaches each dangerous call to rank the ones that look
+exploitable. It works the same on a Linux daemon or a macOS dylib.
 
 ## Why
 
@@ -24,8 +46,9 @@ one for strings and IOCs, one for imports, one for entropy, one to disassemble.
 transparent triage verdict on top. Everything is static: it reads the bytes on
 disk and never runs the file.
 
-It answers the research questions in the same place: what mitigations the target
-was built with, where its dangerous calls are, and what reaches them. See
+But the reason to reach for it is the next step, the one the other tools leave to
+you: it says what the target is protected by, where its dangerous calls are,
+which of them look actually wrong, and what can reach them. See
 [for vulnerability research](#for-vulnerability-research).
 
 ## Install
