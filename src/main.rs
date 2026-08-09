@@ -336,7 +336,7 @@ fn real_main() -> Result<()> {
 /// CFG. Keeping it uniform is what guarantees that a site `audit` reports can
 /// always be shown by `dis --func`: a smaller budget here would let one command
 /// find code another cannot display.
-const ANALYSIS_BUDGET: usize = 2_000_000;
+const ANALYSIS_BUDGET: usize = 10_000_000;
 
 fn load(file: &str) -> Result<Vec<u8>> {
     std::fs::read(file).with_context(|| format!("cannot read {file}"))
