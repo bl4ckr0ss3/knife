@@ -344,6 +344,53 @@ fn br_word(rn: u32) -> u32 {
     0xd61f_0000 | ((rn & 0x1f) << 5)
 }
 
+/// A 64-bit ELF carrying a `.eh_frame_hdr` search table that lists two function
+/// starts (0x1000 and 0x1400). The table encoding is the near-universal
+/// `datarel | sdata4`, so `eh_frame_hdr_starts` recovers both addresses. There
+/// is one `PT_GNU_EH_FRAME` program header and nothing else, which is all the
+/// discovery path reads.
+pub fn elf_with_eh_frame_hdr() -> Vec<u8> {
+    const HDR_OFF: u64 = 0x0080; // both file offset and vaddr of .eh_frame_hdr
+    let starts = [0x1000u64, 0x1400u64];
+
+    let mut f = vec![0u8; 0x100];
+
+    // ── ELF header ──
+    f[0..4].copy_from_slice(b"\x7fELF");
+    f[4] = 2; // ELFCLASS64
+    f[5] = 1; // ELFDATA2LSB
+    f[6] = 1; // EV_CURRENT
+    put16(&mut f, 16, 3); // e_type = ET_DYN
+    put16(&mut f, 18, 62); // e_machine = x86-64
+    put32(&mut f, 20, 1); // e_version
+    put64(&mut f, 32, EHDR as u64); // e_phoff
+    put16(&mut f, 52, EHDR as u16); // e_ehsize
+    put16(&mut f, 54, PHDR as u16); // e_phentsize
+    put16(&mut f, 56, 1); // e_phnum
+
+    // ── one program header: PT_GNU_EH_FRAME ──
+    phdr(&mut f, EHDR, 0x6474_e550, 4, HDR_OFF, HDR_OFF, 0x40, 4);
+
+    // ── .eh_frame_hdr ──
+    let h = HDR_OFF as usize;
+    f[h] = 1; // version
+    f[h + 1] = 0x1b; // eh_frame_ptr_enc = pcrel sdata4 (4 bytes, skipped)
+    f[h + 2] = 0x03; // fde_count_enc = udata4
+    f[h + 3] = 0x3b; // table_enc = datarel sdata4
+    put32(&mut f, h + 4, 0); // eh_frame_ptr (skipped)
+    put32(&mut f, h + 8, starts.len() as u32); // fde_count
+                                               // Each row: (initial_location, fde_addr), both sdata4 relative to HDR_OFF.
+    let mut row = h + 12;
+    for &s in &starts {
+        let delta = (s as i64 - HDR_OFF as i64) as i32;
+        put32(&mut f, row, delta as u32); // initial_location
+        put32(&mut f, row + 4, delta as u32); // fde_addr (value irrelevant here)
+        row += 8;
+    }
+
+    f
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // PE
 //

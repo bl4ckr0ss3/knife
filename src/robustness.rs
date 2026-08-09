@@ -154,6 +154,7 @@ fn fixtures() -> Vec<Vec<u8>> {
         elf_with_plt_call(),
         elf_aarch64_call(),
         elf_aarch64_plt_call(),
+        elf_with_eh_frame_hdr(),
         pe_with_iat_call(),
         macho_with_bind(),
     ]

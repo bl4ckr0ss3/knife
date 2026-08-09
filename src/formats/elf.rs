@@ -8,6 +8,7 @@ const SHF_WRITE: u64 = 0x1;
 const SHF_ALLOC: u64 = 0x2;
 const SHF_EXECINSTR: u64 = 0x4;
 
+const PT_GNU_EH_FRAME: u32 = 0x6474_e550;
 const PT_GNU_STACK: u32 = 0x6474_e551;
 const PT_GNU_RELRO: u32 = 0x6474_e552;
 const PF_X: u32 = 0x1;
@@ -187,8 +188,16 @@ pub fn build(path: &str, bytes: &[u8], elf: Elf) -> Binary {
         && (elf.interpreter.is_some() || dyn_flags_1 & DF_1_PIE != 0)
         && elf.entry != 0;
 
+    // The .eh_frame_hdr search table lists function starts the same way the PE
+    // exception directory does, recovering code reached only through indirect
+    // calls. Computed here so it can also feed the note below.
+    let func_hints = eh_frame_hdr_starts(&elf, bytes);
+
     let mut notes = Vec::new();
     notes.push(format!("ELF{}", if elf.is_64 { "64" } else { "32" }));
+    if !func_hints.is_empty() {
+        notes.push(format!("{} eh_frame functions", func_hints.len()));
+    }
     notes.push(if elf.little_endian {
         "LE".into()
     } else {
@@ -228,7 +237,7 @@ pub fn build(path: &str, bytes: &[u8], elf: Elf) -> Binary {
         imports,
         exports,
         symbols,
-        func_hints: Vec::new(),
+        func_hints,
         libs: elf.libraries.iter().map(|s| s.to_string()).collect(),
         rpaths: elf
             .rpaths
@@ -254,5 +263,116 @@ pub fn build(path: &str, bytes: &[u8], elf: Elf) -> Binary {
             ..Default::default()
         },
         notes,
+    }
+}
+
+/// Function-start addresses from the `.eh_frame_hdr` search table.
+///
+/// The ELF answer to the PE exception directory. `PT_GNU_EH_FRAME` points at a
+/// header whose binary-search table pairs every FDE's `initial_location` (a
+/// function start) with its unwind record, sorted by address. Modern PIE
+/// executables and shared libraries all carry it, so it recovers the functions
+/// a stripped C++ ELF only reaches through vtables, exactly as `.pdata` does on
+/// Windows.
+///
+/// The table encoding is required to be the near-universal `datarel | sdata4`;
+/// anything else returns empty rather than risk a misparse. Every read is
+/// bounds-checked, because this parses attacker-controlled bytes.
+fn eh_frame_hdr_starts(elf: &Elf, bytes: &[u8]) -> Vec<u64> {
+    // DW_EH_PE: low nibble is the value format, high nibble the base.
+    const DW_EH_PE_DATAREL_SDATA4: u8 = 0x3b;
+
+    let Some(ph) = elf
+        .program_headers
+        .iter()
+        .find(|p| p.p_type == PT_GNU_EH_FRAME)
+    else {
+        return Vec::new();
+    };
+
+    let base_off = ph.p_offset as usize;
+    let hdr_vaddr = ph.p_vaddr;
+    let rd = |o: usize, n: usize| bytes.get(o..o + n);
+
+    // version(1), eh_frame_ptr_enc(1), fde_count_enc(1), table_enc(1)
+    let Some(head) = rd(base_off, 4) else {
+        return Vec::new();
+    };
+    if head[0] != 1 || head[3] != DW_EH_PE_DATAREL_SDATA4 {
+        return Vec::new();
+    }
+    let (eh_frame_ptr_enc, fde_count_enc) = (head[1], head[2]);
+    let mut cur = base_off + 4;
+
+    // Skip the eh_frame pointer, then read the FDE count. Both use a
+    // fixed-width encoding whose size comes from the low nibble.
+    let Some(ptr_sz) = enc_width(eh_frame_ptr_enc) else {
+        return Vec::new();
+    };
+    cur += ptr_sz;
+    let Some(cnt_sz) = enc_width(fde_count_enc) else {
+        return Vec::new();
+    };
+    let Some(cnt_bytes) = rd(cur, cnt_sz) else {
+        return Vec::new();
+    };
+    let fde_count = read_uint(cnt_bytes);
+    cur += cnt_sz;
+
+    // Each table row is (initial_location, fde_addr), both sdata4 relative to
+    // the header's own address. Cap the count at what the file can hold so a
+    // corrupted count cannot spin.
+    let max_rows = bytes.len().saturating_sub(cur) / 8;
+    let rows = (fde_count as usize).min(max_rows);
+    let mut out = Vec::with_capacity(rows.min(1 << 16));
+    for _ in 0..rows {
+        let Some(loc) = rd(cur, 4) else { break };
+        let delta = i32::from_le_bytes([loc[0], loc[1], loc[2], loc[3]]);
+        out.push(hdr_vaddr.wrapping_add_signed(delta as i64));
+        cur += 8; // step past this row's fde_addr too
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Byte width of a fixed-size DW_EH_PE encoding, or `None` for the variable and
+/// unsupported forms (leb128, absptr) that the fast path does not decode.
+fn enc_width(enc: u8) -> Option<usize> {
+    match enc & 0x0f {
+        0x02 | 0x0a => Some(2), // udata2 / sdata2
+        0x03 | 0x0b => Some(4), // udata4 / sdata4
+        0x04 | 0x0c => Some(8), // udata8 / sdata8
+        _ => None,
+    }
+}
+
+/// Read a little-endian unsigned integer from 1..=8 bytes.
+fn read_uint(b: &[u8]) -> u64 {
+    let mut v = 0u64;
+    for (i, &byte) in b.iter().take(8).enumerate() {
+        v |= (byte as u64) << (8 * i);
+    }
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn eh_frame_hdr_recovers_function_starts() {
+        // The synthetic ELF lists two function starts in its .eh_frame_hdr
+        // table; both must appear as func_hints so the engine can seed them.
+        let bytes = crate::formats::fixture::elf_with_eh_frame_hdr();
+        let bin = crate::formats::analyze("eh.elf", &bytes).unwrap();
+        assert_eq!(bin.func_hints, vec![0x1000, 0x1400]);
+    }
+
+    #[test]
+    fn a_binary_without_eh_frame_hdr_yields_no_hints() {
+        // The plain PLT fixture has no PT_GNU_EH_FRAME; discovery must return
+        // empty rather than invent addresses.
+        let bytes = crate::formats::fixture::elf_with_plt_call();
+        let bin = crate::formats::analyze("plt.elf", &bytes).unwrap();
+        assert!(bin.func_hints.is_empty());
     }
 }
