@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased
+
+- `audit` reads the copy source, not just the destination: a copy from a
+  constant string is no longer flagged as a stack overflow.
+- `audit` provenance follows values into predecessor blocks (bounded depth), so
+  a value set by an earlier block and used by a common tail is resolved.
+- `audit` understands the 32-bit stack calling convention: arguments passed by
+  `push` are recovered, so legacy 32-bit binaries are analysed properly. This is
+  what lets knife land on CVE-2017-11882 in `EQNEDT32.EXE`.
+- A single shared analysis budget, so a site `audit` finds can always be shown
+  by `dis --func`.
+- Added a case study reproducing CVE-2017-11882 with knife (`docs/`).
+
+## v1.4.0
+
+- ELF function discovery from `.eh_frame_hdr`, the Linux counterpart to the PE
+  exception directory.
+- Hardening: never panics on a malformed file. A torture harness fuzzes the
+  whole pipeline on every build; the parser catches even a dependency panic.
+- `audit` precision: a clamped (`cmp`+`cmov`) or masked (`and`) size is ranked
+  likely-safe instead of high; a copy into a stack buffer is flagged as a stack
+  overflow, reading the destination as well as the length.
+
+## v1.3.0
+
+- Function discovery from the PE exception directory (`.pdata`), recovering the
+  code a stripped C++ binary reaches only through indirect calls. On `7z.dll`
+  this is the difference between 87 functions and 6472.
+
+## v1.2.0
+
+- `audit`: argument-provenance bug finder that ranks sink call sites by how
+  exploitable their arguments look.
+- AArch64 disassembly and PLT-veneer resolution.
+- FLIRT-lite library-function identification.
+- Data cross-references, string annotations in the listing, a hex view in the TUI.
+
+## v1.1.0
+
+- Exploit-mitigation audit (`sec`), attack-surface sinks (`sinks`),
+  cross-references (`xrefs`), call-graph reachability (`paths`).
+- Persistent analysis database: names and notes kept between sessions
+  (`name`, `note`, `db`), keyed by file hash.
+- Interactive TUI (`tui`): function list, listing, cross-references, naming.
+- IAT and PLT import-name resolution in disassembly.
+
 ## v1.0.0
 
 First public release.

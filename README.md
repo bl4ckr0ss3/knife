@@ -158,6 +158,11 @@ knife xrefs ./target --str "/tmp/"       # who builds that path
 knife paths ./target system              # can anything reach it
 ```
 
+For a worked example on a real, shipped binary, see
+[finding CVE-2017-11882 with knife](docs/case-study-eqnedt32.md): `sec` shows the
+Equation Editor has no mitigations, `audit` flags the font-name copy, and `dis`
+confirms it is an `lstrcpy` of attacker data into a stack buffer.
+
 **What you worked out.** Everything above is derived from the bytes and can be
 recomputed at any time. What cannot be recomputed is what you understood, so
 `knife name` and `knife note` write it down, and every later command reads it
