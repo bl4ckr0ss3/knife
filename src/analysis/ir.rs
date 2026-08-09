@@ -73,18 +73,46 @@ pub struct Line {
 /// Decompile a recovered function to pseudocode lines.
 pub fn decompile(an: &Analysis, bin: &Binary, f: &Function) -> Vec<Line> {
     let win64 = bin.format == Format::Pe && an.bits == 64;
-    let mut blocks: Vec<IrBlock> = f
+
+    // Predecessor counts (by block index), so a block with a single predecessor
+    // can inherit that predecessor's propagation state.
+    let idx: BTreeMap<u64, usize> = f
         .blocks
         .iter()
-        .map(|b| {
-            let stmts = lift_block(b, an, bin, win64);
-            IrBlock {
-                start: b.start,
-                stmts,
-                succ: b.succ.clone(),
-            }
-        })
+        .enumerate()
+        .map(|(i, b)| (b.start, i))
         .collect();
+    let mut preds: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); f.blocks.len()];
+    for (i, b) in f.blocks.iter().enumerate() {
+        for s in &b.succ {
+            if let Some(&j) = idx.get(s) {
+                preds[j].insert(i);
+            }
+        }
+    }
+
+    // Lift in address order, carrying each block's exit register state forward.
+    // A block whose only predecessor was already lifted starts from that
+    // predecessor's exit state, so a constant or expression set in one block
+    // flows into the next. Merges and back edges start fresh, which is the safe
+    // choice: a value that arrives on only one path must not be assumed.
+    let mut exit: Vec<BTreeMap<Register, Expr>> = vec![BTreeMap::new(); f.blocks.len()];
+    let mut blocks: Vec<IrBlock> = Vec::with_capacity(f.blocks.len());
+    for (i, b) in f.blocks.iter().enumerate() {
+        // Inherit only from a single predecessor that was already lifted; a
+        // merge point or a back edge starts fresh.
+        let entry = match preds[i].iter().copied().collect::<Vec<_>>().as_slice() {
+            [p] if *p < i => exit[*p].clone(),
+            _ => BTreeMap::new(),
+        };
+        let (stmts, exit_state) = lift_block(b, an, bin, win64, entry);
+        exit[i] = exit_state;
+        blocks.push(IrBlock {
+            start: b.start,
+            stmts,
+            succ: b.succ.clone(),
+        });
+    }
 
     // Propagation happens during lifting (so a call snapshots each argument's
     // value at its push, not the register's final value). The passes left are
@@ -130,8 +158,12 @@ fn lift_block(
     an: &Analysis,
     bin: &Binary,
     win64: bool,
-) -> Vec<Stmt> {
-    let mut st = Lift::default();
+    entry: BTreeMap<Register, Expr>,
+) -> (Vec<Stmt>, BTreeMap<Register, Expr>) {
+    let mut st = Lift {
+        regs: entry,
+        ..Default::default()
+    };
     let mut out = Vec::new();
     for ins in &b.insns {
         let Some(d) = decode(&ins.bytes, ins.addr, an.bits) else {
@@ -147,7 +179,7 @@ fn lift_block(
             &mut out,
         );
     }
-    out
+    (out, st.regs)
 }
 
 fn reg(r: Register) -> Expr {
@@ -838,14 +870,16 @@ mod tests {
         ];
         let lines = lines_x86("puts", code);
         let text: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        // Cross-block propagation carries eax = 7 from the first block into the
+        // call in the second, and dead-store elimination then removes the now
+        // unused definition.
         assert!(
-            text.iter().any(|s| s.contains("eax = 0x7;")),
-            "the cross-block-live def must survive DCE: {text:?}"
+            text.iter().any(|s| s.contains("puts(0x7)")),
+            "the constant flows across the block boundary: {text:?}"
         );
-        // Propagation is block-local, so the call reads the register, not 0x7.
         assert!(
-            text.iter().any(|s| s.contains("puts(eax)")),
-            "the call in the next block: {text:?}"
+            !text.iter().any(|s| s.contains("eax = 0x7;")),
+            "and its now-dead definition is removed: {text:?}"
         );
     }
 }
