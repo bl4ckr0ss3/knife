@@ -107,6 +107,13 @@ enum Command {
         #[arg(long)]
         func: Option<String>,
     },
+    /// Pseudocode view of a function (x86/x64): lifted, with calls and their
+    /// arguments. Not a full decompiler; unmodelled instructions show as asm.
+    Pseudo {
+        file: String,
+        /// Function to lift, by name or address.
+        func: String,
+    },
     /// Find what references a function, import, address, or string.
     Xrefs {
         file: String,
@@ -209,6 +216,7 @@ fn real_main() -> Result<()> {
         "iocs",
         "hashes",
         "dis",
+        "pseudo",
         "xrefs",
         "paths",
         "name",
@@ -257,6 +265,7 @@ fn real_main() -> Result<()> {
             off,
             func,
         } => cmd_dis(&file, count, vaddr, off, func, cli.db.as_deref()),
+        Command::Pseudo { file, func } => cmd_pseudo(&file, &func, cli.db.as_deref()),
         Command::Xrefs { file, target, str } => cmd_xrefs(
             &file,
             target.as_deref(),
@@ -1669,6 +1678,49 @@ fn dis_function(sess: &Session, sel: &str) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn cmd_pseudo(file: &str, sel: &str, db_path: Option<&str>) -> Result<()> {
+    let sess = Session::open(file, db_path, ANALYSIS_BUDGET, "the pseudocode view")?;
+    let an = &sess.an;
+
+    let func = if let Some(f) = an.find_by_name(sel) {
+        Some(f)
+    } else if let Ok(v) = parse_num(sel) {
+        let internal = v.checked_sub(an.display_base).unwrap_or(v);
+        an.find_function(internal).or_else(|| an.find_function(v))
+    } else {
+        None
+    };
+    let func = func.with_context(|| format!("no function '{sel}' (try `knife funcs`)"))?;
+
+    section_header(&format!(
+        "pseudocode: {} @ 0x{:x}",
+        func.name,
+        func.addr + an.display_base
+    ));
+    for line in analysis::pseudo::function(an, &sess.bin, func) {
+        // Labels and the function braces sit at the margin; statements indent.
+        if line.label {
+            println!("  {}", line.text.style(accent()));
+        } else {
+            let comment = line.text.trim_start().starts_with("/*");
+            println!(
+                "      {}",
+                if comment {
+                    line.text.style(faint()).to_string()
+                } else {
+                    line.text.style(muted()).to_string()
+                }
+            );
+        }
+    }
+    println!();
+    println!(
+        "  {}",
+        "pseudocode is a lossy view; `knife dis` shows the exact instructions".style(faint())
+    );
     Ok(())
 }
 

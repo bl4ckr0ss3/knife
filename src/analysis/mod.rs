@@ -7,6 +7,7 @@ pub mod entropy;
 pub mod flirt;
 pub mod hardening;
 pub mod hashes;
+pub mod pseudo;
 pub mod signatures;
 pub mod sinks;
 pub mod strings;

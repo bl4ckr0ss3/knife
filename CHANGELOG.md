@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `pseudo`: a pseudocode view of a function. Not a decompiler: it lifts each
+  instruction to a C-like statement and propagates expressions within a block,
+  so a call renders with its recovered arguments (`lstrcpyA(ebp - 0x28,
+  *(ebp+8) + 0x1c)`) and control flow reads as `if`/`goto`. Unmodelled
+  instructions are shown verbatim rather than guessed at.
+- The engine no longer re-decodes shared block tails, so analysis of real
+  binaries is complete rather than budget-truncated (EQNEDT32.EXE: 537 to 930
+  functions), and the budget is raised so normal targets finish.
+- `audit` reads 32-bit stack-passed arguments, which is what lets knife land on
+  CVE-2017-11882.
 - `audit` reads the copy source, not just the destination: a copy from a
   constant string is no longer flagged as a stack overflow.
 - `audit` provenance follows values into predecessor blocks (bounded depth), so

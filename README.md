@@ -88,6 +88,7 @@ One tool, many jobs, which is the point of a Swiss-army knife:
 | `knife funcs FILE [--by-refs]` | recover functions via control-flow analysis |
 | `knife dis FILE --func NAME` | disassemble a whole function with labels and xrefs |
 | `knife dis FILE [--vaddr X \| --off Y] [--count N]` | linear disassembly (x86/x64, AArch64) |
+| `knife pseudo FILE --func NAME` | pseudocode view: lifted statements, calls with arguments |
 | `knife sections FILE` | sections/segments with per-section entropy bars |
 | `knife imports FILE` | imported libs and functions, suspicious APIs flagged |
 | `knife exports FILE` | exported symbols |
@@ -233,6 +234,14 @@ site reads `call strcpy@plt` or `call KERNELBASE!CreateFileW` instead of an
 anonymous `sub_`. That naming is what makes the sink and cross-reference
 commands point at code rather than at an import table.
 
+**A pseudocode view.** `knife pseudo --func NAME` lifts a function to C-like
+statements, propagating expressions within each block so a run of
+`mov`/`lea`/`add` collapses into what it computes and a call shows its arguments:
+the CVE-2017-11882 overflow reads as the single line `lstrcpyA(ebp - 0x28,
+*(ebp + 8) + 0x1c)`. It is not a full decompiler, and it does not pretend to be:
+there is no type recovery or cross-block value flow, and any instruction it does
+not model is printed verbatim so you always see where the clean lift stops.
+
 **Constant scanning.** `knife scan` fingerprints crypto and structure by their
 byte signatures: AES S-boxes (generated from the GF(2⁸) definition, not stored
 as literals), SHA-1/256/MD5/CRC32 constants in both byte orders, Base64
@@ -285,7 +294,8 @@ knife iocs sample.exe --json | jq '.[] | select(.kind=="url").value'
 - [x] Argument-provenance bug audit (`knife audit`)
 - [x] Function discovery from the PE exception directory (stripped C++ coverage)
 - [ ] Function discovery from ELF `.eh_frame` (the same win for ELF)
-- [ ] IR lift toward a decompiler view
+- [x] Pseudocode view (`pseudo`): lifted statements, calls with arguments
+- [ ] Structured decompiler (loops, if/else, expression propagation across blocks)
 
 ## Build from source
 
