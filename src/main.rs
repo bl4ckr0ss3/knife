@@ -1700,7 +1700,7 @@ fn cmd_pseudo(file: &str, sel: &str, db_path: Option<&str>) -> Result<()> {
         func.name,
         func.addr + an.display_base
     ));
-    for line in analysis::pseudo::function(an, &sess.bin, func) {
+    for line in analysis::ir::decompile(an, &sess.bin, func) {
         // Labels and the function braces sit at the margin; statements indent.
         if line.label {
             println!("  {}", line.text.style(accent()));
