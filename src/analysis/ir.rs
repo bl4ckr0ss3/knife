@@ -19,11 +19,37 @@
 //! becomes an opaque `asm(...)` statement, never a guess.
 
 use crate::analysis::engine::{Analysis, Function};
+use crate::analysis::strings::Located;
 use crate::model::{Binary, Format};
 use iced_x86::{
     Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter, Mnemonic, OpKind, Register,
 };
 use std::collections::{BTreeMap, BTreeSet};
+
+/// What the renderer needs to turn addresses into names: the analysis (for
+/// symbols and imports) and the string literals (so a pointer into one reads as
+/// the quoted text). Passed by value; it is two references.
+#[derive(Clone, Copy)]
+struct Rx<'a> {
+    an: &'a Analysis,
+    strings: &'a BTreeMap<u64, Located>,
+}
+
+/// A short, escaped, quoted rendering of a string literal.
+fn quote(s: &str) -> String {
+    let shown: String = s.chars().take(32).collect();
+    let esc = shown
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    if s.chars().count() > 32 {
+        format!("\"{esc}\"...")
+    } else {
+        format!("\"{esc}\"")
+    }
+}
 
 // ── IR ──────────────────────────────────────────────────────────────────────
 
@@ -85,8 +111,14 @@ pub struct Line {
 
 // ── entry point ───────────────────────────────────────────────────────────
 
-/// Decompile a recovered function to pseudocode lines.
-pub fn decompile(an: &Analysis, bin: &Binary, f: &Function) -> Vec<Line> {
+/// Decompile a recovered function to pseudocode lines. `strings` lets a pointer
+/// into a literal render as the quoted text.
+pub fn decompile(
+    an: &Analysis,
+    bin: &Binary,
+    f: &Function,
+    strings: &BTreeMap<u64, Located>,
+) -> Vec<Line> {
     let win64 = bin.format == Format::Pe && an.bits == 64;
     let frame = has_frame_pointer(an, f);
 
@@ -189,7 +221,7 @@ pub fn decompile(an: &Analysis, bin: &Binary, f: &Function) -> Vec<Line> {
     // Structure the control flow into nested if/else and while, with a goto for
     // the few edges that break nesting. The flat rendering is the fallback for a
     // graph structuring cannot accept at all (an unreachable or empty block).
-    structure(an, f, &blocks).unwrap_or_else(|| render(an, f, &blocks))
+    structure(an, f, &blocks, strings).unwrap_or_else(|| render(an, f, &blocks, strings))
 }
 
 /// The SSA merge rule for propagation state: a register keeps its value only
@@ -1016,7 +1048,13 @@ fn eval(op: &str, a: u64, b: u64) -> Option<u64> {
 
 // ── rendering ───────────────────────────────────────────────────────────────
 
-fn render(an: &Analysis, f: &Function, blocks: &[IrBlock]) -> Vec<Line> {
+fn render(
+    an: &Analysis,
+    f: &Function,
+    blocks: &[IrBlock],
+    strings: &BTreeMap<u64, Located>,
+) -> Vec<Line> {
+    let r = Rx { an, strings };
     let base = an.display_base;
     let mut out = vec![Line {
         label: true,
@@ -1032,7 +1070,7 @@ fn render(an: &Analysis, f: &Function, blocks: &[IrBlock]) -> Vec<Line> {
         for s in &b.stmts {
             out.push(Line {
                 label: false,
-                text: render_stmt(s, base, an),
+                text: render_stmt(s, base, r),
             });
         }
     }
@@ -1283,7 +1321,13 @@ fn dominates(a: usize, b: usize, idom: &[usize]) -> bool {
 /// control flow is preserved exactly: this is a faithful rendering, not a guess.
 /// Returns `None` only when the graph is not amenable at all (an unreachable
 /// block, or an empty function).
-fn structure(an: &Analysis, f: &Function, blocks: &[IrBlock]) -> Option<Vec<Line>> {
+fn structure(
+    an: &Analysis,
+    f: &Function,
+    blocks: &[IrBlock],
+    strings: &BTreeMap<u64, Located>,
+) -> Option<Vec<Line>> {
+    let r = Rx { an, strings };
     let cfg = build_cfg(blocks);
     let n = cfg.body.len();
     if n == 0 {
@@ -1340,7 +1384,7 @@ fn structure(an: &Analysis, f: &Function, blocks: &[IrBlock]) -> Option<Vec<Line
         ipdom: &ipdom,
         loops: &headers,
         loop_body: &loop_body,
-        an,
+        r,
         base,
         lines: Vec::new(),
         emitted: vec![false; n],
@@ -1385,7 +1429,7 @@ struct Ir<'a> {
     /// Loop headers.
     loops: &'a BTreeSet<usize>,
     loop_body: &'a BTreeMap<usize, BTreeSet<usize>>,
-    an: &'a Analysis,
+    r: Rx<'a>,
     base: u64,
     lines: Vec<Line>,
     emitted: Vec<bool>,
@@ -1426,7 +1470,7 @@ impl Ir<'_> {
         let body = self.loop_body.get(&h)?;
         match (body.contains(&taken), body.contains(&fall)) {
             (true, false) => Some((cond.clone(), taken, fall)),
-            (false, true) => Some((not(cond, self.an), fall, taken)),
+            (false, true) => Some((not(cond, self.r), fall, taken)),
             _ => None,
         }
     }
@@ -1477,7 +1521,7 @@ impl Ir<'_> {
             self.node_indent[n] = indent;
             self.emitted[n] = true;
             for s in &self.cfg.body[n] {
-                self.push(indent, render_stmt(s, self.base, self.an));
+                self.push(indent, render_stmt(s, self.base, self.r));
             }
 
             match &self.cfg.term[n] {
@@ -1531,20 +1575,20 @@ impl Ir<'_> {
         // simply continues after the `if`; otherwise the arm has a body.
         match (is_follow(taken), is_follow(fall)) {
             (false, true) => {
-                self.push(indent, format!("if ({}) {{", render_expr(&cond, self.an)));
+                self.push(indent, format!("if ({}) {{", render_expr(&cond, self.r)));
                 self.emit(taken, arm_stop, loopc, indent + 1);
                 self.push(indent, "}".into());
             }
             (true, false) => {
                 self.push(
                     indent,
-                    format!("if ({}) {{", render_expr(&not(&cond, self.an), self.an)),
+                    format!("if ({}) {{", render_expr(&not(&cond, self.r), self.r)),
                 );
                 self.emit(fall, arm_stop, loopc, indent + 1);
                 self.push(indent, "}".into());
             }
             (false, false) => {
-                self.push(indent, format!("if ({}) {{", render_expr(&cond, self.an)));
+                self.push(indent, format!("if ({}) {{", render_expr(&cond, self.r)));
                 self.emit(taken, arm_stop, loopc, indent + 1);
                 self.push(indent, "} else {".into());
                 self.emit(fall, arm_stop, loopc, indent + 1);
@@ -1587,10 +1631,7 @@ impl Ir<'_> {
             }
         }
 
-        self.push(
-            indent,
-            format!("switch ({}) {{", render_expr(&sel, self.an)),
-        );
+        self.push(indent, format!("switch ({}) {{", render_expr(&sel, self.r)));
         for (t, idxs) in groups {
             for i in idxs {
                 self.push(indent + 1, format!("case 0x{i:x}:"));
@@ -1633,10 +1674,7 @@ impl Ir<'_> {
         if self.cfg.body[h].is_empty() {
             // A clean top-tested loop: the header is only the test, so it can be
             // re-evaluated implicitly by `while (cond)`.
-            self.push(
-                indent,
-                format!("while ({}) {{", render_expr(&cond, self.an)),
-            );
+            self.push(indent, format!("while ({}) {{", render_expr(&cond, self.r)));
             self.emit(body_entry, None, Some((h, follow)), indent + 1);
         } else {
             // The header does work on each iteration (a counter decrement, a
@@ -1645,11 +1683,11 @@ impl Ir<'_> {
             // bottom-tested (`do`/`while`) loop faithfully.
             self.push(indent, "while (1) {".into());
             for s in &self.cfg.body[h] {
-                self.push(indent + 1, render_stmt(s, self.base, self.an));
+                self.push(indent + 1, render_stmt(s, self.base, self.r));
             }
             self.push(
                 indent + 1,
-                format!("if ({}) break;", render_expr(&not(&cond, self.an), self.an)),
+                format!("if ({}) break;", render_expr(&not(&cond, self.r), self.r)),
             );
             self.emit(body_entry, None, Some((h, follow)), indent + 1);
         }
@@ -1669,8 +1707,8 @@ impl Ir<'_> {
 }
 
 /// Logical negation of a branch condition, for rendering the inverted arm.
-fn not(cond: &Expr, an: &Analysis) -> Expr {
-    if let Expr::Bin(op, l, r) = cond {
+fn not(cond: &Expr, r: Rx) -> Expr {
+    if let Expr::Bin(op, l, rr) = cond {
         let inv = match *op {
             "==" => "!=",
             "!=" => "==",
@@ -1678,38 +1716,38 @@ fn not(cond: &Expr, an: &Analysis) -> Expr {
             ">=" => "<",
             ">" => "<=",
             "<=" => ">",
-            _ => return Expr::Opaque(format!("!({})", render_expr(cond, an))),
+            _ => return Expr::Opaque(format!("!({})", render_expr(cond, r))),
         };
-        return Expr::Bin(inv, l.clone(), r.clone());
+        return Expr::Bin(inv, l.clone(), rr.clone());
     }
-    Expr::Opaque(format!("!({})", render_expr(cond, an)))
+    Expr::Opaque(format!("!({})", render_expr(cond, r)))
 }
 
 /// `dst = dst OP rhs` reads better as a compound assignment (`dst OP= rhs`), and
 /// a `+`/`-` of one as `dst++` / `dst--`. Any other assignment renders plainly.
-fn render_assign(dst: &Expr, src: &Expr, an: &Analysis) -> String {
+fn render_assign(dst: &Expr, src: &Expr, r: Rx) -> String {
     const COMPOUND: &[&str] = &["+", "-", "*", "&", "|", "^", "<<", ">>"];
-    if let Expr::Bin(op, l, r) = src {
+    if let Expr::Bin(op, l, rhs) = src {
         if l.as_ref() == dst && COMPOUND.contains(op) {
-            let d = render_expr(dst, an);
-            if matches!(*op, "+" | "-") && matches!(r.as_ref(), Expr::Const(1)) {
+            let d = render_expr(dst, r);
+            if matches!(*op, "+" | "-") && matches!(rhs.as_ref(), Expr::Const(1)) {
                 return format!("{d}{op}{op};"); // x++ / x--
             }
-            return format!("{d} {op}= {};", render_expr(r, an));
+            return format!("{d} {op}= {};", render_expr(rhs, r));
         }
     }
-    format!("{} = {};", render_expr(dst, an), render_expr(src, an))
+    format!("{} = {};", render_expr(dst, r), render_expr(src, r))
 }
 
-fn render_stmt(s: &Stmt, base: u64, an: &Analysis) -> String {
+fn render_stmt(s: &Stmt, base: u64, r: Rx) -> String {
     match s {
-        Stmt::Set(dst, src) => render_assign(dst, src, an),
-        Stmt::CallVoid(e) => format!("{};", render_expr(e, an)),
-        Stmt::Ret(Some(e)) => format!("return {};", render_expr(e, an)),
+        Stmt::Set(dst, src) => render_assign(dst, src, r),
+        Stmt::CallVoid(e) => format!("{};", render_expr(e, r)),
+        Stmt::Ret(Some(e)) => format!("return {};", render_expr(e, r)),
         Stmt::Ret(None) => "return;".to_string(),
-        Stmt::Branch(c, t) => format!("if ({}) goto loc_{:x};", render_expr(c, an), t + base),
+        Stmt::Branch(c, t) => format!("if ({}) goto loc_{:x};", render_expr(c, r), t + base),
         Stmt::Goto(t) => format!("goto loc_{:x};", t + base),
-        Stmt::Switch(sel) => format!("switch ({}) {{ /* jump table */ }}", render_expr(sel, an)),
+        Stmt::Switch(sel) => format!("switch ({}) {{ /* jump table */ }}", render_expr(sel, r)),
         Stmt::Asm(s) => format!("/* {s} */"),
     }
 }
@@ -1734,27 +1772,42 @@ fn global_name(an: &Analysis, va: u64) -> String {
         .unwrap_or_else(|| format!("g_{va:x}"))
 }
 
-fn render_expr(e: &Expr, an: &Analysis) -> String {
+/// A global's name, or the string literal it points at, as an address: the
+/// address of a `char[]` in C is the string itself, so `&"..."` reduces to
+/// `"..."`.
+fn global_addr(r: Rx, va: u64) -> String {
+    match r.strings.get(&va) {
+        Some(s) => quote(&s.text),
+        None => format!("&{}", global_name(r.an, va)),
+    }
+}
+
+fn render_expr(e: &Expr, r: Rx) -> String {
     match e {
-        Expr::Const(v) => format!("0x{v:x}"),
+        // An immediate that is exactly the address of a string literal is a
+        // pointer to it (32-bit `push offset aString`), so read it as the text.
+        Expr::Const(v) => match r.strings.get(v) {
+            Some(s) => quote(&s.text),
+            None => format!("0x{v:x}"),
+        },
         Expr::Reg(_, shown) => format!("{shown:?}").to_lowercase(),
         Expr::Stack(off) => slot_name(*off),
-        Expr::Global(va) => global_name(an, *va),
+        Expr::Global(va) => global_name(r.an, *va),
         // A frame slot or global reads as its name, not `*(name)`; its address
-        // reads as `&name`.
+        // reads as `&name`, or the quoted text when it points at a string.
         Expr::Mem(a) => match a.as_ref() {
             Expr::Stack(off) => slot_name(*off),
-            Expr::Global(va) => global_name(an, *va),
-            _ => format!("*({})", render_expr(a, an)),
+            Expr::Global(va) => global_name(r.an, *va),
+            _ => format!("*({})", render_expr(a, r)),
         },
         Expr::Addr(a) => match a.as_ref() {
             Expr::Stack(off) => format!("&{}", slot_name(*off)),
-            Expr::Global(va) => format!("&{}", global_name(an, *va)),
-            _ => format!("&({})", render_expr(a, an)),
+            Expr::Global(va) => global_addr(r, *va),
+            _ => format!("&({})", render_expr(a, r)),
         },
-        Expr::Bin(op, l, r) => format!("{} {op} {}", render_expr(l, an), render_expr(r, an)),
+        Expr::Bin(op, l, r2) => format!("{} {op} {}", render_expr(l, r), render_expr(r2, r)),
         Expr::Call(name, args) => {
-            let a: Vec<String> = args.iter().map(|x| render_expr(x, an)).collect();
+            let a: Vec<String> = args.iter().map(|x| render_expr(x, r)).collect();
             format!("{name}({})", a.join(", "))
         }
         Expr::Opaque(s) => s.clone(),
@@ -1932,7 +1985,7 @@ mod tests {
         bytes.extend_from_slice(&code);
         let an = engine::analyze(&bin, &bytes, 10_000, &Db::default());
         let f = an.find_function(va).unwrap();
-        decompile(&an, &bin, f)
+        decompile(&an, &bin, f, &BTreeMap::new())
     }
 
     #[test]
@@ -2012,7 +2065,7 @@ mod tests {
         bytes.extend_from_slice(&code);
         let an = engine::analyze(&bin, &bytes, 10_000, &Db::default());
         let f = an.find_function(va).unwrap();
-        decompile(&an, &bin, f)
+        decompile(&an, &bin, f, &BTreeMap::new())
     }
 
     /// The same, for a 64-bit PE with no import slot.
@@ -2035,7 +2088,7 @@ mod tests {
         bytes.extend_from_slice(&code);
         let an = engine::analyze(&bin, &bytes, 10_000, &Db::default());
         let f = an.find_function(va).unwrap();
-        decompile(&an, &bin, f)
+        decompile(&an, &bin, f, &BTreeMap::new())
     }
 
     #[test]
@@ -2065,6 +2118,112 @@ mod tests {
                 "stack bookkeeping `{gone}` should be gone, got:\n{joined}"
             );
         }
+    }
+
+    #[test]
+    fn a_pushed_string_address_reads_as_the_literal_32bit() {
+        // push 0x2000 ; call puts ; where "hi!" lives at 0x2000.
+        let va = 0x1000u64;
+        let (slot, sink) = (0x4000u64, "puts");
+        let mut bin = Binary::stub(Format::Pe, Arch::X86);
+        bin.entry = va;
+        bin.image_base = 0;
+        bin.sections = vec![
+            Section {
+                name: ".text".into(),
+                vaddr: va,
+                vsize: 16,
+                file_off: va,
+                file_size: 16,
+                entropy: 0.0,
+                read: true,
+                write: false,
+                exec: true,
+            },
+            Section {
+                name: ".rdata".into(),
+                vaddr: 0x2000,
+                vsize: 8,
+                file_off: 0x2000,
+                file_size: 8,
+                entropy: 0.0,
+                read: true,
+                write: false,
+                exec: false,
+            },
+        ];
+        bin.symbols = vec![Symbol {
+            addr: slot,
+            name: sink.into(),
+            kind: SymKind::Import,
+        }];
+        let mut bytes = vec![0u8; 0x2008];
+        // 0x1000: push 0x2000 ; call [0x4000] ; ret
+        bytes[0x1000..0x100c].copy_from_slice(&[
+            0x68, 0x00, 0x20, 0x00, 0x00, // push 0x2000
+            0xff, 0x15, 0x00, 0x40, 0x00, 0x00, // call dword [0x4000]
+            0xc3, // ret
+        ]);
+        bytes[0x2000..0x2008].copy_from_slice(b"cmd.exe\0");
+        let an = engine::analyze(&bin, &bytes, 10_000, &Db::default());
+        let strings = crate::listing::string_map(&bin, &bytes, engine::display_base(&bin));
+        let f = an.find_function(va).unwrap();
+        let joined = decompile(&an, &bin, f, &strings)
+            .into_iter()
+            .map(|l| l.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("puts(\"cmd.exe\")"),
+            "a pushed string pointer should read as the text, got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn a_pointer_to_a_string_reads_as_the_literal() {
+        // lea rax, [rip+0xff9] -> 0x2000, where "cmd.exe" lives; ret.
+        let va = 0x1000u64;
+        let mut bin = Binary::stub(Format::Pe, Arch::X86_64);
+        bin.entry = va;
+        bin.sections = vec![
+            Section {
+                name: ".text".into(),
+                vaddr: va,
+                vsize: 8,
+                file_off: va,
+                file_size: 8,
+                entropy: 0.0,
+                read: true,
+                write: false,
+                exec: true,
+            },
+            Section {
+                name: ".rdata".into(),
+                vaddr: 0x2000,
+                vsize: 8,
+                file_off: 0x2000,
+                file_size: 8,
+                entropy: 0.0,
+                read: true,
+                write: false,
+                exec: false,
+            },
+        ];
+        let mut bytes = vec![0u8; 0x2008];
+        bytes[0x1000..0x1008].copy_from_slice(&[0x48, 0x8d, 0x05, 0xf9, 0x0f, 0x00, 0x00, 0xc3]);
+        bytes[0x2000..0x2008].copy_from_slice(b"cmd.exe\0");
+        let an = engine::analyze(&bin, &bytes, 10_000, &Db::default());
+        let strings = crate::listing::string_map(&bin, &bytes, 0);
+        let f = an.find_function(va).unwrap();
+        let joined = decompile(&an, &bin, f, &strings)
+            .into_iter()
+            .map(|l| l.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("\"cmd.exe\""),
+            "a pointer into a string should read as the quoted text, got:\n{joined}"
+        );
     }
 
     #[test]

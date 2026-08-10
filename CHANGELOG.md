@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `pseudo`: string literals inline. A pointer to a string, whether an x64
+  `lea reg, [rip + s]` or a 32-bit `push offset s`, reads as the quoted text
+  (`lstrcpyA(&var_28, "Times New Roman")`) instead of a bare address, so the data
+  the code touches is visible in the decompilation.
 - `pseudo`: x64 stack frames. A function without a frame pointer (the common x64
   case) now gets named locals and arguments too: the stack pointer is tracked
   through the prologue and across blocks, and the registers that alias it (MSVC's

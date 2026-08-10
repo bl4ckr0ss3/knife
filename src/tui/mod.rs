@@ -290,7 +290,8 @@ impl App {
         self.pseudo_lines.clear();
         if let Some(addr) = self.cur {
             if let Some(f) = self.an.find_function(addr) {
-                self.pseudo_lines = crate::analysis::ir::decompile(&self.an, &self.bin, f);
+                self.pseudo_lines =
+                    crate::analysis::ir::decompile(&self.an, &self.bin, f, &self.strings);
             }
         }
     }
