@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `mcp`: a Model Context Protocol server (`knife mcp`), a JSON-RPC 2.0 stream over
+  stdio that exposes the analysis as agent tools: `list_functions`, `disassemble`,
+  `decompile`, `audit`, `xrefs`, `info`. It reuses the same engine, decompiler,
+  and audit as the CLI, and caches the last-analysed file so repeated calls on one
+  target do not re-run the engine. This is what lets an agent drive knife directly.
 - `tui`: callees. `x` toggles the reference pane between callers (xrefs to what
   is under the cursor) and callees (the calls the current function makes), so the
   call graph is navigable both directions; `↵` jumps either way.

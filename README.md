@@ -82,6 +82,7 @@ One tool, many jobs, which is the point of a Swiss-army knife:
 | `knife xrefs FILE --str TEXT` | what references the strings matching `TEXT` |
 | `knife paths FILE TARGET [--from F]` | call chains that reach a sink from entry points and exports |
 | `knife tui FILE` | interactive: functions, listing, xrefs, naming and notes |
+| `knife mcp` | Model Context Protocol server over stdio (tools for agents) |
 | `knife name FILE ADDR NAME` | name an address; every later command uses it |
 | `knife note FILE ADDR TEXT` | annotate an address; shows up in the disassembly |
 | `knife db FILE` | everything you have stored for this binary |
