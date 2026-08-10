@@ -37,6 +37,10 @@ pub enum Expr {
     Mem(Box<Expr>),
     /// The address of a memory operand: `&(...)`, from `lea`.
     Addr(Box<Expr>),
+    /// A frame slot, identified by its signed offset from the frame pointer:
+    /// negative is a local (`var_28`), positive an argument (`arg_8`). Wrapped
+    /// in `Mem` it is the slot's value; wrapped in `Addr` it is its address.
+    Stack(i64),
     Bin(&'static str, Box<Expr>, Box<Expr>),
     /// A resolved (or register-indirect) call with its recovered arguments.
     Call(String, Vec<Expr>),
@@ -77,45 +81,68 @@ pub struct Line {
 /// Decompile a recovered function to pseudocode lines.
 pub fn decompile(an: &Analysis, bin: &Binary, f: &Function) -> Vec<Line> {
     let win64 = bin.format == Format::Pe && an.bits == 64;
+    let frame = has_frame_pointer(an, f);
 
-    // Predecessor counts (by block index), so a block with a single predecessor
-    // can inherit that predecessor's propagation state.
+    // Predecessor and successor indices, so propagation can follow the CFG
+    // rather than address order.
+    let n = f.blocks.len();
     let idx: BTreeMap<u64, usize> = f
         .blocks
         .iter()
         .enumerate()
         .map(|(i, b)| (b.start, i))
         .collect();
-    let mut preds: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); f.blocks.len()];
+    let mut preds: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (i, b) in f.blocks.iter().enumerate() {
         for s in &b.succ {
             if let Some(&j) = idx.get(s) {
                 preds[j].insert(i);
+                succ[i].push(j);
             }
         }
     }
 
-    // Lift in address order, carrying each block's exit register state forward.
-    // A block whose only predecessor was already lifted starts from that
-    // predecessor's exit state, so a constant or expression set in one block
-    // flows into the next. Merges and back edges start fresh, which is the safe
-    // choice: a value that arrives on only one path must not be assumed.
-    let mut exit: Vec<BTreeMap<Register, Expr>> = vec![BTreeMap::new(); f.blocks.len()];
-    let mut blocks: Vec<IrBlock> = Vec::with_capacity(f.blocks.len());
-    for (i, b) in f.blocks.iter().enumerate() {
-        // Inherit only from a single predecessor that was already lifted; a
-        // merge point or a back edge starts fresh.
-        let entry = match preds[i].iter().copied().collect::<Vec<_>>().as_slice() {
-            [p] if *p < i => exit[*p].clone(),
-            _ => BTreeMap::new(),
-        };
-        let (stmts, exit_state) = lift_block(b, an, bin, win64, entry);
-        exit[i] = exit_state;
+    // Lift each block from the meet of its predecessors' exit states, iterating
+    // to a fixpoint in reverse postorder so forward edges and back edges also
+    // converge. The meet is the SSA merge rule: a register keeps its propagated
+    // value only when every incoming path agrees on the same expression, so a
+    // value defined on both arms of an if/else survives the join, while one
+    // that differs on some path is dropped (conservative, never a guess).
+    let rpo = reverse_postorder(&succ, 0);
+    let mut entry: Vec<BTreeMap<Register, Expr>> = vec![BTreeMap::new(); n];
+    let mut exit: Vec<BTreeMap<Register, Expr>> = vec![BTreeMap::new(); n];
+    let mut lifted = vec![false; n];
+    let mut blocks: Vec<IrBlock> = Vec::with_capacity(n);
+    for b in &f.blocks {
         blocks.push(IrBlock {
             start: b.start,
-            stmts,
+            stmts: Vec::new(),
             succ: b.succ.clone(),
         });
+    }
+    let mut changed = true;
+    // The meet only ever drops or coarsens values, so the lattice descends and
+    // the fixpoint terminates; the cap is a guard against a pathological graph.
+    let mut guard = 0;
+    while changed && guard <= n + 1 {
+        changed = false;
+        guard += 1;
+        for &i in &rpo {
+            let meet = meet_states(&preds[i], &exit);
+            let entry_changed = meet != entry[i];
+            entry[i] = meet;
+            if entry_changed || !lifted[i] {
+                lifted[i] = true;
+                let (stmts, exit_state) =
+                    lift_block(&f.blocks[i], an, bin, win64, frame, entry[i].clone());
+                blocks[i].stmts = stmts;
+                if exit_state != exit[i] {
+                    exit[i] = exit_state;
+                    changed = true;
+                }
+            }
+        }
     }
 
     // Propagation happens during lifting (so a call snapshots each argument's
@@ -133,6 +160,25 @@ pub fn decompile(an: &Analysis, bin: &Binary, f: &Function) -> Vec<Line> {
     // the few edges that break nesting. The flat rendering is the fallback for a
     // graph structuring cannot accept at all (an unreachable or empty block).
     structure(an, f, &blocks).unwrap_or_else(|| render(an, f, &blocks))
+}
+
+/// The SSA merge rule for propagation state: a register keeps its value only
+/// when every incoming edge carries the same expression. With no predecessors
+/// (the entry block) or a single predecessor, the state is taken directly; at a
+/// join, a register that differs on any path is dropped rather than guessed.
+fn meet_states(
+    preds: &BTreeSet<usize>,
+    exit: &[BTreeMap<Register, Expr>],
+) -> BTreeMap<Register, Expr> {
+    let mut it = preds.iter();
+    let Some(&first) = it.next() else {
+        return BTreeMap::new();
+    };
+    let mut out = exit[first].clone();
+    for &p in it {
+        out.retain(|k, v| exit[p].get(k) == Some(v));
+    }
+    out
 }
 
 // ── lifting ─────────────────────────────────────────────────────────────────
@@ -158,6 +204,9 @@ struct Lift {
     pushed: Vec<Expr>,
     /// Operands of the last `cmp`/`test`, for the next conditional branch.
     cmp: Option<(Expr, Expr, bool)>,
+    /// Whether this function keeps a frame pointer (`mov ebp, esp` in the
+    /// prologue). When it does, `ebp`-relative accesses become named frame slots.
+    frame: bool,
 }
 
 fn lift_block(
@@ -165,10 +214,12 @@ fn lift_block(
     an: &Analysis,
     bin: &Binary,
     win64: bool,
+    frame: bool,
     entry: BTreeMap<Register, Expr>,
 ) -> (Vec<Stmt>, BTreeMap<Register, Expr>) {
     let mut st = Lift {
         regs: entry,
+        frame,
         ..Default::default()
     };
     let mut out = Vec::new();
@@ -191,6 +242,27 @@ fn lift_block(
 
 fn reg(r: Register) -> Expr {
     Expr::Reg(r.full_register(), r)
+}
+
+/// Whether the function keeps a frame pointer, i.e. the entry block sets
+/// `ebp = esp` (or `rbp = rsp`). When it does, `ebp`-relative memory becomes
+/// named frame slots and the frame bookkeeping is dropped.
+fn has_frame_pointer(an: &Analysis, f: &Function) -> bool {
+    let Some(entry) = f.blocks.first() else {
+        return false;
+    };
+    entry.insns.iter().any(|ins| {
+        decode(&ins.bytes, ins.addr, an.bits).is_some_and(|d| {
+            d.mnemonic() == Mnemonic::Mov
+                && matches!(d.op0_register(), Register::EBP | Register::RBP)
+                && matches!(d.op1_register(), Register::ESP | Register::RSP)
+        })
+    })
+}
+
+/// Is `r` the stack pointer or the frame pointer (in any width)?
+fn is_stack_reg(r: Register) -> bool {
+    matches!(r.full_register(), Register::RSP | Register::RBP)
 }
 
 /// Value of operand `i`, with the current register expressions substituted in.
@@ -223,6 +295,21 @@ fn mem_addr(d: &Instruction, st: &Lift) -> Expr {
     if d.is_ip_rel_memory_operand() {
         return Expr::Const(d.ip_rel_memory_address());
     }
+    // 32-bit displacements are zero-extended by iced; sign-extend so a frame
+    // offset reads as `- 0x28`, not a huge positive constant.
+    let raw = d.memory_displacement64();
+    let disp = if raw <= 0xffff_ffff && raw & 0x8000_0000 != 0 {
+        i64::from(raw as u32 as i32)
+    } else {
+        raw as i64
+    };
+    // A plain `[ebp +/- k]` in a frame-pointer function is a named frame slot.
+    if st.frame
+        && d.memory_index() == Register::None
+        && matches!(d.memory_base(), Register::EBP | Register::RBP)
+    {
+        return Expr::Stack(disp);
+    }
     let mut acc: Option<Expr> = None;
     let add = |e: Expr, acc: &mut Option<Expr>| {
         *acc = Some(match acc.take() {
@@ -243,14 +330,6 @@ fn mem_addr(d: &Instruction, st: &Lift) -> Expr {
         };
         add(e, &mut acc);
     }
-    // 32-bit displacements are zero-extended by iced; sign-extend so a frame
-    // offset reads as `- 0x28`, not a huge positive constant.
-    let raw = d.memory_displacement64();
-    let disp = if raw <= 0xffff_ffff && raw & 0x8000_0000 != 0 {
-        i64::from(raw as u32 as i32)
-    } else {
-        raw as i64
-    };
     match acc {
         None => Expr::Const(disp as u64),
         Some(a) if disp == 0 => a,
@@ -321,11 +400,19 @@ fn lift_insn(
             Expr::Bin("-", Box::new(operand(d, st, 0)), Box::new(Expr::Const(1))),
         )),
         Push => {
-            let a = operand(d, st, 0);
-            st.pushed.push(a);
+            // A `push ebp` in a frame-pointer function is the prologue frame
+            // save, not an argument, so it is not collected.
+            let saving_frame = st.frame
+                && d.op0_kind() == OpKind::Register
+                && d.op0_register().full_register() == Register::RBP;
+            if !saving_frame {
+                let a = operand(d, st, 0);
+                st.pushed.push(a);
+            }
             None
         }
         Pop => Some(Stmt::Set(dest(d, st), Expr::Opaque("pop()".into()))),
+        Leave => None,
         Cmp => {
             st.cmp = Some((operand(d, st, 0), operand(d, st, 1), false));
             None
@@ -361,7 +448,18 @@ fn lift_insn(
 
     if let Some(s) = stmt {
         update_state(st, &s);
-        out.push(s);
+        // Drop pure stack bookkeeping: any write to the stack pointer (frame
+        // allocation and cleanup) and, in a frame-pointer function, any write to
+        // the frame pointer (`mov ebp, esp`, `pop ebp`). Their values are never
+        // rendered, so the statements are noise.
+        let housekeeping = matches!(
+            &s,
+            Stmt::Set(Expr::Reg(root, _), _)
+                if *root == Register::RSP || (st.frame && *root == Register::RBP)
+        );
+        if !housekeeping {
+            out.push(s);
+        }
     }
 }
 
@@ -380,7 +478,12 @@ fn update_state(st: &mut Lift, s: &Stmt) {
                 st.regs.remove(&r);
             }
         }
-        if is_pure(src) {
+        // The stack and frame pointers are never propagated: their values are
+        // pure bookkeeping, and substituting them would corrupt the base of a
+        // memory access (an `[ebp + k]` becoming a stale `[esp + k]`).
+        if is_stack_reg(*root) {
+            st.regs.remove(root);
+        } else if is_pure(src) {
             st.regs.insert(*root, src.clone());
         } else {
             st.regs.remove(root);
@@ -422,7 +525,7 @@ fn lift_call(
 
 fn is_pure(e: &Expr) -> bool {
     match e {
-        Expr::Const(_) | Expr::Reg(..) => true,
+        Expr::Const(_) | Expr::Reg(..) | Expr::Stack(_) => true,
         Expr::Mem(a) | Expr::Addr(a) => is_pure(a),
         Expr::Bin(_, l, r) => is_pure(l) && is_pure(r),
         // A call is never pure; an opaque value is not safe to duplicate.
@@ -436,7 +539,7 @@ fn reads_mem(e: &Expr) -> bool {
         Expr::Addr(a) => reads_mem(a),
         Expr::Bin(_, l, r) => reads_mem(l) || reads_mem(r),
         Expr::Call(_, args) => args.iter().any(reads_mem),
-        Expr::Const(_) | Expr::Reg(..) | Expr::Opaque(_) => false,
+        Expr::Const(_) | Expr::Reg(..) | Expr::Stack(_) | Expr::Opaque(_) => false,
     }
 }
 
@@ -565,7 +668,7 @@ fn reads_regs(e: &Expr, live: &mut BTreeSet<Register>) {
             reads_regs(r, live);
         }
         Expr::Call(_, args) => args.iter().for_each(|a| reads_regs(a, live)),
-        Expr::Const(_) | Expr::Opaque(_) => {}
+        Expr::Const(_) | Expr::Stack(_) | Expr::Opaque(_) => {}
     }
 }
 
@@ -597,7 +700,7 @@ fn fold(e: &mut Expr) {
             }
         }
         Expr::Call(_, args) => args.iter_mut().for_each(fold),
-        Expr::Const(_) | Expr::Reg(..) | Expr::Opaque(_) => {}
+        Expr::Const(_) | Expr::Reg(..) | Expr::Stack(_) | Expr::Opaque(_) => {}
     }
 }
 
@@ -1177,12 +1280,31 @@ fn render_stmt(s: &Stmt, base: u64) -> String {
     }
 }
 
+/// The name of a frame slot: `var_28` for a local (below the frame pointer),
+/// `arg_8` for an argument (above it), `frame` for the base itself.
+fn slot_name(off: i64) -> String {
+    match off.cmp(&0) {
+        std::cmp::Ordering::Less => format!("var_{:x}", -off),
+        std::cmp::Ordering::Greater => format!("arg_{off:x}"),
+        std::cmp::Ordering::Equal => "frame".to_string(),
+    }
+}
+
 fn render_expr(e: &Expr) -> String {
     match e {
         Expr::Const(v) => format!("0x{v:x}"),
         Expr::Reg(_, shown) => format!("{shown:?}").to_lowercase(),
-        Expr::Mem(a) => format!("*({})", render_expr(a)),
-        Expr::Addr(a) => format!("&({})", render_expr(a)),
+        Expr::Stack(off) => slot_name(*off),
+        // A frame slot reads as its name (`var_28`), not `*(var_28)`; its address
+        // reads as `&var_28`.
+        Expr::Mem(a) => match a.as_ref() {
+            Expr::Stack(off) => slot_name(*off),
+            _ => format!("*({})", render_expr(a)),
+        },
+        Expr::Addr(a) => match a.as_ref() {
+            Expr::Stack(off) => format!("&{}", slot_name(*off)),
+            _ => format!("&({})", render_expr(a)),
+        },
         Expr::Bin(op, l, r) => format!("{} {op} {}", render_expr(l), render_expr(r)),
         Expr::Call(name, args) => {
             let a: Vec<String> = args.iter().map(render_expr).collect();
@@ -1410,6 +1532,38 @@ mod tests {
     }
 
     #[test]
+    fn frame_slots_are_named_and_housekeeping_is_dropped() {
+        // A real prologue/epilogue with a frame local and an argument:
+        //   push ebp; mov ebp,esp; sub esp,0x10
+        //   mov eax,[ebp+8]; mov [ebp-4],eax
+        //   leave; ret
+        let code = vec![
+            0x55, // push ebp
+            0x89, 0xe5, // mov ebp, esp
+            0x83, 0xec, 0x10, // sub esp, 0x10
+            0x8b, 0x45, 0x08, // mov eax, [ebp+8]
+            0x89, 0x45, 0xfc, // mov [ebp-4], eax
+            0xc9, // leave
+            0xc3, // ret
+        ];
+        let text: Vec<String> = lines_x86_raw(code).into_iter().map(|l| l.text).collect();
+        let joined = text.join("\n");
+        // The local and the argument read as named frame slots.
+        assert!(
+            joined.contains("var_4 = arg_8;"),
+            "frame slots should be named, got:\n{joined}"
+        );
+        // The prologue, frame setup, and epilogue are gone: no esp/ebp
+        // bookkeeping, no `leave`, and no raw `*(ebp ...)` frame reference.
+        for noise in ["esp", "ebp", "leave"] {
+            assert!(
+                !joined.contains(noise),
+                "housekeeping `{noise}` should be dropped, got:\n{joined}"
+            );
+        }
+    }
+
+    #[test]
     fn an_if_else_is_structured() {
         // cmp [ebp+8],0 ; je else ; mov eax,1 ; jmp end ; else: mov eax,2 ; end: ret
         // Two arms that reconverge at the return: this must become a real
@@ -1483,6 +1637,29 @@ mod tests {
         assert!(
             !text.iter().any(|s| s.contains("eax = 0x7;")),
             "and its now-dead definition is removed: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_value_defined_on_both_arms_survives_the_join() {
+        // cmp [ebp+8],0 ; je else ; mov eax,7 ; jmp end ; else: mov eax,7 ;
+        // end: push eax ; call puts
+        // Both arms of the if/else set eax to the same constant. The merge rule
+        // must keep it across the join, so the call renders with the constant
+        // propagated in rather than a bare register.
+        let code = vec![
+            0x83, 0x7d, 0x08, 0x00, // cmp dword [ebp+8], 0
+            0x74, 0x07, // je +7  -> else
+            0xb8, 0x07, 0x00, 0x00, 0x00, // mov eax, 7
+            0xeb, 0x05, // jmp +5 -> end
+            0xb8, 0x07, 0x00, 0x00, 0x00, // mov eax, 7   (else)
+            0x50, // push eax
+        ];
+        let lines = lines_x86("puts", code);
+        let text: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert!(
+            text.iter().any(|s| s.contains("puts(0x7)")),
+            "the constant defined on both arms flows through the join: {text:?}"
         );
     }
 }

@@ -3,10 +3,14 @@
 ## Unreleased
 
 - `pseudo`: a decompiler engine built on a typed IR. It lifts each instruction,
-  propagates expressions (across block boundaries too), eliminates dead stores
-  with a whole-function liveness pass, and folds constants, so a call renders
-  with its recovered arguments (`lstrcpyA(&(ebp - 0x28), *(ebp+8) + 0x1c)`) and
+  propagates expressions, eliminates dead stores with a whole-function liveness
+  pass, and folds constants, so a call renders with its recovered arguments and
   the noise around it is gone.
+- `pseudo`: cross-block propagation is a proper dataflow fixpoint. Each block is
+  lifted from the meet of its predecessors' exit states, iterated in reverse
+  postorder until stable, so values flow through forward edges, joins, and back
+  edges. The meet is the SSA merge rule: a value survives a join only when every
+  incoming path agrees on it, never a guess.
 - `pseudo`: control-flow structuring. Dominators and post-dominators drive a
   recursive emitter that rebuilds nested `if`/`else` and `while` from the graph,
   so output reads as C rather than a goto chain. The few edges that break
@@ -14,6 +18,13 @@
   explicit `goto` to a labelled block, so the flow is preserved exactly rather
   than approximated. There is no type recovery, and an unmodelled instruction is
   shown verbatim rather than guessed at.
+- `pseudo`: stack-frame analysis. In a frame-pointer function, `[ebp - 0x28]`
+  becomes the named local `var_28` and `[ebp + 8]` the argument `arg_8`, so the
+  same slot reads the same way everywhere. The frame bookkeeping (`mov ebp,esp`,
+  the `sub esp`/`add esp` allocation and cleanup, `push ebp`, `leave`) is
+  dropped, and the stack and frame pointers are no longer propagated, which fixes
+  an `[ebp + k]` that could render as a stale `[esp + k]`. The CVE-2017-11882
+  overflow now reads as `lstrcpyA(&var_28, arg_8 + 0x1c);`.
 - The engine no longer re-decodes shared block tails, so analysis of real
   binaries is complete rather than budget-truncated (EQNEDT32.EXE: 537 to 930
   functions), and the budget is raised so normal targets finish.

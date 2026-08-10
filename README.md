@@ -238,16 +238,18 @@ commands point at code rather than at an import table.
 function: it lifts every instruction, propagates expressions (across block
 boundaries too) so a run of `mov`/`lea`/`add` collapses into what it computes,
 eliminates the dead intermediate assignments with a whole-function liveness
-pass, and folds constants. The CVE-2017-11882 overflow comes out as the single
-line `lstrcpyA(&(ebp - 0x28), *(ebp + 8) + 0x1c);` with nothing around it. It
-then structures the control flow: dominators and post-dominators drive a
-recursive emitter that rebuilds nested `if`/`else` and `while`, so a function
-reads as C rather than a goto chain. The handful of edges that break nesting (a
-`switch`'s shared tails, a jump into a common handler) become an explicit `goto`
-to a labelled block, so the flow is preserved exactly, never approximated. It is
-not a full decompiler and does not pretend to be: there is no type recovery, and
-any instruction the lifter does not model is printed verbatim so you always see
-where the clean lift stops.
+pass, and folds constants. It runs a stack-frame analysis, so `[ebp - 0x28]`
+becomes the named local `var_28` and `[ebp + 8]` the argument `arg_8`, and the
+frame bookkeeping (`mov ebp, esp`, the `sub esp` allocation, `push ebp`,
+`leave`) is dropped. The CVE-2017-11882 overflow comes out as the single line
+`lstrcpyA(&var_28, arg_8 + 0x1c);` with nothing around it. It then structures the
+control flow: dominators and post-dominators drive a recursive emitter that
+rebuilds nested `if`/`else` and `while`, so a function reads as C rather than a
+goto chain. The handful of edges that break nesting (a `switch`'s shared tails, a
+jump into a common handler) become an explicit `goto` to a labelled block, so the
+flow is preserved exactly, never approximated. It is not a full decompiler and
+does not pretend to be: there is no type recovery, and any instruction the lifter
+does not model is printed verbatim so you always see where the clean lift stops.
 
 **Constant scanning.** `knife scan` fingerprints crypto and structure by their
 byte signatures: AES S-boxes (generated from the GF(2⁸) definition, not stored

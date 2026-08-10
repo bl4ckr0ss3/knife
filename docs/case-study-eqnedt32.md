@@ -73,6 +73,33 @@ argument, into a 40-byte stack buffer at `[ebp-0x28]`. A font name longer than
 40 bytes overruns the buffer and the saved return address, and step 1 already
 showed there is no stack cookie in the way. That is CVE-2017-11882.
 
+The decompiler makes the same point at a glance, with the frame slots named and
+the control flow structured:
+
+```
+$ knife pseudo EQNEDT32.EXE --func FMDFontListEnum
+
+  sub_421294() {
+      if (arg_10 == 0x4) {
+      loc_4212b7:
+          lstrcpyA(&var_28, arg_8 + 0x1c);   // 40-byte buffer <- attacker data
+          ...
+          sub_421054(&var_28);
+      } else {
+          if (arg_10 == 0x2) {
+              goto loc_4212b7;
+          }
+      }
+      eax = 0x1;
+      return eax;
+  }
+```
+
+`var_28` is the 40-byte local, `arg_8` the equation record, and the copy has no
+bound. The two conditions that reach the copy (`arg_10 == 4` or `== 2`) come out
+as a real branch, with a single `goto` for the short-circuit that a compiler
+emitted as one shared block.
+
 The other two findings are the same shape in `sub_41264b` (an `lstrcpyA` of a
 function argument into a `[ebp-0x64]` stack buffer). `EQNEDT32.EXE` carried a
 family of these overflows, later assigned CVE-2018-0802 and CVE-2018-0798, so
