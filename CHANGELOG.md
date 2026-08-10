@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.5.0
 
 - `tui`: the listing pane toggles to decompiled pseudocode with `d`, so the
   structured `if`/`else`/`while`/`switch` view is available interactively next to
