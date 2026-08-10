@@ -18,6 +18,19 @@
   explicit `goto` to a labelled block, so the flow is preserved exactly rather
   than approximated. There is no type recovery, and an unmodelled instruction is
   shown verbatim rather than guessed at.
+- `pseudo`: condition recovery. A conditional jump reads the comparison the last
+  flag-setting instruction expressed, including the arithmetic and logic ops
+  (`dec`, `sub`, `and`, ...) that set flags without a `cmp`, so `dec ecx; jnz`
+  reads `ecx != 0` instead of an opaque `flags` test. The compare is carried
+  across blocks by the same dataflow, so a `cmp` shared by several conditional
+  jumps (a multi-way dispatch) is recovered at each branch, and it is dropped the
+  moment an instruction clobbers the flags, so a stale compare is never used.
+  Unsigned conditions that a "result vs zero" test cannot express fall back to
+  the raw condition rather than a wrong comparison.
+- `pseudo`: bottom-tested loops. A loop whose header does work on each iteration
+  (a counter decrement, a value read in the condition) keeps that work inside the
+  loop and leaves on the exit edge, so a `do`/`while` reads faithfully instead of
+  hoisting the body out.
 - `pseudo`: stack-frame analysis. In a frame-pointer function, `[ebp - 0x28]`
   becomes the named local `var_28` and `[ebp + 8]` the argument `arg_8`, so the
   same slot reads the same way everywhere. The frame bookkeeping (`mov ebp,esp`,

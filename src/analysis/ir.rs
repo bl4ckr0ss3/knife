@@ -112,6 +112,10 @@ pub fn decompile(an: &Analysis, bin: &Binary, f: &Function) -> Vec<Line> {
     let rpo = reverse_postorder(&succ, 0);
     let mut entry: Vec<BTreeMap<Register, Expr>> = vec![BTreeMap::new(); n];
     let mut exit: Vec<BTreeMap<Register, Expr>> = vec![BTreeMap::new(); n];
+    // The recovered comparison is carried the same way, so a `cmp` shared by
+    // conditional jumps in several blocks reaches each `jcc` that reads it.
+    let mut entry_cmp: Vec<Option<Cmp>> = vec![None; n];
+    let mut exit_cmp: Vec<Option<Cmp>> = vec![None; n];
     let mut lifted = vec![false; n];
     let mut blocks: Vec<IrBlock> = Vec::with_capacity(n);
     for b in &f.blocks {
@@ -130,15 +134,25 @@ pub fn decompile(an: &Analysis, bin: &Binary, f: &Function) -> Vec<Line> {
         guard += 1;
         for &i in &rpo {
             let meet = meet_states(&preds[i], &exit);
-            let entry_changed = meet != entry[i];
+            let meet_c = meet_cmp(&preds[i], &exit_cmp);
+            let entry_changed = meet != entry[i] || meet_c != entry_cmp[i];
             entry[i] = meet;
+            entry_cmp[i] = meet_c;
             if entry_changed || !lifted[i] {
                 lifted[i] = true;
-                let (stmts, exit_state) =
-                    lift_block(&f.blocks[i], an, bin, win64, frame, entry[i].clone());
+                let (stmts, exit_state, exit_c) = lift_block(
+                    &f.blocks[i],
+                    an,
+                    bin,
+                    win64,
+                    frame,
+                    entry[i].clone(),
+                    entry_cmp[i].clone(),
+                );
                 blocks[i].stmts = stmts;
-                if exit_state != exit[i] {
+                if exit_state != exit[i] || exit_c != exit_cmp[i] {
                     exit[i] = exit_state;
+                    exit_cmp[i] = exit_c;
                     changed = true;
                 }
             }
@@ -181,6 +195,21 @@ fn meet_states(
     out
 }
 
+/// The same merge rule for the recovered comparison: it reaches a block only
+/// when every predecessor leaves the identical comparison. Any disagreement (or
+/// a block whose flags were clobbered) drops it, so a branch never reads a
+/// comparison that does not hold on all paths into it.
+fn meet_cmp(preds: &BTreeSet<usize>, exit_cmp: &[Option<Cmp>]) -> Option<Cmp> {
+    let mut it = preds.iter();
+    let first = exit_cmp[*it.next()?].clone();
+    for &p in it {
+        if exit_cmp[p] != first {
+            return None;
+        }
+    }
+    first
+}
+
 // ── lifting ─────────────────────────────────────────────────────────────────
 
 fn decode(raw: &[u8], ip: u64, bits: u32) -> Option<Instruction> {
@@ -197,17 +226,31 @@ fn decode(raw: &[u8], ip: u64, bits: u32) -> Option<Instruction> {
 /// propagation state: an operand read substitutes the expression a register
 /// currently holds, so each `push` snapshots its argument's value at that point
 /// rather than the register's final value.
+/// How the flags a conditional jump will read were set. `Compare` is an explicit
+/// `cmp a, b`, so the condition is `a <op> b`; `Zero` is a `test` or a flag-
+/// setting arithmetic op (`dec`, `sub`, `and`, ...), whose result is compared
+/// against zero.
+#[derive(Clone, Copy, PartialEq)]
+enum FlagSrc {
+    Compare,
+    Zero,
+}
+
 #[derive(Default)]
 struct Lift {
     regs: BTreeMap<Register, Expr>,
     /// Arguments pushed since the last call, in program order (32-bit calls).
     pushed: Vec<Expr>,
-    /// Operands of the last `cmp`/`test`, for the next conditional branch.
-    cmp: Option<(Expr, Expr, bool)>,
+    /// The comparison the last flag-setting instruction expressed, for the next
+    /// conditional branch: the two operands (the second is `0` for a zero test)
+    /// and how the flags were set.
+    cmp: Option<(Expr, Expr, FlagSrc)>,
     /// Whether this function keeps a frame pointer (`mov ebp, esp` in the
     /// prologue). When it does, `ebp`-relative accesses become named frame slots.
     frame: bool,
 }
+
+type Cmp = (Expr, Expr, FlagSrc);
 
 fn lift_block(
     b: &crate::analysis::engine::BasicBlock,
@@ -216,9 +259,11 @@ fn lift_block(
     win64: bool,
     frame: bool,
     entry: BTreeMap<Register, Expr>,
-) -> (Vec<Stmt>, BTreeMap<Register, Expr>) {
+    entry_cmp: Option<Cmp>,
+) -> (Vec<Stmt>, BTreeMap<Register, Expr>, Option<Cmp>) {
     let mut st = Lift {
         regs: entry,
+        cmp: entry_cmp,
         frame,
         ..Default::default()
     };
@@ -237,7 +282,7 @@ fn lift_block(
             &mut out,
         );
     }
-    (out, st.regs)
+    (out, st.regs, st.cmp)
 }
 
 fn reg(r: Register) -> Expr {
@@ -414,11 +459,13 @@ fn lift_insn(
         Pop => Some(Stmt::Set(dest(d, st), Expr::Opaque("pop()".into()))),
         Leave => None,
         Cmp => {
-            st.cmp = Some((operand(d, st, 0), operand(d, st, 1), false));
+            st.cmp = Some((operand(d, st, 0), operand(d, st, 1), FlagSrc::Compare));
             None
         }
         Test => {
-            st.cmp = Some((operand(d, st, 0), operand(d, st, 1), true));
+            // `test x, x` (the common form) sets the flags from `x`; compare it
+            // against zero.
+            st.cmp = Some((operand(d, st, 0), Expr::Const(0), FlagSrc::Zero));
             None
         }
         Call => {
@@ -445,6 +492,20 @@ fn lift_insn(
         }),
         _ => Some(Stmt::Asm(raw(d))),
     };
+
+    // Maintain the recovered comparison for a following `jcc`, which may be in a
+    // later block (a `cmp` shared by several conditional jumps). A flag-setting
+    // arithmetic op records "result vs zero"; anything that clobbers the flags
+    // without being a recognised comparison invalidates it, so a stale compare
+    // is never carried into the branch that reads it.
+    let m = d.mnemonic();
+    if sets_zero_flags(m) {
+        if let Some(Stmt::Set(dst, _)) = &stmt {
+            st.cmp = Some((dst.clone(), Expr::Const(0), FlagSrc::Zero));
+        }
+    } else if !matches!(m, Mnemonic::Cmp | Mnemonic::Test) && !preserves_flags(m) {
+        st.cmp = None;
+    }
 
     if let Some(s) = stmt {
         update_state(st, &s);
@@ -1230,13 +1291,28 @@ impl Ir<'_> {
         self.node_line[h] = self.lines.len();
         self.node_indent[h] = indent;
         self.emitted[h] = true;
-        // The header's own body statements are the loop condition test; emit
-        // them before the `while` so any side effects are preserved.
-        for s in &self.cfg.body[h] {
-            self.push(indent, render_stmt(s, self.base));
+
+        if self.cfg.body[h].is_empty() {
+            // A clean top-tested loop: the header is only the test, so it can be
+            // re-evaluated implicitly by `while (cond)`.
+            self.push(indent, format!("while ({}) {{", render_expr(&cond)));
+            self.emit(body_entry, None, Some((h, follow)), indent + 1);
+        } else {
+            // The header does work on each iteration (a counter decrement, a
+            // read in the condition), so it cannot be hoisted out. Keep it inside
+            // an infinite loop and leave on the exit edge, which also renders a
+            // bottom-tested (`do`/`while`) loop faithfully.
+            self.push(indent, "while (1) {".into());
+            for s in &self.cfg.body[h] {
+                self.push(indent + 1, render_stmt(s, self.base));
+            }
+            self.push(
+                indent + 1,
+                format!("if ({}) break;", render_expr(&not(&cond))),
+            );
+            self.emit(body_entry, None, Some((h, follow)), indent + 1);
         }
-        self.push(indent, format!("while ({}) {{", render_expr(&cond)));
-        self.emit(body_entry, None, Some((h, follow)), indent + 1);
+
         // A `continue;` as the loop's very last statement is redundant with
         // falling off the end, so drop it.
         if self
@@ -1347,26 +1423,63 @@ fn is_jcc(m: Mnemonic) -> bool {
     format!("{m:?}").starts_with('J') && m != Mnemonic::Jmp
 }
 
-fn condition(m: Mnemonic, cmp: &Option<(Expr, Expr, bool)>) -> Expr {
-    let (l, r, was_test) = match cmp {
-        Some(c) => c.clone(),
-        None => (Expr::Opaque("flags".into()), Expr::Const(0), false),
+/// The flag-setting arithmetic and logic ops whose result a following `jcc`
+/// tests against zero. `cmp` and `test` are handled separately.
+fn sets_zero_flags(m: Mnemonic) -> bool {
+    use Mnemonic::*;
+    matches!(
+        m,
+        Add | Sub | And | Or | Xor | Inc | Dec | Shl | Shr | Sal | Sar
+    )
+}
+
+/// Instructions that leave the flags untouched, so a recovered comparison stays
+/// valid across them (a `mov`/`lea` between a `cmp` and the `jcc` that reads it,
+/// or the fall-through from one conditional jump to the next).
+fn preserves_flags(m: Mnemonic) -> bool {
+    use Mnemonic::*;
+    matches!(
+        m,
+        Mov | Movzx | Movsx | Movsxd | Lea | Push | Pop | Nop | Endbr32 | Endbr64
+    ) || (format!("{m:?}").starts_with('J'))
+}
+
+fn condition(m: Mnemonic, cmp: &Option<(Expr, Expr, FlagSrc)>) -> Expr {
+    let bin = |op: &'static str, l: Expr, r: Expr| Expr::Bin(op, Box::new(l), Box::new(r));
+    let Some((l, r, src)) = cmp.clone() else {
+        // No comparison was recovered (for instance the flags were set in an
+        // earlier block); show the raw condition rather than invent operands.
+        return Expr::Opaque(format!("{m:?}").to_lowercase());
     };
-    let op = match m {
-        Mnemonic::Je => "==",
-        Mnemonic::Jne => "!=",
-        Mnemonic::Jg | Mnemonic::Ja => ">",
-        Mnemonic::Jge | Mnemonic::Jae => ">=",
-        Mnemonic::Jl | Mnemonic::Jb => "<",
-        Mnemonic::Jle | Mnemonic::Jbe => "<=",
-        _ => return Expr::Opaque(format!("{m:?}").to_lowercase()),
-    };
-    // `test x, x; je` means x == 0.
-    if was_test {
-        let op = if m == Mnemonic::Je { "==" } else { "!=" };
-        return Expr::Bin(op, Box::new(l), Box::new(Expr::Const(0)));
+    match src {
+        FlagSrc::Compare => {
+            let op = match m {
+                Mnemonic::Je => "==",
+                Mnemonic::Jne => "!=",
+                Mnemonic::Jg | Mnemonic::Ja => ">",
+                Mnemonic::Jge | Mnemonic::Jae => ">=",
+                Mnemonic::Jl | Mnemonic::Jb => "<",
+                Mnemonic::Jle | Mnemonic::Jbe => "<=",
+                _ => return Expr::Opaque(format!("{m:?}").to_lowercase()),
+            };
+            bin(op, l, r)
+        }
+        // A result compared against zero. The unsigned conditions (`ja`/`jb`
+        // and friends) are carry-based and not expressible as "result vs 0", so
+        // they fall back to the raw condition rather than a wrong comparison.
+        FlagSrc::Zero => {
+            let op = match m {
+                Mnemonic::Je => "==",
+                Mnemonic::Jne => "!=",
+                Mnemonic::Jg => ">",
+                Mnemonic::Jge | Mnemonic::Jns => ">=",
+                Mnemonic::Jl | Mnemonic::Js => "<",
+                Mnemonic::Jle => "<=",
+                _ => return Expr::Opaque(format!("{m:?}").to_lowercase()),
+            };
+            bin(op, l, Expr::Const(0))
+        }
     }
-    Expr::Bin(op, Box::new(l), Box::new(r))
 }
 
 fn strip_module(name: &str) -> String {
@@ -1561,6 +1674,66 @@ mod tests {
                 "housekeeping `{noise}` should be dropped, got:\n{joined}"
             );
         }
+    }
+
+    #[test]
+    fn an_arithmetic_flag_becomes_a_real_comparison() {
+        // mov eax,[ebp+8]; sub eax,5; je else; mov eax,1; jmp end; else: mov eax,2; end: ret
+        // The `sub` sets the flags the `je` reads; the branch must become a
+        // comparison against zero, not an opaque `flags` test.
+        let code = vec![
+            0x8b, 0x45, 0x08, // mov eax, [ebp+8]
+            0x2d, 0x05, 0x00, 0x00, 0x00, // sub eax, 5
+            0x74, 0x07, // je +7 -> else
+            0xb8, 0x01, 0x00, 0x00, 0x00, // mov eax, 1
+            0xeb, 0x05, // jmp +5 -> end
+            0xb8, 0x02, 0x00, 0x00, 0x00, // mov eax, 2  (else)
+            0xc3, // ret
+        ];
+        let joined = lines_x86_raw(code)
+            .into_iter()
+            .map(|l| l.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("if (eax == 0x0) {"),
+            "the sub/je pair should recover a comparison, got:\n{joined}"
+        );
+        assert!(
+            !joined.contains("flags"),
+            "no opaque flags condition should remain, got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn a_bottom_tested_loop_keeps_its_body_inside() {
+        // mov ecx,0xa; loop: dec ecx; jnz loop; ret
+        // The header does the decrement each iteration, so it must stay inside
+        // the loop (an infinite loop with a break), not be hoisted out.
+        let code = vec![
+            0xb9, 0x0a, 0x00, 0x00, 0x00, // mov ecx, 0xa
+            0x49, // dec ecx
+            0x75, 0xfd, // jnz -3 -> dec
+            0xc3, // ret
+        ];
+        let text: Vec<String> = lines_x86_raw(code).into_iter().map(|l| l.text).collect();
+        let joined = text.join("\n");
+        assert!(
+            joined.contains("while (1) {"),
+            "a self-loop header becomes an infinite loop, got:\n{joined}"
+        );
+        assert!(
+            joined.contains("ecx = ecx - 0x1;") && joined.contains("if (ecx == 0x0) break;"),
+            "the decrement stays in the loop with a break on exit, got:\n{joined}"
+        );
+        // The decrement appears once (inside the loop), not hoisted out as well.
+        assert_eq!(
+            text.iter()
+                .filter(|l| l.contains("ecx = ecx - 0x1;"))
+                .count(),
+            1,
+            "the loop body must not be duplicated, got:\n{joined}"
+        );
     }
 
     #[test]
