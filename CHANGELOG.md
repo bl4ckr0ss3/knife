@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `pseudo`: global naming. A fixed-address memory operand (an absolute or
+  RIP-relative access) reads as its symbol name when the engine knows one and
+  `g_<addr>` otherwise, so `*(0x45519c)` becomes `g_45519c` and a struct field
+  through a global pointer reads `*(g_4641d4 + 0xb2)` instead of nested
+  dereferences of a bare number.
+
 ## v1.5.0
 
 - `tui`: the listing pane toggles to decompiled pseudocode with `d`, so the

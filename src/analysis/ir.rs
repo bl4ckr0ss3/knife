@@ -41,6 +41,10 @@ pub enum Expr {
     /// negative is a local (`var_28`), positive an argument (`arg_8`). Wrapped
     /// in `Mem` it is the slot's value; wrapped in `Addr` it is its address.
     Stack(i64),
+    /// A global at a fixed address (an absolute or RIP-relative memory operand),
+    /// rendered by its symbol name if known and `g_<addr>` otherwise. Like
+    /// `Stack`, it is an address: `Mem` reads the global, `Addr` takes its address.
+    Global(u64),
     Bin(&'static str, Box<Expr>, Box<Expr>),
     /// A resolved (or register-indirect) call with its recovered arguments.
     Call(String, Vec<Expr>),
@@ -341,7 +345,7 @@ fn reg_val(st: &Lift, r: Register) -> Expr {
 /// The address expression of a memory operand (no dereference), substituted.
 fn mem_addr(d: &Instruction, st: &Lift) -> Expr {
     if d.is_ip_rel_memory_operand() {
-        return Expr::Const(d.ip_rel_memory_address());
+        return Expr::Global(d.ip_rel_memory_address());
     }
     // 32-bit displacements are zero-extended by iced; sign-extend so a frame
     // offset reads as `- 0x28`, not a huge positive constant.
@@ -379,7 +383,8 @@ fn mem_addr(d: &Instruction, st: &Lift) -> Expr {
         add(e, &mut acc);
     }
     match acc {
-        None => Expr::Const(disp as u64),
+        // No base or index: a fixed address, i.e. a global.
+        None => Expr::Global(disp as u64),
         Some(a) if disp == 0 => a,
         Some(a) if disp < 0 => Expr::Bin("-", Box::new(a), Box::new(Expr::Const((-disp) as u64))),
         Some(a) => Expr::Bin("+", Box::new(a), Box::new(Expr::Const(disp as u64))),
@@ -594,7 +599,7 @@ fn lift_call(
 
 fn is_pure(e: &Expr) -> bool {
     match e {
-        Expr::Const(_) | Expr::Reg(..) | Expr::Stack(_) => true,
+        Expr::Const(_) | Expr::Reg(..) | Expr::Stack(_) | Expr::Global(_) => true,
         Expr::Mem(a) | Expr::Addr(a) => is_pure(a),
         Expr::Bin(_, l, r) => is_pure(l) && is_pure(r),
         // A call is never pure; an opaque value is not safe to duplicate.
@@ -608,7 +613,9 @@ fn reads_mem(e: &Expr) -> bool {
         Expr::Addr(a) => reads_mem(a),
         Expr::Bin(_, l, r) => reads_mem(l) || reads_mem(r),
         Expr::Call(_, args) => args.iter().any(reads_mem),
-        Expr::Const(_) | Expr::Reg(..) | Expr::Stack(_) | Expr::Opaque(_) => false,
+        Expr::Const(_) | Expr::Reg(..) | Expr::Stack(_) | Expr::Global(_) | Expr::Opaque(_) => {
+            false
+        }
     }
 }
 
@@ -739,7 +746,7 @@ fn reads_regs(e: &Expr, live: &mut BTreeSet<Register>) {
             reads_regs(r, live);
         }
         Expr::Call(_, args) => args.iter().for_each(|a| reads_regs(a, live)),
-        Expr::Const(_) | Expr::Stack(_) | Expr::Opaque(_) => {}
+        Expr::Const(_) | Expr::Stack(_) | Expr::Global(_) | Expr::Opaque(_) => {}
     }
 }
 
@@ -771,7 +778,7 @@ fn fold(e: &mut Expr) {
             }
         }
         Expr::Call(_, args) => args.iter_mut().for_each(fold),
-        Expr::Const(_) | Expr::Reg(..) | Expr::Stack(_) | Expr::Opaque(_) => {}
+        Expr::Const(_) | Expr::Reg(..) | Expr::Stack(_) | Expr::Global(_) | Expr::Opaque(_) => {}
     }
 }
 
@@ -807,7 +814,7 @@ fn render(an: &Analysis, f: &Function, blocks: &[IrBlock]) -> Vec<Line> {
         for s in &b.stmts {
             out.push(Line {
                 label: false,
-                text: render_stmt(s, base),
+                text: render_stmt(s, base, an),
             });
         }
     }
@@ -1115,6 +1122,7 @@ fn structure(an: &Analysis, f: &Function, blocks: &[IrBlock]) -> Option<Vec<Line
         ipdom: &ipdom,
         loops: &headers,
         loop_body: &loop_body,
+        an,
         base,
         lines: Vec::new(),
         emitted: vec![false; n],
@@ -1159,6 +1167,7 @@ struct Ir<'a> {
     /// Loop headers.
     loops: &'a BTreeSet<usize>,
     loop_body: &'a BTreeMap<usize, BTreeSet<usize>>,
+    an: &'a Analysis,
     base: u64,
     lines: Vec<Line>,
     emitted: Vec<bool>,
@@ -1199,7 +1208,7 @@ impl Ir<'_> {
         let body = self.loop_body.get(&h)?;
         match (body.contains(&taken), body.contains(&fall)) {
             (true, false) => Some((cond.clone(), taken, fall)),
-            (false, true) => Some((not(cond), fall, taken)),
+            (false, true) => Some((not(cond, self.an), fall, taken)),
             _ => None,
         }
     }
@@ -1250,7 +1259,7 @@ impl Ir<'_> {
             self.node_indent[n] = indent;
             self.emitted[n] = true;
             for s in &self.cfg.body[n] {
-                self.push(indent, render_stmt(s, self.base));
+                self.push(indent, render_stmt(s, self.base, self.an));
             }
 
             match &self.cfg.term[n] {
@@ -1304,17 +1313,20 @@ impl Ir<'_> {
         // simply continues after the `if`; otherwise the arm has a body.
         match (is_follow(taken), is_follow(fall)) {
             (false, true) => {
-                self.push(indent, format!("if ({}) {{", render_expr(&cond)));
+                self.push(indent, format!("if ({}) {{", render_expr(&cond, self.an)));
                 self.emit(taken, arm_stop, loopc, indent + 1);
                 self.push(indent, "}".into());
             }
             (true, false) => {
-                self.push(indent, format!("if ({}) {{", render_expr(&not(&cond))));
+                self.push(
+                    indent,
+                    format!("if ({}) {{", render_expr(&not(&cond, self.an), self.an)),
+                );
                 self.emit(fall, arm_stop, loopc, indent + 1);
                 self.push(indent, "}".into());
             }
             (false, false) => {
-                self.push(indent, format!("if ({}) {{", render_expr(&cond)));
+                self.push(indent, format!("if ({}) {{", render_expr(&cond, self.an)));
                 self.emit(taken, arm_stop, loopc, indent + 1);
                 self.push(indent, "} else {".into());
                 self.emit(fall, arm_stop, loopc, indent + 1);
@@ -1357,7 +1369,10 @@ impl Ir<'_> {
             }
         }
 
-        self.push(indent, format!("switch ({}) {{", render_expr(&sel)));
+        self.push(
+            indent,
+            format!("switch ({}) {{", render_expr(&sel, self.an)),
+        );
         for (t, idxs) in groups {
             for i in idxs {
                 self.push(indent + 1, format!("case 0x{i:x}:"));
@@ -1400,7 +1415,10 @@ impl Ir<'_> {
         if self.cfg.body[h].is_empty() {
             // A clean top-tested loop: the header is only the test, so it can be
             // re-evaluated implicitly by `while (cond)`.
-            self.push(indent, format!("while ({}) {{", render_expr(&cond)));
+            self.push(
+                indent,
+                format!("while ({}) {{", render_expr(&cond, self.an)),
+            );
             self.emit(body_entry, None, Some((h, follow)), indent + 1);
         } else {
             // The header does work on each iteration (a counter decrement, a
@@ -1409,11 +1427,11 @@ impl Ir<'_> {
             // bottom-tested (`do`/`while`) loop faithfully.
             self.push(indent, "while (1) {".into());
             for s in &self.cfg.body[h] {
-                self.push(indent + 1, render_stmt(s, self.base));
+                self.push(indent + 1, render_stmt(s, self.base, self.an));
             }
             self.push(
                 indent + 1,
-                format!("if ({}) break;", render_expr(&not(&cond))),
+                format!("if ({}) break;", render_expr(&not(&cond, self.an), self.an)),
             );
             self.emit(body_entry, None, Some((h, follow)), indent + 1);
         }
@@ -1433,7 +1451,7 @@ impl Ir<'_> {
 }
 
 /// Logical negation of a branch condition, for rendering the inverted arm.
-fn not(cond: &Expr) -> Expr {
+fn not(cond: &Expr, an: &Analysis) -> Expr {
     if let Expr::Bin(op, l, r) = cond {
         let inv = match *op {
             "==" => "!=",
@@ -1442,22 +1460,22 @@ fn not(cond: &Expr) -> Expr {
             ">=" => "<",
             ">" => "<=",
             "<=" => ">",
-            _ => return Expr::Opaque(format!("!({})", render_expr(cond))),
+            _ => return Expr::Opaque(format!("!({})", render_expr(cond, an))),
         };
         return Expr::Bin(inv, l.clone(), r.clone());
     }
-    Expr::Opaque(format!("!({})", render_expr(cond)))
+    Expr::Opaque(format!("!({})", render_expr(cond, an)))
 }
 
-fn render_stmt(s: &Stmt, base: u64) -> String {
+fn render_stmt(s: &Stmt, base: u64, an: &Analysis) -> String {
     match s {
-        Stmt::Set(dst, src) => format!("{} = {};", render_expr(dst), render_expr(src)),
-        Stmt::CallVoid(e) => format!("{};", render_expr(e)),
-        Stmt::Ret(Some(e)) => format!("return {};", render_expr(e)),
+        Stmt::Set(dst, src) => format!("{} = {};", render_expr(dst, an), render_expr(src, an)),
+        Stmt::CallVoid(e) => format!("{};", render_expr(e, an)),
+        Stmt::Ret(Some(e)) => format!("return {};", render_expr(e, an)),
         Stmt::Ret(None) => "return;".to_string(),
-        Stmt::Branch(c, t) => format!("if ({}) goto loc_{:x};", render_expr(c), t + base),
+        Stmt::Branch(c, t) => format!("if ({}) goto loc_{:x};", render_expr(c, an), t + base),
         Stmt::Goto(t) => format!("goto loc_{:x};", t + base),
-        Stmt::Switch(sel) => format!("switch ({}) {{ /* jump table */ }}", render_expr(sel)),
+        Stmt::Switch(sel) => format!("switch ({}) {{ /* jump table */ }}", render_expr(sel, an)),
         Stmt::Asm(s) => format!("/* {s} */"),
     }
 }
@@ -1472,24 +1490,37 @@ fn slot_name(off: i64) -> String {
     }
 }
 
-fn render_expr(e: &Expr) -> String {
+/// The name of a global: its symbol or import name when the engine knows one,
+/// otherwise `g_<addr>`.
+fn global_name(an: &Analysis, va: u64) -> String {
+    an.names
+        .get(&va)
+        .or_else(|| an.imports.get(&va))
+        .cloned()
+        .unwrap_or_else(|| format!("g_{va:x}"))
+}
+
+fn render_expr(e: &Expr, an: &Analysis) -> String {
     match e {
         Expr::Const(v) => format!("0x{v:x}"),
         Expr::Reg(_, shown) => format!("{shown:?}").to_lowercase(),
         Expr::Stack(off) => slot_name(*off),
-        // A frame slot reads as its name (`var_28`), not `*(var_28)`; its address
-        // reads as `&var_28`.
+        Expr::Global(va) => global_name(an, *va),
+        // A frame slot or global reads as its name, not `*(name)`; its address
+        // reads as `&name`.
         Expr::Mem(a) => match a.as_ref() {
             Expr::Stack(off) => slot_name(*off),
-            _ => format!("*({})", render_expr(a)),
+            Expr::Global(va) => global_name(an, *va),
+            _ => format!("*({})", render_expr(a, an)),
         },
         Expr::Addr(a) => match a.as_ref() {
             Expr::Stack(off) => format!("&{}", slot_name(*off)),
-            _ => format!("&({})", render_expr(a)),
+            Expr::Global(va) => format!("&{}", global_name(an, *va)),
+            _ => format!("&({})", render_expr(a, an)),
         },
-        Expr::Bin(op, l, r) => format!("{} {op} {}", render_expr(l), render_expr(r)),
+        Expr::Bin(op, l, r) => format!("{} {op} {}", render_expr(l, an), render_expr(r, an)),
         Expr::Call(name, args) => {
-            let a: Vec<String> = args.iter().map(render_expr).collect();
+            let a: Vec<String> = args.iter().map(|x| render_expr(x, an)).collect();
             format!("{name}({})", a.join(", "))
         }
         Expr::Opaque(s) => s.clone(),
@@ -1839,6 +1870,31 @@ mod tests {
                 .count(),
             1,
             "the loop body must not be duplicated, got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn a_fixed_address_becomes_a_named_global() {
+        // mov dword [0x9000], 0x2a ; mov eax, [0x9000] ; ret
+        // An absolute memory operand is an anonymous global, so it reads as
+        // `g_9000`, not `*(0x9000)`.
+        let code = vec![
+            0xc7, 0x05, 0x00, 0x90, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00, // mov [0x9000], 0x2a
+            0x8b, 0x05, 0x00, 0x90, 0x00, 0x00, // mov eax, [0x9000]
+            0xc3, // ret
+        ];
+        let joined = lines_x86_raw(code)
+            .into_iter()
+            .map(|l| l.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("g_9000 = 0x2a;") && joined.contains("eax = g_9000;"),
+            "a fixed address should read as g_9000, got:\n{joined}"
+        );
+        assert!(
+            !joined.contains("*(0x9000)") && !joined.contains("*(g_9000)"),
+            "the raw dereference should be gone, got:\n{joined}"
         );
     }
 
