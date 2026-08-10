@@ -18,6 +18,12 @@
   explicit `goto` to a labelled block, so the flow is preserved exactly rather
   than approximated. There is no type recovery, and an unmodelled instruction is
   shown verbatim rather than guessed at.
+- `pseudo`: `switch` recovery. An indexed jump through a table is rendered as a
+  `switch` on the selector, with each case body structured and grouped when
+  several indices share a target. The engine already resolves the table's case
+  edges; the decompiler now uses them, so a function built around a jump table
+  reads as a switch instead of collapsing to a flat goto listing (EQNEDT32.EXE
+  has 51 such functions).
 - `pseudo`: condition recovery. A conditional jump reads the comparison the last
   flag-setting instruction expressed, including the arithmetic and logic ops
   (`dec`, `sub`, `and`, ...) that set flags without a `cmp`, so `dec ecx; jnz`

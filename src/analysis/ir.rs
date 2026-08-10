@@ -58,6 +58,9 @@ pub enum Stmt {
     /// Conditional branch to a label address.
     Branch(Expr, u64),
     Goto(u64),
+    /// An indexed indirect jump (a jump table). The expression is the selector;
+    /// the case targets are the block's successors, resolved by the engine.
+    Switch(Expr),
     /// Verbatim assembly for an unmodelled instruction.
     Asm(String),
 }
@@ -484,6 +487,11 @@ fn lift_insn(
         })))),
         Jmp => Some(match branch_target(d) {
             Some(t) => Stmt::Goto(t),
+            // An indexed memory jump is a switch; its selector is the index. The
+            // case targets come from the block's engine-resolved successors.
+            None if d.op0_kind() == OpKind::Memory && d.memory_index() != Register::None => {
+                Stmt::Switch(reg_val(st, d.memory_index()))
+            }
             None => Stmt::Asm(raw(d)),
         }),
         m if is_jcc(m) => Some(match branch_target(d) {
@@ -713,7 +721,9 @@ fn apply_liveness(s: &Stmt, live: &mut BTreeSet<Register>) {
             }
             reads_regs(src, live);
         }
-        Stmt::CallVoid(e) | Stmt::Branch(e, _) | Stmt::Ret(Some(e)) => reads_regs(e, live),
+        Stmt::CallVoid(e) | Stmt::Branch(e, _) | Stmt::Ret(Some(e)) | Stmt::Switch(e) => {
+            reads_regs(e, live)
+        }
         _ => {}
     }
 }
@@ -743,7 +753,7 @@ fn fold_stmt(s: &mut Stmt) {
             }
             fold(src);
         }
-        Stmt::CallVoid(e) | Stmt::Branch(e, _) | Stmt::Ret(Some(e)) => fold(e),
+        Stmt::CallVoid(e) | Stmt::Branch(e, _) | Stmt::Ret(Some(e)) | Stmt::Switch(e) => fold(e),
         _ => {}
     }
 }
@@ -829,6 +839,12 @@ enum Term {
         taken: usize,
         fall: usize,
     },
+    /// An indexed jump: a selector and the case target blocks (deduplicated, in
+    /// the successor order the engine resolved from the jump table).
+    Switch {
+        sel: Expr,
+        cases: Vec<usize>,
+    },
     End,
 }
 
@@ -875,6 +891,25 @@ fn build_cfg(blocks: &[IrBlock]) -> Cfg {
                     _ => Term::End,
                 }
             }
+            // An indexed jump: the case targets are the block's engine-resolved
+            // successors (the jump table), deduplicated in address order.
+            Some(Stmt::Switch(sel)) => {
+                let sel = sel.clone();
+                let mut cases: Vec<usize> = Vec::new();
+                for s in &b.succ {
+                    if let Some(&j) = idx.get(s) {
+                        if !cases.contains(&j) {
+                            cases.push(j);
+                        }
+                    }
+                }
+                if cases.is_empty() {
+                    Term::End
+                } else {
+                    stmts.pop();
+                    Term::Switch { sel, cases }
+                }
+            }
             _ => next.map(Term::Fall).unwrap_or(Term::End),
         };
         body.push(stmts);
@@ -885,6 +920,7 @@ fn build_cfg(blocks: &[IrBlock]) -> Cfg {
         .map(|t| match t {
             Term::Goto(a) | Term::Fall(a) => vec![*a],
             Term::Cond { taken, fall, .. } => vec![*taken, *fall],
+            Term::Switch { cases, .. } => cases.clone(),
             Term::Ret | Term::End => vec![],
         })
         .collect();
@@ -1229,6 +1265,13 @@ impl Ir<'_> {
                         None => return,
                     }
                 }
+                Term::Switch { sel, cases } => {
+                    let (sel, cases) = (sel.clone(), cases.clone());
+                    match self.emit_switch(n, sel, cases, stop, loopc, indent) {
+                        Some(follow) => n = follow,
+                        None => return,
+                    }
+                }
             }
         }
     }
@@ -1282,6 +1325,68 @@ impl Ir<'_> {
             (true, true) => {}
         }
         follow
+    }
+
+    /// Emit a `switch` for an indexed jump, its cases reconverging at the
+    /// selector's immediate post-dominator. Cases sharing a target are grouped;
+    /// each case body is emitted inline and ended with a `break` so they do not
+    /// fall through. Returns the follow block to continue from.
+    fn emit_switch(
+        &mut self,
+        node: usize,
+        sel: Expr,
+        cases: Vec<usize>,
+        stop: Option<usize>,
+        loopc: Option<(usize, usize)>,
+        indent: usize,
+    ) -> Option<usize> {
+        let n_nodes = self.cfg.body.len();
+        let ipd = self.ipdom.get(node).copied().unwrap_or(usize::MAX);
+        let follow = (ipd < n_nodes).then_some(ipd);
+        // Inside a case, `break` leaves the switch (the follow); `continue` still
+        // refers to the enclosing loop, if any.
+        let cont = loopc.map(|c| c.0).unwrap_or(usize::MAX);
+        let case_loopc = follow.map(|f| (cont, f)).or(loopc);
+
+        // Group the case indices that share a target, in first-appearance order.
+        let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+        for (i, &t) in cases.iter().enumerate() {
+            match groups.iter_mut().find(|(tt, _)| *tt == t) {
+                Some((_, idxs)) => idxs.push(i),
+                None => groups.push((t, vec![i])),
+            }
+        }
+
+        self.push(indent, format!("switch ({}) {{", render_expr(&sel)));
+        for (t, idxs) in groups {
+            for i in idxs {
+                self.push(indent + 1, format!("case 0x{i:x}:"));
+            }
+            if Some(t) == follow {
+                // The case goes straight to the reconvergence point.
+                self.push(indent + 2, "break;".into());
+            } else {
+                self.emit(t, stop, case_loopc, indent + 2);
+                // Keep the cases from falling through into one another.
+                if !self.last_is_transfer() {
+                    self.push(indent + 2, "break;".into());
+                }
+            }
+        }
+        self.push(indent, "}".into());
+        follow
+    }
+
+    /// Whether the last emitted line already transfers control, so no `break` is
+    /// needed after it.
+    fn last_is_transfer(&self) -> bool {
+        self.lines.last().is_some_and(|l| {
+            let t = l.text.trim_start();
+            t.starts_with("break")
+                || t.starts_with("continue")
+                || t.starts_with("return")
+                || t.starts_with("goto")
+        })
     }
 
     /// Emit a `while` loop for header `h` given its recovered shape; return the
@@ -1352,6 +1457,7 @@ fn render_stmt(s: &Stmt, base: u64) -> String {
         Stmt::Ret(None) => "return;".to_string(),
         Stmt::Branch(c, t) => format!("if ({}) goto loc_{:x};", render_expr(c), t + base),
         Stmt::Goto(t) => format!("goto loc_{:x};", t + base),
+        Stmt::Switch(sel) => format!("switch ({}) {{ /* jump table */ }}", render_expr(sel)),
         Stmt::Asm(s) => format!("/* {s} */"),
     }
 }
@@ -1734,6 +1840,41 @@ mod tests {
             1,
             "the loop body must not be duplicated, got:\n{joined}"
         );
+    }
+
+    #[test]
+    fn a_jump_table_becomes_a_switch() {
+        // mov eax,[ebp+8]; jmp [eax*4 + table]; three cases each returning a
+        // constant; then the table of their addresses.
+        let code = vec![
+            0x8b, 0x45, 0x08, // 0x1000 mov eax, [ebp+8]
+            0xff, 0x24, 0x85, 0x1c, 0x10, 0x00, 0x00, // 0x1003 jmp [eax*4 + 0x101c]
+            0xb8, 0xaa, 0x00, 0x00, 0x00, 0xc3, // 0x100a case0: mov eax,0xaa; ret
+            0xb8, 0xbb, 0x00, 0x00, 0x00, 0xc3, // 0x1010 case1: mov eax,0xbb; ret
+            0xb8, 0xcc, 0x00, 0x00, 0x00, 0xc3, // 0x1016 case2: mov eax,0xcc; ret
+            0x0a, 0x10, 0x00, 0x00, // 0x101c table[0] = 0x100a
+            0x10, 0x10, 0x00, 0x00, // table[1] = 0x1010
+            0x16, 0x10, 0x00, 0x00, // table[2] = 0x1016
+        ];
+        let joined = lines_x86_raw(code)
+            .into_iter()
+            .map(|l| l.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("switch ("),
+            "an indexed jump should become a switch, got:\n{joined}"
+        );
+        for (case, val) in [
+            ("case 0x0:", "0xaa"),
+            ("case 0x1:", "0xbb"),
+            ("case 0x2:", "0xcc"),
+        ] {
+            assert!(
+                joined.contains(case) && joined.contains(val),
+                "case {case} with body {val} should be recovered, got:\n{joined}"
+            );
+        }
     }
 
     #[test]

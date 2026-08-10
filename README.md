@@ -244,12 +244,16 @@ frame bookkeeping (`mov ebp, esp`, the `sub esp` allocation, `push ebp`,
 `leave`) is dropped. The CVE-2017-11882 overflow comes out as the single line
 `lstrcpyA(&var_28, arg_8 + 0x1c);` with nothing around it. It then structures the
 control flow: dominators and post-dominators drive a recursive emitter that
-rebuilds nested `if`/`else` and `while`, so a function reads as C rather than a
-goto chain. The handful of edges that break nesting (a `switch`'s shared tails, a
-jump into a common handler) become an explicit `goto` to a labelled block, so the
-flow is preserved exactly, never approximated. It is not a full decompiler and
-does not pretend to be: there is no type recovery, and any instruction the lifter
-does not model is printed verbatim so you always see where the clean lift stops.
+rebuilds nested `if`/`else` and `while`, and an indexed jump through a table
+becomes a `switch` on its selector with each case structured. A function reads as
+C rather than a goto chain. Conditions are recovered from whatever set the flags,
+including the arithmetic ops (`dec`, `sub`, ...) that branch without a `cmp`, and
+the compare is followed across blocks so a multi-way dispatch reads as a real
+if/else-if chain. The handful of edges that break nesting (a jump into a common
+handler) become an explicit `goto` to a labelled block, so the flow is preserved
+exactly, never approximated. It is not a full decompiler and does not pretend to
+be: there is no type recovery, and any instruction the lifter does not model is
+printed verbatim so you always see where the clean lift stops.
 
 **Constant scanning.** `knife scan` fingerprints crypto and structure by their
 byte signatures: AES S-boxes (generated from the GF(2⁸) definition, not stored
