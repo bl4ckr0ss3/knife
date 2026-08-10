@@ -1467,9 +1467,25 @@ fn not(cond: &Expr, an: &Analysis) -> Expr {
     Expr::Opaque(format!("!({})", render_expr(cond, an)))
 }
 
+/// `dst = dst OP rhs` reads better as a compound assignment (`dst OP= rhs`), and
+/// a `+`/`-` of one as `dst++` / `dst--`. Any other assignment renders plainly.
+fn render_assign(dst: &Expr, src: &Expr, an: &Analysis) -> String {
+    const COMPOUND: &[&str] = &["+", "-", "*", "&", "|", "^", "<<", ">>"];
+    if let Expr::Bin(op, l, r) = src {
+        if l.as_ref() == dst && COMPOUND.contains(op) {
+            let d = render_expr(dst, an);
+            if matches!(*op, "+" | "-") && matches!(r.as_ref(), Expr::Const(1)) {
+                return format!("{d}{op}{op};"); // x++ / x--
+            }
+            return format!("{d} {op}= {};", render_expr(r, an));
+        }
+    }
+    format!("{} = {};", render_expr(dst, an), render_expr(src, an))
+}
+
 fn render_stmt(s: &Stmt, base: u64, an: &Analysis) -> String {
     match s {
-        Stmt::Set(dst, src) => format!("{} = {};", render_expr(dst, an), render_expr(src, an)),
+        Stmt::Set(dst, src) => render_assign(dst, src, an),
         Stmt::CallVoid(e) => format!("{};", render_expr(e, an)),
         Stmt::Ret(Some(e)) => format!("return {};", render_expr(e, an)),
         Stmt::Ret(None) => "return;".to_string(),
@@ -1860,14 +1876,12 @@ mod tests {
             "a self-loop header becomes an infinite loop, got:\n{joined}"
         );
         assert!(
-            joined.contains("ecx = ecx - 0x1;") && joined.contains("if (ecx == 0x0) break;"),
+            joined.contains("ecx--;") && joined.contains("if (ecx == 0x0) break;"),
             "the decrement stays in the loop with a break on exit, got:\n{joined}"
         );
         // The decrement appears once (inside the loop), not hoisted out as well.
         assert_eq!(
-            text.iter()
-                .filter(|l| l.contains("ecx = ecx - 0x1;"))
-                .count(),
+            text.iter().filter(|l| l.contains("ecx--;")).count(),
             1,
             "the loop body must not be duplicated, got:\n{joined}"
         );
