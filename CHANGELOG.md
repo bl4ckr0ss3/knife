@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `pseudo`: conditional idioms. `setcc` reads as the boolean it computes
+  (`al = ecx == edx`) and `cmovcc` as a ternary (`rax = rax == rbx ? rcx : rax`),
+  so neither shows up as an opaque `asm(...)` any more.
 - `pseudo`: string literals inline. A pointer to a string, whether an x64
   `lea reg, [rip + s]` or a 32-bit `push offset s`, reads as the quoted text
   (`lstrcpyA(&var_28, "Times New Roman")`) instead of a bare address, so the data

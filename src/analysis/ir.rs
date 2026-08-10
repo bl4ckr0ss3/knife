@@ -72,6 +72,8 @@ pub enum Expr {
     /// `Stack`, it is an address: `Mem` reads the global, `Addr` takes its address.
     Global(u64),
     Bin(&'static str, Box<Expr>, Box<Expr>),
+    /// A conditional value `cond ? a : b`, from a `cmov`.
+    Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
     /// A resolved (or register-indirect) call with its recovered arguments.
     Call(String, Vec<Expr>),
     /// Something the lifter chose not to model as a value.
@@ -738,6 +740,21 @@ fn lift_insn(
             Some(t) => Stmt::Branch(condition(m, &st.cmp), t),
             None => Stmt::Asm(raw(d)),
         }),
+        // `setcc dst` is a boolean: `dst = (comparison)`.
+        m if is_setcc(m) && cc_to_jcc(m).is_some() => {
+            let cond = condition(cc_to_jcc(m).unwrap(), &st.cmp);
+            Some(Stmt::Set(dest(d, st), cond))
+        }
+        // `cmovcc dst, src` is a conditional move: `dst = cond ? src : dst`.
+        m if is_cmovcc(m) && cc_to_jcc(m).is_some() => {
+            let cond = condition(cc_to_jcc(m).unwrap(), &st.cmp);
+            let src = operand(d, st, 1);
+            let keep = operand(d, st, 0);
+            Some(Stmt::Set(
+                dest(d, st),
+                Expr::Ternary(Box::new(cond), Box::new(src), Box::new(keep)),
+            ))
+        }
         _ => Some(Stmt::Asm(raw(d))),
     };
 
@@ -852,6 +869,7 @@ fn is_pure(e: &Expr) -> bool {
         Expr::Const(_) | Expr::Reg(..) | Expr::Stack(_) | Expr::Global(_) => true,
         Expr::Mem(a) | Expr::Addr(a) => is_pure(a),
         Expr::Bin(_, l, r) => is_pure(l) && is_pure(r),
+        Expr::Ternary(c, a, b) => is_pure(c) && is_pure(a) && is_pure(b),
         // A call is never pure; an opaque value is not safe to duplicate.
         Expr::Call(..) | Expr::Opaque(_) => false,
     }
@@ -862,6 +880,7 @@ fn reads_mem(e: &Expr) -> bool {
         Expr::Mem(_) => true,
         Expr::Addr(a) => reads_mem(a),
         Expr::Bin(_, l, r) => reads_mem(l) || reads_mem(r),
+        Expr::Ternary(c, a, b) => reads_mem(c) || reads_mem(a) || reads_mem(b),
         Expr::Call(_, args) => args.iter().any(reads_mem),
         Expr::Const(_) | Expr::Reg(..) | Expr::Stack(_) | Expr::Global(_) | Expr::Opaque(_) => {
             false
@@ -874,6 +893,7 @@ fn contains_call(e: &Expr) -> bool {
         Expr::Call(..) => true,
         Expr::Mem(a) | Expr::Addr(a) => contains_call(a),
         Expr::Bin(_, l, r) => contains_call(l) || contains_call(r),
+        Expr::Ternary(c, a, b) => contains_call(c) || contains_call(a) || contains_call(b),
         _ => false,
     }
 }
@@ -995,6 +1015,11 @@ fn reads_regs(e: &Expr, live: &mut BTreeSet<Register>) {
             reads_regs(l, live);
             reads_regs(r, live);
         }
+        Expr::Ternary(c, a, b) => {
+            reads_regs(c, live);
+            reads_regs(a, live);
+            reads_regs(b, live);
+        }
         Expr::Call(_, args) => args.iter().for_each(|a| reads_regs(a, live)),
         Expr::Const(_) | Expr::Stack(_) | Expr::Global(_) | Expr::Opaque(_) => {}
     }
@@ -1026,6 +1051,11 @@ fn fold(e: &mut Expr) {
                     *e = Expr::Const(v);
                 }
             }
+        }
+        Expr::Ternary(c, a, b) => {
+            fold(c);
+            fold(a);
+            fold(b);
         }
         Expr::Call(_, args) => args.iter_mut().for_each(fold),
         Expr::Const(_) | Expr::Reg(..) | Expr::Stack(_) | Expr::Global(_) | Expr::Opaque(_) => {}
@@ -1806,6 +1836,12 @@ fn render_expr(e: &Expr, r: Rx) -> String {
             _ => format!("&({})", render_expr(a, r)),
         },
         Expr::Bin(op, l, r2) => format!("{} {op} {}", render_expr(l, r), render_expr(r2, r)),
+        Expr::Ternary(c, a, b) => format!(
+            "{} ? {} : {}",
+            render_expr(c, r),
+            render_expr(a, r),
+            render_expr(b, r)
+        ),
         Expr::Call(name, args) => {
             let a: Vec<String> = args.iter().map(|x| render_expr(x, r)).collect();
             format!("{name}({})", a.join(", "))
@@ -1847,6 +1883,35 @@ fn is_jcc(m: Mnemonic) -> bool {
     format!("{m:?}").starts_with('J') && m != Mnemonic::Jmp
 }
 
+fn is_setcc(m: Mnemonic) -> bool {
+    format!("{m:?}").starts_with("Set")
+}
+
+fn is_cmovcc(m: Mnemonic) -> bool {
+    format!("{m:?}").starts_with("Cmov")
+}
+
+/// The `jcc` a `setcc` or `cmovcc` shares its condition with, so the one
+/// `condition` mapping serves all three.
+fn cc_to_jcc(m: Mnemonic) -> Option<Mnemonic> {
+    use Mnemonic::*;
+    Some(match m {
+        Sete | Cmove => Je,
+        Setne | Cmovne => Jne,
+        Setl | Cmovl => Jl,
+        Setle | Cmovle => Jle,
+        Setg | Cmovg => Jg,
+        Setge | Cmovge => Jge,
+        Setb | Cmovb => Jb,
+        Setbe | Cmovbe => Jbe,
+        Seta | Cmova => Ja,
+        Setae | Cmovae => Jae,
+        Sets | Cmovs => Js,
+        Setns | Cmovns => Jns,
+        _ => return None,
+    })
+}
+
 /// The flag-setting arithmetic and logic ops whose result a following `jcc`
 /// tests against zero. `cmp` and `test` are handled separately.
 fn sets_zero_flags(m: Mnemonic) -> bool {
@@ -1865,7 +1930,11 @@ fn preserves_flags(m: Mnemonic) -> bool {
     matches!(
         m,
         Mov | Movzx | Movsx | Movsxd | Lea | Push | Pop | Nop | Endbr32 | Endbr64
-    ) || (format!("{m:?}").starts_with('J'))
+    ) || format!("{m:?}").starts_with('J')
+        // setcc/cmov read the flags but do not change them, so a compare survives
+        // for a following conditional that shares it.
+        || is_setcc(m)
+        || is_cmovcc(m)
 }
 
 fn condition(m: Mnemonic, cmp: &Option<(Expr, Expr, FlagSrc)>) -> Expr {
@@ -2118,6 +2187,47 @@ mod tests {
                 "stack bookkeeping `{gone}` should be gone, got:\n{joined}"
             );
         }
+    }
+
+    #[test]
+    fn setcc_becomes_a_boolean_comparison() {
+        // cmp ecx,edx ; sete al ; movzx eax,al ; ret
+        let code = vec![
+            0x39, 0xd1, // cmp ecx, edx
+            0x0f, 0x94, 0xc0, // sete al
+            0x0f, 0xb6, 0xc0, // movzx eax, al
+            0xc3, // ret
+        ];
+        let joined = lines_x86_raw(code)
+            .into_iter()
+            .map(|l| l.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("ecx == edx"),
+            "setcc should recover the comparison, got:\n{joined}"
+        );
+        assert!(!joined.contains("sete"), "no raw setcc, got:\n{joined}");
+    }
+
+    #[test]
+    fn cmov_becomes_a_ternary() {
+        // cmp rax,rbx ; cmove rax,rcx ; ret
+        let code = vec![
+            0x48, 0x39, 0xd8, // cmp rax, rbx
+            0x48, 0x0f, 0x44, 0xc1, // cmove rax, rcx
+            0xc3, // ret
+        ];
+        let joined = lines_x64_raw(code)
+            .into_iter()
+            .map(|l| l.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("rax == rbx ? rcx :"),
+            "cmov should read as a ternary, got:\n{joined}"
+        );
+        assert!(!joined.contains("cmov"), "no raw cmov, got:\n{joined}");
     }
 
     #[test]
