@@ -2,13 +2,6 @@
 
 ## Unreleased
 
-- `gui`: a native windowed view (`knife gui FILE`), in the spirit of a decompiler
-  workbench: the function list on the left, the disassembly and the decompiler in
-  tabs at the centre, cross-references below, with the same red palette as the
-  reports and the TUI. Click a function to open it, double-click a call to follow
-  it, `goto` an address or symbol, filter the list. Built on egui/eframe (pure
-  Rust, no C toolchain) and gated behind the `gui` feature so the default build
-  stays lean: `cargo install --path . --features gui`.
 - `pseudo`: self-updating assignments read as compound operators, so a counter
   is `ecx--` and an accumulate is `x += 0x10` rather than restating the target.
 - `pseudo`: global naming. A fixed-address memory operand (an absolute or

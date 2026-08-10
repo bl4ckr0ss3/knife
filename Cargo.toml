@@ -46,13 +46,6 @@ owo-colors = "4"
 anyhow = "1"
 yara-x = "1.5.0"
 ratatui = "0.30"
-# The windowed GUI (`knife gui`) is behind a feature so the default CLI build
-# stays lean; eframe/egui is pure Rust, no C toolchain.
-eframe = { version = "0.31", optional = true, default-features = false, features = ["glow", "default_fonts"] }
-
-[features]
-default = []
-gui = ["dep:eframe"]
 
 [profile.release]
 opt-level = 3
