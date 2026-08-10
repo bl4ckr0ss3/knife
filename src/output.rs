@@ -15,7 +15,7 @@ pub fn human(bytes: u64) -> String {
 
 // palette
 pub fn accent() -> Style {
-    Style::new().truecolor(0xa8, 0x94, 0xe8)
+    Style::new().truecolor(0xe0, 0x55, 0x55)
 }
 pub fn muted() -> Style {
     Style::new().truecolor(0x9b, 0x94, 0xae)
@@ -89,7 +89,7 @@ pub fn section_header(title: &str) {
     println!();
     println!(
         "{} {}",
-        "§".style(accent()),
+        "▌".style(accent()),
         title.to_uppercase().style(accent()).bold()
     );
 }

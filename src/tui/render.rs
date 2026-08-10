@@ -13,7 +13,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 
 fn accent() -> Color {
-    Color::Rgb(0xa8, 0x94, 0xe8)
+    Color::Rgb(0xe0, 0x55, 0x55)
 }
 fn muted() -> Color {
     Color::Rgb(0x9b, 0x94, 0xae)
