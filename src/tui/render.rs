@@ -3,7 +3,7 @@
 //! The palette is the same one the printed output uses, so the interactive view
 //! and the reports look like the same tool.
 
-use super::{App, Focus, Line};
+use super::{App, Focus, LeftView, Line};
 use crate::analysis::engine::XrefKind;
 use crate::listing::Annot;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -94,6 +94,10 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn functions(f: &mut Frame, area: Rect, app: &App) {
+    if app.left == LeftView::Sinks {
+        sinks(f, area, app);
+        return;
+    }
     let focused = app.focus == Focus::Functions;
     // The function containing whatever the listing shows is marked, so moving
     // through code keeps the left pane in step even after following calls.
@@ -133,6 +137,56 @@ fn functions(f: &mut Frame, area: Rect, app: &App) {
     let mut state = ListState::default();
     if !app.order.is_empty() {
         state.select(Some(app.sel));
+    }
+    f.render_stateful_widget(
+        List::new(items)
+            .block(pane(&title, focused))
+            .highlight_style(Style::default().bg(Color::Rgb(0x2a, 0x26, 0x3a)))
+            .highlight_symbol("›"),
+        area,
+        &mut state,
+    );
+}
+
+/// The attack surface: ranked sink call sites, most severe first.
+fn sinks(f: &mut Frame, area: Rect, app: &App) {
+    let focused = app.focus == Focus::Functions;
+    let items: Vec<ListItem> = if app.sinks.is_empty() {
+        vec![ListItem::new(TLine::from(Span::styled(
+            " no sinks found",
+            Style::default().fg(faint()),
+        )))]
+    } else {
+        app.sinks
+            .iter()
+            .map(|s| {
+                // 3 = looks exploitable, 2 = worth a look, 1 = context.
+                let (mark, color) = match s.severity {
+                    3 => ("!", accent()),
+                    2 => ("=", amber()),
+                    _ => ("·", muted()),
+                };
+                let where_ = s.func.as_deref().unwrap_or("-");
+                ListItem::new(TLine::from(vec![
+                    Span::styled(format!("{mark} "), Style::default().fg(color)),
+                    Span::styled(
+                        format!("{:<12} ", truncate(&s.api, 12)),
+                        Style::default().fg(color),
+                    ),
+                    Span::styled(
+                        format!("{:>10x} ", s.addr + app.an.display_base),
+                        Style::default().fg(faint()),
+                    ),
+                    Span::styled(truncate(where_, 14), Style::default().fg(muted())),
+                ]))
+            })
+            .collect()
+    };
+
+    let title = format!("sinks ({})", app.sinks.len());
+    let mut state = ListState::default();
+    if !app.sinks.is_empty() {
+        state.select(Some(app.ssel.min(app.sinks.len() - 1)));
     }
     f.render_stateful_widget(
         List::new(items)
@@ -397,13 +451,15 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(
         Paragraph::new(TLine::from(Span::styled(
             format!(
-                " db {} · ↵ open/follow{jump} ⌫ back   / filter   g goto   d {mode}   n name   c note   ? help   q quit",
+                " db {} · ↵ open/follow{jump} ⌫ back   {find}   g goto   s {left}   d {mode}   n name   c note   ? help   q quit",
                 app.db.len(),
                 jump = if app.focus == Focus::Xrefs {
                     " (jump to ref)"
                 } else {
                     ""
                 },
+                find = if app.focus == Focus::Listing { "/ search" } else { "/ filter" },
+                left = if app.left == LeftView::Sinks { "funcs" } else { "sinks" },
                 mode = if app.pseudo { "asm" } else { "pseudo" },
             ),
             Style::default().fg(faint()),
@@ -424,7 +480,10 @@ fn help(f: &mut Frame, area: Rect) {
         "                 string operand opens its bytes as a hex dump",
         "  ⌫              back to where you followed from",
         "",
-        "  /              filter the function list by name",
+        "  /              filter the function list, or search the code when the",
+        "                 listing is focused (/↵ repeats, jumping to the next hit)",
+        "  s              toggle the left pane between functions and sinks (the",
+        "                 ranked attack surface); ↵ on a sink jumps to its call",
         "  g              go to an address or a symbol",
         "  d              toggle decompiled pseudocode for the current function",
         "  n              name what is under the cursor (empty clears it)",

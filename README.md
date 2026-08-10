@@ -180,10 +180,12 @@ knife dis  ./target --func parse_record
 **Somewhere to do it.** `knife tui` puts the same analysis behind a keyboard:
 the function list on the left, the listing and cross-references on the right.
 `↵` opens a function or follows the call under the cursor, `⌫` returns to where
-you followed from, `/` filters, `g` goes to an address or a symbol, `d` toggles
-the listing between disassembly and decompiled pseudocode, and `n` and `c` name
-and annotate whatever the cursor is on. The xrefs pane is a list of
-its own: tab into it, and `↵` jumps to the reference's site. Operands that
+you followed from, `/` filters the function list (or searches the code when the
+listing is focused), `g` goes to an address or a symbol, `d` toggles the listing
+between disassembly and decompiled pseudocode, and `n` and `c` name and annotate
+whatever the cursor is on. `s` swaps the left pane for the ranked attack surface,
+the sink call sites the audit found worst first, and `↵` jumps to one. The xrefs
+pane is a list of its own: tab into it, and `↵` jumps to the reference's site. Operands that
 point at a literal are annotated with the string itself, in the listing and in
 the printed `dis --func`, and following one opens its bytes as a hex dump. The
 mouse works too: the wheel scrolls the focused pane, a click focuses and

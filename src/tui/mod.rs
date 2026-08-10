@@ -28,6 +28,13 @@ pub enum Focus {
     Xrefs,
 }
 
+/// What the left pane is showing: the function list or the ranked sink sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeftView {
+    Functions,
+    Sinks,
+}
+
 /// What a prompt at the bottom of the screen is collecting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ask {
@@ -35,6 +42,8 @@ pub enum Ask {
     Name,
     Note,
     Goto,
+    /// Text to find within the current listing.
+    Search,
 }
 
 impl Ask {
@@ -44,6 +53,7 @@ impl Ask {
             Ask::Name => "name",
             Ask::Note => "note",
             Ask::Goto => "goto",
+            Ask::Search => "search",
         }
     }
 }
@@ -99,12 +109,34 @@ pub struct App {
     /// change while the view is open, and rebuilding per navigation is the
     /// kind of cost a big binary makes obvious.
     pub strings: BTreeMap<u64, Located>,
+
+    // ── sinks (attack surface) ──
+    /// Ranked sink call sites from the argument-provenance audit, most severe
+    /// first, built once.
+    pub sinks: Vec<crate::analysis::audit::Finding>,
+    /// Whether the left pane shows the function list or the sinks.
+    pub left: LeftView,
+    /// Cursor into the sinks list.
+    pub ssel: usize,
+
+    // ── in-listing search ──
+    /// The last text searched for in the listing, so repeating advances.
+    pub search: String,
 }
 
 impl App {
     pub fn new(bin: Binary, bytes: Vec<u8>, db: Db, an: Analysis, title: String) -> App {
         let base = engine::display_base(&bin);
         let strings = listing::string_map(&bin, &bytes, base);
+        // The attack surface, computed once: the argument-provenance audit, most
+        // severe first, then the reachable ones, then by address.
+        let mut sinks = crate::analysis::audit::run(&an, &bin, &bytes);
+        sinks.sort_by(|a, b| {
+            b.severity
+                .cmp(&a.severity)
+                .then(b.reachable.cmp(&a.reachable))
+                .then(a.addr.cmp(&b.addr))
+        });
         let mut app = App {
             bin,
             bytes,
@@ -129,6 +161,10 @@ impl App {
             xsel: 0,
             dims: (0, 0),
             strings,
+            sinks,
+            left: LeftView::Functions,
+            ssel: 0,
+            search: String::new(),
         };
         app.refilter();
         // Open something immediately: an empty right-hand pane makes the tool
@@ -295,6 +331,83 @@ impl App {
         self.cursor = self.cursor.saturating_add_signed(delta).min(len - 1);
     }
 
+    /// The searchable text of listing row `i`, in whichever view is showing.
+    fn line_text(&self, i: usize) -> String {
+        if self.pseudo {
+            self.pseudo_lines
+                .get(i)
+                .map(|l| l.text.clone())
+                .unwrap_or_default()
+        } else {
+            match self.lines.get(i) {
+                Some(Line::Label { text, .. }) | Some(Line::Data { text, .. }) => text.clone(),
+                Some(Line::Insn {
+                    mnemonic,
+                    operands,
+                    annot,
+                    ..
+                }) => format!("{mnemonic} {operands} {annot:?}"),
+                None => String::new(),
+            }
+        }
+    }
+
+    /// Find `text` in the current listing and move the cursor to the next match
+    /// after the current line, wrapping. Repeating the same search advances.
+    pub fn search_listing(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        self.search = text.clone();
+        let needle = text.to_lowercase();
+        let len = self.listing_len();
+        let hits: Vec<usize> = (0..len)
+            .filter(|&i| self.line_text(i).to_lowercase().contains(&needle))
+            .collect();
+        if hits.is_empty() {
+            self.status = format!("no match for '{text}'");
+            return;
+        }
+        let next = hits
+            .iter()
+            .find(|&&i| i > self.cursor)
+            .copied()
+            .unwrap_or(hits[0]);
+        self.cursor = next;
+        let pos = hits.iter().position(|&i| i == next).unwrap_or(0) + 1;
+        self.status = format!("match {pos}/{} for '{text}'", hits.len());
+    }
+
+    // ── sinks ──
+
+    pub fn toggle_sinks(&mut self) {
+        self.left = match self.left {
+            LeftView::Functions => LeftView::Sinks,
+            LeftView::Sinks => LeftView::Functions,
+        };
+        self.focus = Focus::Functions;
+        if self.left == LeftView::Sinks && self.sinks.is_empty() {
+            self.status = "no sinks found (audit is x86/x64 only)".into();
+        }
+    }
+
+    pub fn move_ssel(&mut self, delta: isize) {
+        if self.sinks.is_empty() {
+            return;
+        }
+        let last = self.sinks.len() - 1;
+        self.ssel = self.ssel.saturating_add_signed(delta).min(last);
+    }
+
+    /// Open the call site of the selected sink in the listing.
+    pub fn open_sink(&mut self) {
+        if let Some(f) = self.sinks.get(self.ssel) {
+            let addr = f.addr;
+            self.open(addr, true);
+            self.focus = Focus::Listing;
+        }
+    }
+
     /// The address the cursor is on, which is what a name, note, or
     /// cross-reference lookup applies to.
     pub fn cursor_addr(&self) -> Option<u64> {
@@ -414,6 +527,7 @@ impl App {
                     None => self.status = format!("no symbol or address '{text}'"),
                 }
             }
+            Ask::Search => self.search_listing(text),
             Ask::Name => {
                 if text.is_empty() {
                     let (n, _) = self.db.clear(stored);
@@ -558,20 +672,27 @@ impl App {
             KeyCode::Home => self.step(isize::MIN / 2),
             KeyCode::End => self.step(isize::MAX / 2),
             KeyCode::Enter => match self.focus {
-                Focus::Functions => {
-                    if let Some(a) = self.selected_addr() {
-                        self.open(a, true);
-                        self.focus = Focus::Listing;
+                Focus::Functions => match self.left {
+                    LeftView::Sinks => self.open_sink(),
+                    LeftView::Functions => {
+                        if let Some(a) = self.selected_addr() {
+                            self.open(a, true);
+                            self.focus = Focus::Listing;
+                        }
                     }
-                }
+                },
                 Focus::Listing => self.follow(),
                 Focus::Xrefs => self.jump_xref(),
             },
             KeyCode::Backspace => self.back(),
+            // `/` filters the function list, but searches within the code when
+            // the listing is focused.
+            KeyCode::Char('/') if self.focus == Focus::Listing => self.ask(Ask::Search),
             KeyCode::Char('/') => self.ask(Ask::Filter),
             KeyCode::Char('g') => self.ask(Ask::Goto),
             KeyCode::Char('n') => self.ask(Ask::Name),
             KeyCode::Char('c') => self.ask(Ask::Note),
+            KeyCode::Char('s') => self.toggle_sinks(),
             KeyCode::Char('d') => {
                 self.toggle_pseudo();
                 self.focus = Focus::Listing;
@@ -586,7 +707,10 @@ impl App {
 
     fn step(&mut self, delta: isize) {
         match self.focus {
-            Focus::Functions => self.move_sel(delta),
+            Focus::Functions => match self.left {
+                LeftView::Functions => self.move_sel(delta),
+                LeftView::Sinks => self.move_ssel(delta),
+            },
             Focus::Listing => self.move_cursor(delta),
             Focus::Xrefs => self.move_xsel(delta),
         }
@@ -601,6 +725,8 @@ impl App {
             Ask::Name => self.db.names.get(&stored).cloned().unwrap_or_default(),
             Ask::Note => self.db.notes.get(&stored).cloned().unwrap_or_default(),
             Ask::Goto => String::new(),
+            // Prefilled with the last search so pressing `/`↵ repeats it.
+            Ask::Search => self.search.clone(),
         };
         self.prompt = Some(Prompt { ask, input, at });
     }
@@ -622,8 +748,12 @@ impl App {
         let body_h = h.saturating_sub(2);
         let fns_w = 34.min(w);
         let xrefs_h = 8u16.min(body_h);
+        let left_len = match self.left {
+            LeftView::Functions => self.order.len(),
+            LeftView::Sinks => self.sinks.len(),
+        };
         let (focus, list_len, pane_row) = if column < fns_w {
-            (Focus::Functions, self.order.len(), row)
+            (Focus::Functions, left_len, row)
         } else if row + xrefs_h < h.saturating_sub(1) {
             (Focus::Listing, self.listing_len(), row)
         } else {
@@ -655,12 +785,18 @@ impl App {
                 };
                 self.focus = focus;
                 match focus {
-                    Focus::Functions => {
-                        self.sel = idx;
-                        if let Some(a) = self.selected_addr() {
-                            self.open(a, false);
+                    Focus::Functions => match self.left {
+                        LeftView::Sinks => {
+                            self.ssel = idx;
+                            self.open_sink();
                         }
-                    }
+                        LeftView::Functions => {
+                            self.sel = idx;
+                            if let Some(a) = self.selected_addr() {
+                                self.open(a, false);
+                            }
+                        }
+                    },
                     Focus::Listing => self.cursor = idx.min(self.listing_len().saturating_sub(1)),
                     Focus::Xrefs => self.xsel = idx,
                 }
@@ -813,6 +949,39 @@ mod tests {
     }
 
     #[test]
+    fn searching_the_listing_moves_the_cursor_to_a_match() {
+        let mut app = two_functions();
+        app.open(0x1000, false);
+        app.focus = Focus::Listing;
+        app.cursor = 0;
+        app.search_listing("ret".into());
+        assert!(
+            app.line_text(app.cursor).to_lowercase().contains("ret"),
+            "the cursor should land on a line containing the query"
+        );
+        assert!(app.status.contains("match"));
+
+        app.search_listing("no_such_text_here".into());
+        assert!(app.status.contains("no match"));
+    }
+
+    #[test]
+    fn the_left_pane_toggles_between_functions_and_sinks() {
+        let mut app = two_functions();
+        assert_eq!(app.left, LeftView::Functions);
+        app.toggle_sinks();
+        assert_eq!(app.left, LeftView::Sinks);
+        app.toggle_sinks();
+        assert_eq!(app.left, LeftView::Functions);
+        // With no sinks recovered, navigating them must not panic.
+        app.left = LeftView::Sinks;
+        app.move_ssel(1);
+        app.move_ssel(-1);
+        app.open_sink();
+        assert_eq!(app.ssel, 0);
+    }
+
+    #[test]
     fn following_in_the_pseudocode_view_asks_to_switch() {
         let mut app = two_functions();
         app.open(0x1000, false);
@@ -937,6 +1106,14 @@ mod tests {
         assert!(out.contains("entry"), "and lists what was recovered");
         assert!(out.contains("xrefs"), "the xref pane is drawn");
         assert!(out.contains("open/follow"), "the key hints are drawn");
+    }
+
+    #[test]
+    fn the_sinks_pane_renders() {
+        let mut app = two_functions();
+        app.toggle_sinks();
+        let out = rendered(&app, 110, 30);
+        assert!(out.contains("sinks"), "the sinks pane title is drawn");
     }
 
     #[test]

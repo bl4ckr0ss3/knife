@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `tui`: a sinks pane. `s` toggles the left pane between the function list and
+  the ranked attack surface (the argument-provenance audit, most severe first);
+  `↵` on a sink jumps straight to its call site in the listing. This puts the
+  whole find-the-sink loop inside the interactive view.
+- `tui`: in-listing search. When the listing is focused, `/` searches the code
+  (disassembly or pseudocode) instead of filtering the function list; `/`↵
+  repeats, jumping to the next match and wrapping.
 - `pseudo`: self-updating assignments read as compound operators, so a counter
   is `ecx--` and an accumulate is `x += 0x10` rather than restating the target.
 - `pseudo`: global naming. A fixed-address memory operand (an absolute or
