@@ -123,6 +123,10 @@ pub fn decompile(an: &Analysis, bin: &Binary, f: &Function) -> Vec<Line> {
     // conditional jumps in several blocks reaches each `jcc` that reads it.
     let mut entry_cmp: Vec<Option<Cmp>> = vec![None; n];
     let mut exit_cmp: Vec<Option<Cmp>> = vec![None; n];
+    // The stack pointer's position is carried the same way, so a local addressed
+    // in the body resolves to the right slot even after the prologue moved rsp.
+    let mut entry_stk: Vec<StackSt> = vec![StackSt::default(); n];
+    let mut exit_stk: Vec<StackSt> = vec![StackSt::default(); n];
     let mut lifted = vec![false; n];
     let mut blocks: Vec<IrBlock> = Vec::with_capacity(n);
     for b in &f.blocks {
@@ -142,12 +146,15 @@ pub fn decompile(an: &Analysis, bin: &Binary, f: &Function) -> Vec<Line> {
         for &i in &rpo {
             let meet = meet_states(&preds[i], &exit);
             let meet_c = meet_cmp(&preds[i], &exit_cmp);
-            let entry_changed = meet != entry[i] || meet_c != entry_cmp[i];
+            let meet_s = meet_stack(&preds[i], &exit_stk);
+            let entry_changed =
+                meet != entry[i] || meet_c != entry_cmp[i] || meet_s != entry_stk[i];
             entry[i] = meet;
             entry_cmp[i] = meet_c;
+            entry_stk[i] = meet_s;
             if entry_changed || !lifted[i] {
                 lifted[i] = true;
-                let (stmts, exit_state, exit_c) = lift_block(
+                let (stmts, exit_state, exit_c, exit_s) = lift_block(
                     &f.blocks[i],
                     an,
                     bin,
@@ -155,11 +162,13 @@ pub fn decompile(an: &Analysis, bin: &Binary, f: &Function) -> Vec<Line> {
                     frame,
                     entry[i].clone(),
                     entry_cmp[i].clone(),
+                    entry_stk[i].clone(),
                 );
                 blocks[i].stmts = stmts;
-                if exit_state != exit[i] || exit_c != exit_cmp[i] {
+                if exit_state != exit[i] || exit_c != exit_cmp[i] || exit_s != exit_stk[i] {
                     exit[i] = exit_state;
                     exit_cmp[i] = exit_c;
+                    exit_stk[i] = exit_s;
                     changed = true;
                 }
             }
@@ -217,6 +226,46 @@ fn meet_cmp(preds: &BTreeSet<usize>, exit_cmp: &[Option<Cmp>]) -> Option<Cmp> {
     first
 }
 
+/// Where the stack pointer stands, tracked so a function without a frame pointer
+/// (the common x64 case) still gets named locals. `sp` is `rsp`'s offset from
+/// the value it had at function entry (0 = the return address); `alias` records
+/// the registers that hold a copy of the stack pointer, such as the `rax` in
+/// MSVC's `mov rax, rsp` prologue. `None` for `sp` means "unknown here", so a
+/// stack access simply is not named rather than named wrongly.
+#[derive(Clone, PartialEq, Default)]
+struct StackSt {
+    sp: Option<i64>,
+    alias: BTreeMap<Register, i64>,
+}
+
+impl StackSt {
+    fn at_entry() -> Self {
+        StackSt {
+            sp: Some(0),
+            alias: BTreeMap::new(),
+        }
+    }
+}
+
+/// Merge the stack state across a join: `sp` survives only when every
+/// predecessor agrees, and an alias only when every predecessor holds it at the
+/// same offset. A block with no predecessors is the entry, where `rsp` is 0.
+fn meet_stack(preds: &BTreeSet<usize>, exit: &[StackSt]) -> StackSt {
+    let mut it = preds.iter();
+    let Some(&first) = it.next() else {
+        return StackSt::at_entry();
+    };
+    let mut out = exit[first].clone();
+    for &p in it {
+        let o = &exit[p];
+        if out.sp != o.sp {
+            out.sp = None;
+        }
+        out.alias.retain(|k, v| o.alias.get(k) == Some(v));
+    }
+    out
+}
+
 // ── lifting ─────────────────────────────────────────────────────────────────
 
 fn decode(raw: &[u8], ip: u64, bits: u32) -> Option<Instruction> {
@@ -255,10 +304,14 @@ struct Lift {
     /// Whether this function keeps a frame pointer (`mov ebp, esp` in the
     /// prologue). When it does, `ebp`-relative accesses become named frame slots.
     frame: bool,
+    /// The stack pointer's offset from entry, and the registers aliasing it, so a
+    /// frame-pointer-less function still gets named `rsp`-relative slots.
+    stack: StackSt,
 }
 
 type Cmp = (Expr, Expr, FlagSrc);
 
+#[allow(clippy::too_many_arguments)]
 fn lift_block(
     b: &crate::analysis::engine::BasicBlock,
     an: &Analysis,
@@ -267,11 +320,13 @@ fn lift_block(
     frame: bool,
     entry: BTreeMap<Register, Expr>,
     entry_cmp: Option<Cmp>,
-) -> (Vec<Stmt>, BTreeMap<Register, Expr>, Option<Cmp>) {
+    entry_stack: StackSt,
+) -> (Vec<Stmt>, BTreeMap<Register, Expr>, Option<Cmp>, StackSt) {
     let mut st = Lift {
         regs: entry,
         cmp: entry_cmp,
         frame,
+        stack: entry_stack,
         ..Default::default()
     };
     let mut out = Vec::new();
@@ -289,7 +344,7 @@ fn lift_block(
             &mut out,
         );
     }
-    (out, st.regs, st.cmp)
+    (out, st.regs, st.cmp, st.stack)
 }
 
 fn reg(r: Register) -> Expr {
@@ -342,25 +397,43 @@ fn reg_val(st: &Lift, r: Register) -> Expr {
         .unwrap_or_else(|| reg(r))
 }
 
+/// The sign-extended displacement of a memory operand. iced zero-extends 32-bit
+/// displacements, so a frame offset reads as `- 0x28`, not a huge constant.
+fn mem_disp(d: &Instruction) -> i64 {
+    let raw = d.memory_displacement64();
+    if raw <= 0xffff_ffff && raw & 0x8000_0000 != 0 {
+        i64::from(raw as u32 as i32)
+    } else {
+        raw as i64
+    }
+}
+
 /// The address expression of a memory operand (no dereference), substituted.
 fn mem_addr(d: &Instruction, st: &Lift) -> Expr {
     if d.is_ip_rel_memory_operand() {
         return Expr::Global(d.ip_rel_memory_address());
     }
-    // 32-bit displacements are zero-extended by iced; sign-extend so a frame
-    // offset reads as `- 0x28`, not a huge positive constant.
-    let raw = d.memory_displacement64();
-    let disp = if raw <= 0xffff_ffff && raw & 0x8000_0000 != 0 {
-        i64::from(raw as u32 as i32)
-    } else {
-        raw as i64
-    };
+    let disp = mem_disp(d);
     // A plain `[ebp +/- k]` in a frame-pointer function is a named frame slot.
     if st.frame
         && d.memory_index() == Register::None
         && matches!(d.memory_base(), Register::EBP | Register::RBP)
     {
         return Expr::Stack(disp);
+    }
+    // In a function without a frame pointer, name a slot addressed off `rsp` or a
+    // register that aliases it (MSVC's `mov rax, rsp`), using the stack pointer's
+    // tracked offset from entry.
+    if !st.frame && d.memory_index() == Register::None && d.memory_base() != Register::None {
+        let base = d.memory_base().full_register();
+        let off = if base == Register::RSP {
+            st.stack.sp
+        } else {
+            st.stack.alias.get(&base).copied()
+        };
+        if let Some(off) = off {
+            return Expr::Stack(off + disp);
+        }
     }
     let mut acc: Option<Expr> = None;
     let add = |e: Expr, acc: &mut Option<Expr>| {
@@ -397,6 +470,136 @@ fn dest(d: &Instruction, st: &Lift) -> Expr {
         OpKind::Register => reg(d.op0_register()),
         OpKind::Memory => Expr::Mem(Box::new(mem_addr(d, st))),
         _ => Expr::Opaque(operand_text(d, 0)),
+    }
+}
+
+fn is_imm(d: &Instruction, i: u32) -> bool {
+    matches!(
+        d.op_kind(i),
+        OpKind::Immediate8
+            | OpKind::Immediate16
+            | OpKind::Immediate32
+            | OpKind::Immediate64
+            | OpKind::Immediate8to16
+            | OpKind::Immediate8to32
+            | OpKind::Immediate8to64
+            | OpKind::Immediate32to64
+    )
+}
+
+/// The callee-saved (nonvolatile) registers, whose prologue save and epilogue
+/// restore are ABI housekeeping with no observable effect.
+fn is_callee_saved(r: Register) -> bool {
+    matches!(
+        r.full_register(),
+        Register::RBX
+            | Register::RBP
+            | Register::RSI
+            | Register::RDI
+            | Register::R12
+            | Register::R13
+            | Register::R14
+            | Register::R15
+    )
+}
+
+/// Whether an address expression is a named stack slot.
+fn is_stack_slot(e: &Expr) -> bool {
+    matches!(e, Expr::Stack(_))
+}
+
+/// Track the stack pointer and its aliases across one instruction, so a local
+/// addressed off `rsp` (or a copy of it) resolves to the right slot later in the
+/// function. Anything that moves the stack pointer in a way we do not model
+/// leaves it `None`, and a stack access simply stays unnamed rather than wrong.
+fn update_stack(st: &mut Lift, d: &Instruction, ptr: i64) {
+    use Mnemonic::*;
+    let m = d.mnemonic();
+    match m {
+        Push => {
+            if let Some(s) = st.stack.sp.as_mut() {
+                *s -= ptr;
+            }
+        }
+        Pop => {
+            if d.op0_kind() == OpKind::Register {
+                st.stack.alias.remove(&d.op0_register().full_register());
+            }
+            if let Some(s) = st.stack.sp.as_mut() {
+                *s += ptr;
+            }
+        }
+        // A call clobbers the caller-saved registers, so any alias in one is gone.
+        Call => {
+            for r in CALLER_SAVED {
+                st.stack.alias.remove(&r);
+            }
+        }
+        Ret => {}
+        _ if d.op0_kind() == OpKind::Register => {
+            let dst = d.op0_register().full_register();
+            let is_sp = dst == Register::RSP;
+            let mut handled = false;
+            match m {
+                Mov if d.op1_kind() == OpKind::Register => {
+                    let src = d.op1_register().full_register();
+                    let srcval = if src == Register::RSP {
+                        st.stack.sp
+                    } else {
+                        st.stack.alias.get(&src).copied()
+                    };
+                    if is_sp {
+                        st.stack.sp = srcval;
+                        handled = true;
+                    } else if let Some(o) = srcval {
+                        st.stack.alias.insert(dst, o);
+                        handled = true;
+                    }
+                }
+                Lea if d.memory_index() == Register::None => {
+                    let base = d.memory_base().full_register();
+                    let bo = if base == Register::RSP {
+                        st.stack.sp
+                    } else {
+                        st.stack.alias.get(&base).copied()
+                    };
+                    if let Some(bo) = bo {
+                        let off = bo + mem_disp(d);
+                        if is_sp {
+                            st.stack.sp = Some(off);
+                        } else {
+                            st.stack.alias.insert(dst, off);
+                        }
+                        handled = true;
+                    }
+                }
+                Add | Sub if is_imm(d, 1) => {
+                    let mut delta = d.immediate(1) as i64;
+                    if m == Sub {
+                        delta = -delta;
+                    }
+                    if is_sp {
+                        if let Some(s) = st.stack.sp.as_mut() {
+                            *s += delta;
+                        }
+                        handled = true;
+                    } else if let Some(o) = st.stack.alias.get(&dst).copied() {
+                        st.stack.alias.insert(dst, o + delta);
+                        handled = true;
+                    }
+                }
+                _ => {}
+            }
+            if !handled {
+                // The register got some other value, so it no longer aliases the
+                // stack pointer; an unmodelled write to `rsp` makes it unknown.
+                st.stack.alias.remove(&dst);
+                if is_sp {
+                    st.stack.sp = None;
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -520,16 +723,31 @@ fn lift_insn(
         st.cmp = None;
     }
 
+    let ptr = if an.bits == 64 { 8 } else { 4 };
+    update_stack(st, d, ptr);
+
     if let Some(s) = stmt {
         update_state(st, &s);
-        // Drop pure stack bookkeeping: any write to the stack pointer (frame
-        // allocation and cleanup) and, in a frame-pointer function, any write to
-        // the frame pointer (`mov ebp, esp`, `pop ebp`). Their values are never
-        // rendered, so the statements are noise.
+        // Drop pure stack bookkeeping so it does not clutter the output:
+        //   - any write to the stack pointer (frame allocation and cleanup), and
+        //     the frame-pointer setup/teardown in a frame-pointer function;
+        //   - a copy of the stack/frame pointer into a register (the frame-base
+        //     alias, `mov rax, rsp`), which the stack tracker has already noted;
+        //   - a callee-saved register spilled to, or restored from, a stack slot.
+        // None of these have an observable effect, so hiding them is faithful.
         let housekeeping = matches!(
             &s,
             Stmt::Set(Expr::Reg(root, _), _)
                 if *root == Register::RSP || (st.frame && *root == Register::RBP)
+        ) || matches!(
+            &s,
+            Stmt::Set(Expr::Reg(..), Expr::Reg(sr, _)) if is_stack_reg(*sr)
+        ) || matches!(
+            &s,
+            Stmt::Set(Expr::Mem(a), Expr::Reg(sr, _)) if is_callee_saved(*sr) && is_stack_slot(a)
+        ) || matches!(
+            &s,
+            Stmt::Set(Expr::Reg(dr, _), Expr::Mem(a)) if is_callee_saved(*dr) && is_stack_slot(a)
         );
         if !housekeeping {
             out.push(s);
@@ -1795,6 +2013,58 @@ mod tests {
         let an = engine::analyze(&bin, &bytes, 10_000, &Db::default());
         let f = an.find_function(va).unwrap();
         decompile(&an, &bin, f)
+    }
+
+    /// The same, for a 64-bit PE with no import slot.
+    fn lines_x64_raw(code: Vec<u8>) -> Vec<Line> {
+        let va = 0x1000u64;
+        let mut bin = Binary::stub(Format::Pe, Arch::X86_64);
+        bin.entry = va;
+        bin.sections = vec![Section {
+            name: ".text".into(),
+            vaddr: va,
+            vsize: code.len() as u64,
+            file_off: va,
+            file_size: code.len() as u64,
+            entropy: 0.0,
+            read: true,
+            write: false,
+            exec: true,
+        }];
+        let mut bytes = vec![0u8; va as usize];
+        bytes.extend_from_slice(&code);
+        let an = engine::analyze(&bin, &bytes, 10_000, &Db::default());
+        let f = an.find_function(va).unwrap();
+        decompile(&an, &bin, f)
+    }
+
+    #[test]
+    fn x64_rsp_locals_are_named_and_the_prologue_is_dropped() {
+        // The MSVC x64 shape: mov rax,rsp; save a register through it; allocate a
+        // frame; then read an argument and write a local off rsp.
+        let code = vec![
+            0x48, 0x8b, 0xc4, // mov rax, rsp        (frame-base alias)
+            0x48, 0x89, 0x58, 0x08, // mov [rax+8], rbx   (nonvolatile spill)
+            0x48, 0x83, 0xec, 0x28, // sub rsp, 0x28      (frame allocation)
+            0x89, 0x54, 0x24, 0x20, // mov [rsp+0x20], edx  -> var_8
+            0x8b, 0x44, 0x24, 0x30, // mov eax, [rsp+0x30]  -> arg_8 (returned)
+            0xc3, // ret
+        ];
+        let joined = lines_x64_raw(code)
+            .into_iter()
+            .map(|l| l.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("eax = arg_8;") && joined.contains("var_8 = edx;"),
+            "rsp-relative locals should be named, got:\n{joined}"
+        );
+        for gone in ["rax = rsp", "= rbx", "rsp -", "*(rsp"] {
+            assert!(
+                !joined.contains(gone),
+                "stack bookkeeping `{gone}` should be gone, got:\n{joined}"
+            );
+        }
     }
 
     #[test]

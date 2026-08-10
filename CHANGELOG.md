@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `pseudo`: x64 stack frames. A function without a frame pointer (the common x64
+  case) now gets named locals and arguments too: the stack pointer is tracked
+  through the prologue and across blocks, and the registers that alias it (MSVC's
+  `mov rax, rsp`) are followed, so `[rsp + 0x30]` reads `arg_8` and a spill slot
+  reads `var_8`. The frame-base copy, the frame allocation, and the callee-saved
+  register spills and restores are dropped as the pure bookkeeping they are.
 - `tui`: a sinks pane. `s` toggles the left pane between the function list and
   the ranked attack surface (the argument-provenance audit, most severe first);
   `↵` on a sink jumps straight to its call site in the listing. This puts the
