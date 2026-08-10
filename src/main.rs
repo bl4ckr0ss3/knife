@@ -5,6 +5,8 @@
 mod analysis;
 mod db;
 mod formats;
+#[cfg(feature = "gui")]
+mod gui;
 mod listing;
 mod model;
 mod output;
@@ -159,6 +161,8 @@ enum Command {
     Db { file: String },
     /// Open the interactive view: functions, listing, xrefs, naming and notes.
     Tui { file: String },
+    /// Open the windowed view (functions, disassembly, decompiler, xrefs).
+    Gui { file: String },
     /// Recover and list functions (control-flow analysis, x86/x64).
     Funcs {
         file: String,
@@ -223,6 +227,7 @@ fn real_main() -> Result<()> {
         "note",
         "db",
         "tui",
+        "gui",
         "hex",
         "map",
         "scan",
@@ -314,6 +319,7 @@ fn real_main() -> Result<()> {
         ),
         Command::Db { file } => cmd_db(&file, cli.db.as_deref(), cli.json),
         Command::Tui { file } => cmd_tui(&file, cli.db.as_deref()),
+        Command::Gui { file } => cmd_gui(&file, cli.db.as_deref()),
         Command::Funcs { file, by_refs } => cmd_funcs(&file, by_refs, cli.json, cli.db.as_deref()),
         Command::Hex { file, off, len } => cmd_hex(&file, off, len),
         Command::Map { file, buckets } => cmd_map(&file, buckets, cli.json),
@@ -451,6 +457,24 @@ fn cmd_tui(file: &str, db_path: Option<&str>) -> Result<()> {
     let title = basename(file).to_string();
     let app = tui::App::new(sess.bin, sess.bytes, sess.db, sess.an, title);
     tui::run(app)
+}
+
+#[cfg(feature = "gui")]
+fn cmd_gui(file: &str, db_path: Option<&str>) -> Result<()> {
+    let sess = Session::open(file, db_path, ANALYSIS_BUDGET, "the windowed view")?;
+    if sess.an.functions.is_empty() {
+        anyhow::bail!("no functions were recovered, so there is nothing to browse");
+    }
+    let title = basename(file).to_string();
+    gui::run(sess.bin, sess.bytes, sess.db, sess.an, title)
+}
+
+#[cfg(not(feature = "gui"))]
+fn cmd_gui(_file: &str, _db_path: Option<&str>) -> Result<()> {
+    anyhow::bail!(
+        "this build has no GUI; rebuild with the `gui` feature:\n  \
+         cargo install --path . --features gui"
+    )
 }
 
 fn cmd_db(file: &str, db_path: Option<&str>, as_json: bool) -> Result<()> {
