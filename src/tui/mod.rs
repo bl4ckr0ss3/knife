@@ -35,6 +35,23 @@ pub enum LeftView {
     Sinks,
 }
 
+/// Which way the reference pane points: to what is under the cursor (callers),
+/// or from the current function (callees).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefView {
+    To,
+    From,
+}
+
+/// One row in the reference pane: a jump target, the site shown, its kind (for
+/// colour), and the function or import it names.
+pub struct XRow {
+    pub jump: u64,
+    pub site: u64,
+    pub kind: &'static str,
+    pub label: String,
+}
+
 /// What a prompt at the bottom of the screen is collecting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ask {
@@ -122,6 +139,9 @@ pub struct App {
     // ── in-listing search ──
     /// The last text searched for in the listing, so repeating advances.
     pub search: String,
+
+    /// Whether the reference pane shows callers (to) or callees (from).
+    pub refview: RefView,
 }
 
 impl App {
@@ -165,6 +185,7 @@ impl App {
             left: LeftView::Functions,
             ssel: 0,
             search: String::new(),
+            refview: RefView::To,
         };
         app.refilter();
         // Open something immediately: an empty right-hand pane makes the tool
@@ -460,51 +481,113 @@ impl App {
         self.focus = Focus::Listing;
     }
 
-    /// Cross-references to whatever is under the cursor.
-    pub fn xrefs(&self) -> (u64, &[engine::Xref]) {
-        let at = self.cursor_addr().or(self.cur).unwrap_or(0);
-        (
-            at,
-            self.an.xrefs_to.get(&at).map(Vec::as_slice).unwrap_or(&[]),
-        )
+    /// The address the reference pane keys off: whatever is under the cursor.
+    pub fn xref_at(&self) -> u64 {
+        self.cursor_addr().or(self.cur).unwrap_or(0)
     }
 
-    /// The reference the cursor in the xrefs pane is on.
-    pub fn selected_xref(&self) -> Option<engine::Xref> {
-        let (_, refs) = self.xrefs();
-        refs.get(self.xsel).copied()
+    /// The name of a call/reference site: its function, with an offset when the
+    /// site is inside one rather than at its head.
+    fn site_name(&self, addr: u64) -> String {
+        match self.an.function_at(addr) {
+            Some(fun) => {
+                let off = addr.saturating_sub(fun.addr);
+                if off == 0 {
+                    fun.name.clone()
+                } else {
+                    format!("{}+0x{off:x}", fun.name)
+                }
+            }
+            None => "-".into(),
+        }
+    }
+
+    /// The reference pane's rows: callers of what is under the cursor, or the
+    /// callees of the current function.
+    pub fn xref_rows(&self) -> Vec<XRow> {
+        match self.refview {
+            RefView::To => {
+                let at = self.xref_at();
+                self.an
+                    .xrefs_to
+                    .get(&at)
+                    .map(|v| {
+                        v.iter()
+                            .map(|x| XRow {
+                                jump: x.from,
+                                site: x.from,
+                                kind: x.kind.label(),
+                                label: self.site_name(x.from),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+            RefView::From => {
+                let mut seen = std::collections::BTreeSet::new();
+                let mut rows = Vec::new();
+                for l in &self.lines {
+                    let Some(t) = l.target() else { continue };
+                    if !seen.insert(t) {
+                        continue;
+                    }
+                    let name = self
+                        .an
+                        .find_function(t)
+                        .map(|f| f.name.clone())
+                        .or_else(|| self.an.imports.get(&t).cloned());
+                    if let Some(name) = name {
+                        rows.push(XRow {
+                            jump: t,
+                            site: l.addr(),
+                            kind: "call",
+                            label: name,
+                        });
+                    }
+                }
+                rows
+            }
+        }
     }
 
     pub fn clamp_xsel(&mut self) {
-        let n = self.xrefs().1.len();
-        if n == 0 {
-            self.xsel = 0;
-        } else {
-            self.xsel = self.xsel.min(n - 1);
-        }
+        let n = self.xref_rows().len();
+        self.xsel = if n == 0 { 0 } else { self.xsel.min(n - 1) };
     }
 
     pub fn move_xsel(&mut self, delta: isize) {
-        let n = self.xrefs().1.len();
+        let n = self.xref_rows().len();
         if n == 0 {
             self.xsel = 0;
             return;
         }
-        let last = n - 1;
-        self.xsel = self.xsel.saturating_add_signed(delta).min(last);
+        self.xsel = self.xsel.saturating_add_signed(delta).min(n - 1);
     }
 
-    /// Follow the xref under the cursor: jump to wherever it points.
+    pub fn toggle_refs(&mut self) {
+        self.refview = match self.refview {
+            RefView::To => RefView::From,
+            RefView::From => RefView::To,
+        };
+        self.xsel = 0;
+    }
+
+    /// Follow the reference under the cursor: jump to where it points.
     pub fn jump_xref(&mut self) {
-        let Some(x) = self.selected_xref() else {
+        let rows = self.xref_rows();
+        let Some(row) = rows.get(self.xsel) else {
             self.status = "no reference under the cursor".into();
             return;
         };
-        if self.an.function_at(x.from).is_none() && self.an.find_function(x.from).is_none() {
-            self.status = format!("0x{:x} is not in a recovered function", x.from + self.base);
+        let t = row.jump;
+        if self.an.function_at(t).is_none() && self.an.find_function(t).is_none() {
+            self.status = match self.an.imports.get(&t) {
+                Some(n) => format!("{n} is imported; there is no body to show"),
+                None => format!("0x{:x} is not in a recovered function", t + self.base),
+            };
             return;
         }
-        self.open(x.from, true);
+        self.open(t, true);
         self.focus = Focus::Listing;
     }
 
@@ -694,6 +777,7 @@ impl App {
             KeyCode::Char('n') => self.ask(Ask::Name),
             KeyCode::Char('c') => self.ask(Ask::Note),
             KeyCode::Char('s') => self.toggle_sinks(),
+            KeyCode::Char('x') => self.toggle_refs(),
             KeyCode::Char('d') => {
                 self.toggle_pseudo();
                 self.focus = Focus::Listing;
@@ -760,7 +844,7 @@ impl App {
         } else {
             (
                 Focus::Xrefs,
-                self.xrefs().1.len(),
+                self.xref_rows().len(),
                 row - (h.saturating_sub(1) - xrefs_h),
             )
         };
@@ -980,6 +1064,29 @@ mod tests {
         app.move_ssel(-1);
         app.open_sink();
         assert_eq!(app.ssel, 0);
+    }
+
+    #[test]
+    fn the_reference_pane_toggles_callers_and_callees() {
+        let mut app = two_functions();
+        app.focus = Focus::Listing;
+        // Callees of entry: it calls sub_100b.
+        app.open(0x1000, false);
+        app.refview = RefView::From;
+        let rows = app.xref_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].jump, 0x100b);
+        // Callers of sub_100b: entry, from 0x1000.
+        app.open(0x100b, false);
+        app.refview = RefView::To;
+        let rows = app.xref_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].jump, 0x1000);
+        // Toggling flips the view and resets the selection.
+        app.xsel = 5;
+        app.toggle_refs();
+        assert_eq!(app.refview, RefView::From);
+        assert_eq!(app.xsel, 0);
     }
 
     #[test]
@@ -1204,7 +1311,7 @@ mod tests {
         let mut app = two_functions();
         // sub_100b is called once, from 0x1000.
         app.open(0x100b, false);
-        assert_eq!(app.xrefs().1.len(), 1);
+        assert_eq!(app.xref_rows().len(), 1);
         app.focus = Focus::Xrefs;
         app.on_key(KeyEvent::from(KeyCode::Enter));
         assert_eq!(app.cur, Some(0x1000), "jumped to the call site");

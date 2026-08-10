@@ -3,8 +3,7 @@
 //! The palette is the same one the printed output uses, so the interactive view
 //! and the reports look like the same tool.
 
-use super::{App, Focus, LeftView, Line};
-use crate::analysis::engine::XrefKind;
+use super::{App, Focus, LeftView, Line, RefView};
 use crate::listing::Annot;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -367,51 +366,55 @@ fn pseudo(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn xrefs(f: &mut Frame, area: Rect, app: &App) {
-    let (at, refs) = app.xrefs();
+    let rows = app.xref_rows();
     let focused = app.focus == Focus::Xrefs;
-    let title = format!("xrefs to 0x{:x} ({})", at + app.an.display_base, refs.len());
+    let title = match app.refview {
+        RefView::To => format!(
+            "xrefs to 0x{:x} ({})",
+            app.xref_at() + app.an.display_base,
+            rows.len()
+        ),
+        RefView::From => {
+            let name = app.cur.map(|a| app.an.label(a)).unwrap_or_default();
+            format!("calls from {name} ({})", rows.len())
+        }
+    };
 
-    let items: Vec<ListItem> = if refs.is_empty() {
+    let empty = if app.refview == RefView::To {
+        " no references"
+    } else {
+        " no calls"
+    };
+    let items: Vec<ListItem> = if rows.is_empty() {
         vec![ListItem::new(TLine::from(Span::styled(
-            " no references",
+            empty,
             Style::default().fg(faint()),
         )))]
     } else {
-        refs.iter()
-            .map(|x| {
-                let site = match app.an.function_at(x.from) {
-                    Some(fun) => {
-                        let off = x.from.saturating_sub(fun.addr);
-                        if off == 0 {
-                            fun.name.clone()
-                        } else {
-                            format!("{}+0x{off:x}", fun.name)
-                        }
-                    }
-                    None => "-".into(),
-                };
+        rows.iter()
+            .map(|row| {
                 ListItem::new(TLine::from(vec![
                     Span::styled(
-                        format!(" {:>12x}  ", x.from + app.an.display_base),
+                        format!(" {:>12x}  ", row.site + app.an.display_base),
                         Style::default().fg(faint()),
                     ),
                     Span::styled(
-                        format!("{:<7}", x.kind.label()),
-                        Style::default().fg(match x.kind {
-                            XrefKind::Call => mint(),
-                            XrefKind::Data => muted(),
+                        format!("{:<7}", row.kind),
+                        Style::default().fg(match row.kind {
+                            "call" => mint(),
+                            "data" => muted(),
                             _ => amber(),
                         }),
                     ),
-                    Span::styled(site, Style::default().fg(muted())),
+                    Span::styled(row.label.clone(), Style::default().fg(muted())),
                 ]))
             })
             .collect()
     };
 
     let mut state = ListState::default();
-    if !refs.is_empty() {
-        state.select(Some(app.xsel.min(refs.len() - 1)));
+    if !rows.is_empty() {
+        state.select(Some(app.xsel.min(rows.len() - 1)));
     }
     f.render_stateful_widget(
         List::new(items)
@@ -451,7 +454,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(
         Paragraph::new(TLine::from(Span::styled(
             format!(
-                " db {} · ↵ open/follow{jump} ⌫ back   {find}   g goto   s {left}   d {mode}   n name   c note   ? help   q quit",
+                " db {} · ↵ open/follow{jump} ⌫ back   {find}   g goto   s {left}   x {refs}   d {mode}   n name   c note   ? help   q quit",
                 app.db.len(),
                 jump = if app.focus == Focus::Xrefs {
                     " (jump to ref)"
@@ -460,6 +463,7 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
                 },
                 find = if app.focus == Focus::Listing { "/ search" } else { "/ filter" },
                 left = if app.left == LeftView::Sinks { "funcs" } else { "sinks" },
+                refs = if app.refview == RefView::To { "callees" } else { "callers" },
                 mode = if app.pseudo { "asm" } else { "pseudo" },
             ),
             Style::default().fg(faint()),
@@ -484,6 +488,8 @@ fn help(f: &mut Frame, area: Rect) {
         "                 listing is focused (/↵ repeats, jumping to the next hit)",
         "  s              toggle the left pane between functions and sinks (the",
         "                 ranked attack surface); ↵ on a sink jumps to its call",
+        "  x              toggle the reference pane between callers (xrefs to the",
+        "                 cursor) and callees (the calls the function makes)",
         "  g              go to an address or a symbol",
         "  d              toggle decompiled pseudocode for the current function",
         "  n              name what is under the cursor (empty clears it)",

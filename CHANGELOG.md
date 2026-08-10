@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `tui`: callees. `x` toggles the reference pane between callers (xrefs to what
+  is under the cursor) and callees (the calls the current function makes), so the
+  call graph is navigable both directions; `↵` jumps either way.
 - `pseudo`: conditional idioms. `setcc` reads as the boolean it computes
   (`al = ecx == edx`) and `cmovcc` as a ternary (`rax = rax == rbx ? rcx : rax`),
   so neither shows up as an opaque `asm(...)` any more.
