@@ -145,9 +145,18 @@ fn functions(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn listing(f: &mut Frame, area: Rect, app: &App) {
+    if app.pseudo {
+        pseudo(f, area, app);
+        return;
+    }
     let focused = app.focus == Focus::Listing;
     let title = match app.cur {
-        Some(a) => format!("{} @ 0x{:x}", app.an.label(a), a + app.an.display_base),
+        Some(a) => format!(
+            "{} @ 0x{:x}{}",
+            app.an.label(a),
+            a + app.an.display_base,
+            position(app.cursor, app.lines.len())
+        ),
         None => "listing".into(),
     };
 
@@ -204,6 +213,94 @@ fn listing(f: &mut Frame, area: Rect, app: &App) {
     let mut state = ListState::default();
     if !app.lines.is_empty() {
         state.select(Some(app.cursor));
+    }
+    f.render_stateful_widget(
+        List::new(items)
+            .block(pane(&title, focused))
+            .highlight_style(Style::default().bg(Color::Rgb(0x2a, 0x26, 0x3a)))
+            .highlight_symbol("›"),
+        area,
+        &mut state,
+    );
+}
+
+/// Colour a line of pseudocode: keywords stand out, everything else is muted.
+fn pseudo_spans(text: &str) -> Vec<Span<'static>> {
+    const KW: &[&str] = &[
+        "if", "else", "while", "switch", "case", "break", "continue", "goto", "return", "do", "for",
+    ];
+    let mut spans = Vec::new();
+    let mut buf = String::new();
+    let mut buf_word = false;
+    let flush = |buf: &mut String, word: bool, spans: &mut Vec<Span<'static>>| {
+        if buf.is_empty() {
+            return;
+        }
+        let color = if word && KW.contains(&buf.as_str()) {
+            accent()
+        } else {
+            muted()
+        };
+        spans.push(Span::styled(
+            std::mem::take(buf),
+            Style::default().fg(color),
+        ));
+    };
+    for ch in text.chars() {
+        let word = ch.is_alphanumeric() || ch == '_';
+        if word != buf_word {
+            flush(&mut buf, buf_word, &mut spans);
+            buf_word = word;
+        }
+        buf.push(ch);
+    }
+    flush(&mut buf, buf_word, &mut spans);
+    spans
+}
+
+fn pseudo(f: &mut Frame, area: Rect, app: &App) {
+    let focused = app.focus == Focus::Listing;
+    let title = match app.cur {
+        Some(a) => format!(
+            "pseudocode · {} @ 0x{:x}{}",
+            app.an.label(a),
+            a + app.an.display_base,
+            position(app.cursor, app.pseudo_lines.len())
+        ),
+        None => "pseudocode".into(),
+    };
+
+    let mut items: Vec<ListItem> = app
+        .pseudo_lines
+        .iter()
+        .map(|l| {
+            if l.label {
+                // A jump label reads like one; the signature and braces are the
+                // structure, so they take the accent.
+                let color = if l.text.trim_end().ends_with(':') {
+                    amber()
+                } else {
+                    accent()
+                };
+                ListItem::new(TLine::from(Span::styled(
+                    l.text.clone(),
+                    Style::default().fg(color),
+                )))
+            } else {
+                ListItem::new(TLine::from(pseudo_spans(&l.text)))
+            }
+        })
+        .collect();
+    if items.is_empty() {
+        items.push(ListItem::new(TLine::from(Span::styled(
+            "  (no pseudocode for this view)",
+            Style::default().fg(faint()),
+        ))));
+    }
+
+    let mut state = ListState::default();
+    if !app.pseudo_lines.is_empty() {
+        state.select(Some(app.cursor.min(app.pseudo_lines.len() - 1)));
     }
     f.render_stateful_widget(
         List::new(items)
@@ -300,13 +397,14 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(
         Paragraph::new(TLine::from(Span::styled(
             format!(
-                " db {} · ↵ open/follow{jump} ⌫ back   / filter   g goto   n name   c note   ? help   q quit",
+                " db {} · ↵ open/follow{jump} ⌫ back   / filter   g goto   d {mode}   n name   c note   ? help   q quit",
                 app.db.len(),
                 jump = if app.focus == Focus::Xrefs {
                     " (jump to ref)"
                 } else {
                     ""
                 },
+                mode = if app.pseudo { "asm" } else { "pseudo" },
             ),
             Style::default().fg(faint()),
         ))),
@@ -328,6 +426,7 @@ fn help(f: &mut Frame, area: Rect) {
         "",
         "  /              filter the function list by name",
         "  g              go to an address or a symbol",
+        "  d              toggle decompiled pseudocode for the current function",
         "  n              name what is under the cursor (empty clears it)",
         "  c              note what is under the cursor (empty clears it)",
         "  r              re-analyse",
@@ -355,6 +454,16 @@ fn help(f: &mut Frame, area: Rect) {
         .block(pane("keys", true)),
         box_area,
     );
+}
+
+/// A ` · row/total` suffix for a pane title, so the position in a long listing
+/// is visible; empty when there is nothing to place.
+fn position(cursor: usize, total: usize) -> String {
+    if total == 0 {
+        String::new()
+    } else {
+        format!(" · {}/{}", cursor + 1, total)
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {

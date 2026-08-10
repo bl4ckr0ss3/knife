@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `tui`: the listing pane toggles to decompiled pseudocode with `d`, so the
+  structured `if`/`else`/`while`/`switch` view is available interactively next to
+  the disassembly. It follows the selected function as you navigate, keywords are
+  highlighted, and the pane title shows the row position in long listings.
 - `pseudo`: a decompiler engine built on a typed IR. It lifts each instruction,
   propagates expressions, eliminates dead stores with a whole-function liveness
   pass, and folds constants, so a call renders with its recovered arguments and

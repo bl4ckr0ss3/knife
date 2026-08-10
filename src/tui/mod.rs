@@ -75,6 +75,12 @@ pub struct App {
     pub cur: Option<u64>,
     pub lines: Vec<Line>,
     pub cursor: usize,
+    /// When set, the listing pane shows decompiled pseudocode for the current
+    /// function instead of the disassembly.
+    pub pseudo: bool,
+    /// The decompiled lines for the current function, rebuilt when it changes
+    /// while pseudocode is showing.
+    pub pseudo_lines: Vec<crate::analysis::ir::Line>,
 
     // ── the rest ──
     pub focus: Focus,
@@ -112,6 +118,8 @@ impl App {
             cur: None,
             lines: Vec::new(),
             cursor: 0,
+            pseudo: false,
+            pseudo_lines: Vec::new(),
             focus: Focus::Functions,
             prompt: None,
             history: Vec::new(),
@@ -224,6 +232,44 @@ impl App {
         {
             self.sel = p;
         }
+        if self.pseudo {
+            self.recompute_pseudo();
+            self.cursor = 0;
+        }
+    }
+
+    /// The number of rows the listing pane is currently showing, which is the
+    /// pseudocode length when that view is on and the disassembly length
+    /// otherwise. Navigation and mouse mapping both clamp to it.
+    pub fn listing_len(&self) -> usize {
+        if self.pseudo {
+            self.pseudo_lines.len()
+        } else {
+            self.lines.len()
+        }
+    }
+
+    /// Rebuild the decompiled lines for the current function.
+    fn recompute_pseudo(&mut self) {
+        self.pseudo_lines.clear();
+        if let Some(addr) = self.cur {
+            if let Some(f) = self.an.find_function(addr) {
+                self.pseudo_lines = crate::analysis::ir::decompile(&self.an, &self.bin, f);
+            }
+        }
+    }
+
+    /// Switch the listing pane between disassembly and decompiled pseudocode.
+    pub fn toggle_pseudo(&mut self) {
+        if !self.pseudo {
+            self.recompute_pseudo();
+            if self.pseudo_lines.is_empty() {
+                self.status = "no pseudocode here: open a recovered function first".into();
+                return;
+            }
+        }
+        self.pseudo = !self.pseudo;
+        self.cursor = 0;
     }
 
     /// Does the address lie inside a mapped section? The data-view entry
@@ -242,17 +288,20 @@ impl App {
     }
 
     pub fn move_cursor(&mut self, delta: isize) {
-        if self.lines.is_empty() {
+        let len = self.listing_len();
+        if len == 0 {
             return;
         }
-        let last = self.lines.len() - 1;
-        self.cursor = self.cursor.saturating_add_signed(delta).min(last);
+        self.cursor = self.cursor.saturating_add_signed(delta).min(len - 1);
     }
 
     /// The address the cursor is on, which is what a name, note, or
     /// cross-reference lookup applies to.
     pub fn cursor_addr(&self) -> Option<u64> {
         match self.focus {
+            // A pseudocode line has no address of its own, so naming and noting
+            // in that view apply to the function as a whole.
+            Focus::Listing if self.pseudo => self.cur,
             Focus::Listing => self.lines.get(self.cursor).map(Line::addr),
             Focus::Functions => self.selected_addr(),
             // Naming/noting want the address of interest; the xrefs pane
@@ -265,6 +314,10 @@ impl App {
     /// control-flow target falls back to its data operand, opening the
     /// referenced bytes when they are not code.
     pub fn follow(&mut self) {
+        if self.pseudo {
+            self.status = "switch to the disassembly (d) to follow a call".into();
+            return;
+        }
         let line = self.lines.get(self.cursor);
         if let Some(t) = line.and_then(Line::target) {
             // An import slot has a name but no body; say so rather than failing.
@@ -428,12 +481,14 @@ impl App {
         if let Some(addr) = self.cur {
             if let Some(f) = self.an.find_function(addr) {
                 self.lines = listing::function(&self.an, f, &self.db, self.base, &self.strings);
-                self.cursor = self.cursor.min(self.lines.len().saturating_sub(1));
             } else if engine::va_to_off(&self.bin, self.base, addr).is_some() {
                 self.lines = listing::data_view(&self.bin, self.base, &self.bytes, addr);
-                self.cursor = self.cursor.min(self.lines.len().saturating_sub(1));
             }
         }
+        if self.pseudo {
+            self.recompute_pseudo();
+        }
+        self.cursor = self.cursor.min(self.listing_len().saturating_sub(1));
     }
 
     pub fn reanalyze(&mut self) {
@@ -517,6 +572,10 @@ impl App {
             KeyCode::Char('g') => self.ask(Ask::Goto),
             KeyCode::Char('n') => self.ask(Ask::Name),
             KeyCode::Char('c') => self.ask(Ask::Note),
+            KeyCode::Char('d') => {
+                self.toggle_pseudo();
+                self.focus = Focus::Listing;
+            }
             KeyCode::Char('r') => {
                 self.reanalyze();
                 self.status = "re-analysed".into();
@@ -566,7 +625,7 @@ impl App {
         let (focus, list_len, pane_row) = if column < fns_w {
             (Focus::Functions, self.order.len(), row)
         } else if row + xrefs_h < h.saturating_sub(1) {
-            (Focus::Listing, self.lines.len(), row)
+            (Focus::Listing, self.listing_len(), row)
         } else {
             (
                 Focus::Xrefs,
@@ -602,7 +661,7 @@ impl App {
                             self.open(a, false);
                         }
                     }
-                    Focus::Listing => self.cursor = idx.min(self.lines.len().saturating_sub(1)),
+                    Focus::Listing => self.cursor = idx.min(self.listing_len().saturating_sub(1)),
                     Focus::Xrefs => self.xsel = idx,
                 }
             }
@@ -733,6 +792,57 @@ mod tests {
     }
 
     #[test]
+    fn toggling_pseudocode_shows_decompiled_lines_and_back_to_asm() {
+        let mut app = two_functions();
+        app.open(0x1000, false);
+        let asm = app.lines.len();
+        assert!(!app.pseudo);
+
+        app.toggle_pseudo();
+        assert!(app.pseudo, "the pseudocode view is on");
+        assert!(!app.pseudo_lines.is_empty(), "and it has decompiled lines");
+        assert_eq!(app.cursor, 0, "the cursor resets to the top");
+        // Navigation now clamps to the pseudocode, not the disassembly.
+        app.focus = Focus::Listing;
+        app.move_cursor(10_000);
+        assert!(app.cursor < app.pseudo_lines.len());
+
+        app.toggle_pseudo();
+        assert!(!app.pseudo, "toggles back to disassembly");
+        assert_eq!(app.lines.len(), asm, "and the disassembly is intact");
+    }
+
+    #[test]
+    fn following_in_the_pseudocode_view_asks_to_switch() {
+        let mut app = two_functions();
+        app.open(0x1000, false);
+        app.toggle_pseudo();
+        app.focus = Focus::Listing;
+        app.follow();
+        assert!(app.status.contains("disassembly"));
+        assert!(
+            app.pseudo,
+            "following did not navigate away from pseudocode"
+        );
+    }
+
+    #[test]
+    fn changing_function_in_pseudo_mode_recomputes_it() {
+        let mut app = two_functions();
+        app.open(0x1000, false);
+        app.toggle_pseudo();
+        let first = app.pseudo_lines.clone();
+        app.open(0x100b, false); // the callee
+        assert!(app.pseudo, "still in pseudocode mode");
+        assert!(!app.pseudo_lines.is_empty());
+        // A different function decompiles to different text.
+        assert_ne!(
+            first.iter().map(|l| &l.text).collect::<Vec<_>>(),
+            app.pseudo_lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn back_with_no_history_says_so_instead_of_panicking() {
         let mut app = two_functions();
         app.history.clear();
@@ -827,6 +937,16 @@ mod tests {
         assert!(out.contains("entry"), "and lists what was recovered");
         assert!(out.contains("xrefs"), "the xref pane is drawn");
         assert!(out.contains("open/follow"), "the key hints are drawn");
+    }
+
+    #[test]
+    fn the_pseudocode_view_renders() {
+        let mut app = two_functions();
+        app.open(0x1000, false);
+        app.toggle_pseudo();
+        let out = rendered(&app, 110, 30);
+        assert!(out.contains("pseudocode"), "the pseudocode pane is drawn");
+        assert!(out.contains("sub_"), "and shows a decompiled signature");
     }
 
     #[test]
