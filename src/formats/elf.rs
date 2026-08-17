@@ -81,6 +81,7 @@ pub fn build(path: &str, bytes: &[u8], elf: Elf) -> Binary {
         vec![ImportedLib {
             name: "(dynamic symbols)".to_string(),
             functions: imports_fns,
+            ordinals: Vec::new(),
         }]
     };
 

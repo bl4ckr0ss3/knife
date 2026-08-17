@@ -1,7 +1,31 @@
 # Changelog
 
-## Unreleased
+## v1.6.0
 
+- `drv`: kernel-driver and BYOVD analysis (`knife drv FILE`). Reads identity
+  (publisher, version info, Authenticode signature state), the devices and
+  symbolic links it exposes, IRP dispatch handlers, the IOCTL surface, and the
+  kernel primitives each handler reaches. `--reachable` keeps only what
+  user-mode code can actually drive, so accidental surface does not inflate the
+  report. A persistence scanner pulls the Authenticode chain out of the
+  certificate table; a bundled snapshot of the loldrivers project
+  (`data/loldrivers.json`) flags matching known-vulnerable samples by SHA-256;
+  and Windows kernel export ordinal imports are resolved from a generated table
+  when `ntoskrnl` symbols are stripped.
+- `patch`, `graph`, `typelib`, `var`, `proto`: a persistent analyst workspace.
+  Binary edits are staged non-destructively (`knife patch --bytes/--clear/
+  --export`) and replay through every command, then export atomically; user
+  structure layouts import/export between binaries (`typelib`); and
+  function-scoped pseudocode variable and prototype overrides round-trip
+  through the database. The TUI edits all of it in place.
+- `graph FUNC --dot`: one function's control-flow graph as deterministic text,
+  JSON, or Graphviz, stable ordering and DOT-escaped symbols.
+- Versioned persistent per-target analysis cache: the second pass over a binary
+  is warm for every command, and the key is the file hash + names digest so your
+  analyst facts always invalidate it.
+- C++ / MSVC / Rust demangling for recovered function names.
+- `diff`: compares two binaries' functions, imports, and sections and exits 1
+  on any change.
 - `mcp`: a Model Context Protocol server (`knife mcp`), a JSON-RPC 2.0 stream over
   stdio that exposes the analysis as agent tools: `list_functions`, `disassemble`,
   `decompile`, `audit`, `xrefs`, `info`. It reuses the same engine, decompiler,
@@ -37,6 +61,14 @@
   `g_<addr>` otherwise, so `*(0x45519c)` becomes `g_45519c` and a struct field
   through a global pointer reads `*(g_4641d4 + 0xb2)` instead of nested
   dereferences of a bare number.
+- Robustness: the decompiler now bounds expression propagation so no hostile
+  file can drive a stack overflow through `pseudo`, the torture harness
+  exercises the decompiler itself, runtime MCP frames are capped, each MCP
+  request is contained against panics, `hex`/`dis`/`db` reject or survive
+  overflowing and mutually-exclusive inputs, and the stats-performance fix
+  makes device-string scan linear.
+- The experimental native GUI and its dependencies are removed from the
+  release; the crate ships the CLI/TUI/MCP only.
 
 ## v1.5.0
 

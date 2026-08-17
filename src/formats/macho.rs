@@ -71,6 +71,7 @@ fn build_one(path: &str, bytes: &[u8], m: MachO) -> Binary {
         vec![ImportedLib {
             name: "(dyld imports)".to_string(),
             functions: import_fns,
+            ordinals: Vec::new(),
         }]
     };
     let exports: Vec<String> = m

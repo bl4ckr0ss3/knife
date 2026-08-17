@@ -8,13 +8,11 @@
 //! whose format string is loaded from memory rather than pointed at a
 //! constant: those are where the bugs are, and those are what it prints.
 //!
-//! The provenance is an intra-block backward walk over x86-64 registers. It is
-//! deliberately shallow and deliberately honest: it looks back only within the
-//! call's own basic block, stops at the previous call (argument registers do
-//! not survive one), and when it cannot see where a value came from it says
-//! nothing rather than guess. That keeps the false-positive rate low enough
-//! that a finding is worth a researcher's attention, which is the only metric
-//! that matters for a tool like this.
+//! Provenance is a bounded backward data-flow walk over x86 registers. It stops
+//! at calls, follows copies and predecessor blocks, and joins origins from
+//! control-flow paths as a may-set. Findings say when a dangerous origin exists
+//! only on some incoming paths rather than silently dropping it or pretending
+//! every path is dangerous.
 
 use crate::analysis::engine::Analysis;
 use crate::analysis::thunks::bare_name;
@@ -94,13 +92,17 @@ pub struct Finding {
 }
 
 /// What the backward walk concluded about where a register's value came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Origin {
     /// A fixed address: `lea reg, [rip+k]` or `mov reg, imm`. Not attacker
     /// controlled, so a format pointer that is one of these is safe.
     Fixed,
     /// Loaded from memory or copied from another register: a runtime value.
     Dynamic,
+    /// A value inherited from this function's calling convention arguments.
+    Argument,
+    /// A return value from an API that introduces process-external input.
+    External,
     /// Produced by a multiply or a left shift.
     Multiply,
     /// Produced by a subtraction.
@@ -113,6 +115,27 @@ enum Origin {
     Stack,
     /// No defining instruction was found in the block before the call.
     Unknown,
+}
+
+/// APIs whose return register itself carries data or a size controlled by the
+/// process environment, a file, a socket, the command line, or user input.
+fn external_return(api: &str) -> bool {
+    matches!(
+        api,
+        "getenv"
+            | "secure_getenv"
+            | "fgets"
+            | "gets"
+            | "getline"
+            | "getdelim"
+            | "read"
+            | "recv"
+            | "recvfrom"
+            | "GetCommandLineA"
+            | "GetCommandLineW"
+            | "GetEnvironmentStringsA"
+            | "GetEnvironmentStringsW"
+    )
 }
 
 pub fn run(an: &Analysis, bin: &Binary, bytes: &[u8]) -> Vec<Finding> {
@@ -188,7 +211,7 @@ fn classify(
     // into a fixed-size stack buffer is the classic overflow, so it is worth
     // knowing whichever length pattern applies.
     let dest_is_stack =
-        provenance(an, bin, bytes, func, block, call_idx, 1, win64).origin == Origin::Stack;
+        provenance(an, bin, bytes, func, block, call_idx, 1, win64).contains(Origin::Stack);
 
     match check {
         Check::Unbounded => {
@@ -199,11 +222,9 @@ fn classify(
             // bottom band. This is exactly the false positive a run against real
             // software surfaces: `strcpy(local, "some literal")`.
             if dest_is_stack {
-                let src_fixed = source_arg(api).is_some_and(|s| {
-                    provenance(an, bin, bytes, func, block, call_idx, s, win64).origin
-                        == Origin::Fixed
-                });
-                if src_fixed {
+                let source = source_arg(api)
+                    .map(|arg| provenance(an, bin, bytes, func, block, call_idx, arg, win64));
+                if source.as_ref().is_some_and(|p| p.is_only(Origin::Fixed)) {
                     return Some(mk(
                         "stack-overflow",
                         1,
@@ -211,11 +232,20 @@ fn classify(
                             .to_string(),
                     ));
                 }
+                let source_kind = match source.as_ref() {
+                    Some(p) if p.contains(Origin::External) => "external-input API data",
+                    Some(p) if p.contains(Origin::Argument) => "a function argument",
+                    Some(p) if p.contains(Origin::Dynamic) => "a runtime value",
+                    Some(_) => "a value of unknown provenance",
+                    None if api == "gets" => "input read directly by gets",
+                    None => "runtime-expanded data",
+                };
                 return Some(mk(
                     "stack-overflow",
                     3,
-                    "unbounded copy of a runtime value into a stack buffer (classic overflow)"
-                        .to_string(),
+                    format!(
+                        "unbounded copy of {source_kind} into a stack buffer (classic overflow)"
+                    ),
                 ));
             }
             // No length argument to inspect; the finding is the call plus reach.
@@ -231,13 +261,30 @@ fn classify(
             // A format pointer that is a fixed constant is the normal, safe
             // case; a runtime pointer is the format-string bug. Anything we
             // could not resolve is left alone rather than guessed at.
-            match provenance(an, bin, bytes, func, block, call_idx, arg, win64).origin {
-                Origin::Dynamic => Some(mk(
+            let p = provenance(an, bin, bytes, func, block, call_idx, arg, win64);
+            if p.contains(Origin::External)
+                || p.contains(Origin::Argument)
+                || p.contains(Origin::Dynamic)
+            {
+                let path = if p.mixed() {
+                    " on some incoming paths"
+                } else {
+                    ""
+                };
+                let source = if p.contains(Origin::External) {
+                    "originates from an external-input API"
+                } else if p.contains(Origin::Argument) {
+                    "comes from a function argument"
+                } else {
+                    "is loaded at runtime"
+                };
+                Some(mk(
                     "format-string",
                     3,
-                    "format argument is loaded at runtime, not a constant string".to_string(),
-                )),
-                _ => None,
+                    format!("format argument {source}{path}, not a constant string"),
+                ))
+            } else {
+                None
             }
         }
         // A size that is clamped or masked before the call cannot actually reach
@@ -245,22 +292,26 @@ fn classify(
         // still worth a glance, no longer worth an afternoon.
         Check::AllocSize(arg) => {
             let p = provenance(an, bin, bytes, func, block, call_idx, arg, win64);
-            match p.origin {
-                Origin::Multiply => Some(sized(
+            if p.contains(Origin::Multiply) {
+                Some(sized(
                     &mk,
                     "alloc-overflow",
                     3,
                     "allocation size computed by multiplication (integer overflow?)",
                     p.bounded,
-                )),
-                Origin::Subtract => Some(sized(
+                    p.mixed(),
+                ))
+            } else if p.contains(Origin::Subtract) {
+                Some(sized(
                     &mk,
                     "alloc-underflow",
                     2,
                     "allocation size computed by subtraction",
                     p.bounded,
-                )),
-                _ => None,
+                    p.mixed(),
+                ))
+            } else {
+                None
             }
         }
         Check::CopySize(arg) => {
@@ -272,8 +323,8 @@ fn classify(
             } else {
                 ""
             };
-            match p.origin {
-                Origin::Subtract => Some(sized(
+            if p.contains(Origin::Subtract) {
+                Some(sized(
                     &mk,
                     "copy-underflow",
                     3,
@@ -281,15 +332,19 @@ fn classify(
                         "copy length computed by subtraction (integer underflow to a huge size?){dst}"
                     ),
                     p.bounded,
-                )),
-                Origin::Multiply => Some(sized(
+                    p.mixed(),
+                ))
+            } else if p.contains(Origin::Multiply) {
+                Some(sized(
                     &mk,
                     "copy-overflow",
                     2,
                     &format!("copy length computed by multiplication (integer overflow?){dst}"),
                     p.bounded,
-                )),
-                _ => None,
+                    p.mixed(),
+                ))
+            } else {
+                None
             }
         }
     }
@@ -303,17 +358,23 @@ fn sized(
     severity: u8,
     detail: &str,
     bounded: bool,
+    mixed: bool,
 ) -> Finding {
+    let path = if mixed {
+        "; arithmetic origin occurs on some incoming paths"
+    } else {
+        ""
+    };
     if bounded {
         // A clamped or masked size is likely safe, so it sinks to the bottom
         // band rather than merely one step down.
         mk(
             pattern,
             1,
-            format!("{detail}; but clamped or masked before the call, likely safe"),
+            format!("{detail}{path}; but clamped or masked before the call, likely safe"),
         )
     } else {
-        mk(pattern, severity, detail.to_string())
+        mk(pattern, severity, format!("{detail}{path}"))
     }
 }
 
@@ -337,11 +398,36 @@ fn arg_register(n: u8, win64: bool) -> Option<Register> {
 /// What the backward walk found about an argument: where its value came from,
 /// and whether it was bounded before the call.
 struct Prov {
-    origin: Origin,
+    origins: BTreeSet<Origin>,
     /// A clamp (`cmp` + `cmov`) or a mask (`and reg, imm`) was applied to the
     /// value between its computation and the call, so a raw subtraction or
     /// multiply cannot actually reach an extreme.
     bounded: bool,
+}
+
+impl Prov {
+    fn one(origin: Origin, bounded: bool) -> Self {
+        Self {
+            origins: BTreeSet::from([origin]),
+            bounded,
+        }
+    }
+
+    fn unknown(bounded: bool) -> Self {
+        Self::one(Origin::Unknown, bounded)
+    }
+
+    fn contains(&self, origin: Origin) -> bool {
+        self.origins.contains(&origin)
+    }
+
+    fn is_only(&self, origin: Origin) -> bool {
+        self.origins.len() == 1 && self.contains(origin)
+    }
+
+    fn mixed(&self) -> bool {
+        self.origins.len() > 1
+    }
 }
 
 /// Where an argument's value came from, and whether it was bounded on the way.
@@ -350,8 +436,8 @@ struct Prov {
 /// off the top of the call's own block without an answer, it continues into the
 /// predecessor blocks: the "a switch picks a value, a common tail makes the
 /// call" shape is everywhere, and without following it a value set one block
-/// earlier reads as unknown. Predecessors must agree, or the result is unknown;
-/// the depth is capped so a loop or a fan-in cannot run away.
+/// earlier reads as unknown. Predecessor origins are unioned, and the depth is
+/// capped so a loop or a fan-in cannot run away.
 #[allow(clippy::too_many_arguments)]
 fn provenance(
     an: &Analysis,
@@ -370,10 +456,7 @@ fn provenance(
         return provenance_32(an, bin, bytes, func, block, call_idx, arg);
     }
     let Some(target) = arg_register(arg, win64) else {
-        return Prov {
-            origin: Origin::Unknown,
-            bounded: false,
-        };
+        return Prov::unknown(false);
     };
     resolve_reg(
         an,
@@ -384,6 +467,7 @@ fn provenance(
         call_idx,
         target.full_register(),
         0,
+        win64,
     )
 }
 
@@ -400,10 +484,7 @@ fn provenance_32(
     call_idx: usize,
     arg: u8,
 ) -> Prov {
-    let unknown = Prov {
-        origin: Origin::Unknown,
-        bounded: false,
-    };
+    let unknown = Prov::unknown(false);
     // Walk back counting pushes; the arg-th one is our argument.
     let mut seen = 0u8;
     for j in (0..call_idx).rev() {
@@ -437,24 +518,22 @@ fn provenance_32(
                     j,
                     d.op0_register().full_register(),
                     0,
+                    false,
                 )
             }
-            OpKind::Memory => Prov {
-                origin: Origin::Dynamic,
-                bounded: false,
-            },
+            OpKind::Memory => Prov::one(Origin::Dynamic, false),
             _ => {
                 // A pushed immediate: a constant, or a fixed pointer if it lands
                 // on a string (`push offset "literal"`).
                 let imm = d.immediate(0);
-                Prov {
-                    origin: if points_at_string(bin, an, bytes, imm) {
+                Prov::one(
+                    if points_at_string(bin, an, bytes, imm) {
                         Origin::Fixed
                     } else {
                         Origin::Constant
                     },
-                    bounded: false,
-                }
+                    false,
+                )
             }
         };
     }
@@ -473,6 +552,7 @@ fn resolve_reg(
     upto: usize,
     want_in: Register,
     depth: u32,
+    win64: bool,
 ) -> Prov {
     let mut want = want_in;
     let mut bounded = false;
@@ -487,10 +567,16 @@ fn resolve_reg(
         // before one is not the value passed here, and there is no point
         // chasing it into predecessors either.
         if matches!(d.mnemonic(), Mnemonic::Call) {
-            return Prov {
-                origin: Origin::Unknown,
-                bounded,
-            };
+            if want == Register::RAX
+                && ins
+                    .target_name
+                    .as_deref()
+                    .map(bare_name)
+                    .is_some_and(external_return)
+            {
+                return Prov::one(Origin::External, bounded);
+            }
+            return Prov::unknown(bounded);
         }
 
         // A conditional move into the tracked register is the min/max clamp
@@ -520,18 +606,12 @@ fn resolve_reg(
             want = d.op1_register().full_register();
             continue;
         }
-        return Prov {
-            origin: origin_of(&d, bin, an, bytes),
-            bounded,
-        };
+        return Prov::one(origin_of(&d, bin, an, bytes), bounded);
     }
 
-    // Not written in this block. Follow the predecessors, which must agree.
+    // Not written in this block. Join every predecessor's possible origins.
     if depth >= 2 {
-        return Prov {
-            origin: Origin::Unknown,
-            bounded,
-        };
+        return Prov::unknown(bounded);
     }
     let preds: Vec<&crate::analysis::engine::BasicBlock> = func
         .blocks
@@ -539,33 +619,49 @@ fn resolve_reg(
         .filter(|b| b.start != block.start && b.succ.contains(&block.start))
         .collect();
     if preds.is_empty() {
-        return Prov {
-            origin: Origin::Unknown,
-            bounded,
-        };
+        if block.start == func.addr && an.bits == 64 && abi_arg_register(want, win64) {
+            return Prov::one(Origin::Argument, bounded);
+        }
+        return Prov::unknown(bounded);
     }
 
-    let mut agreed: Option<Origin> = None;
+    let mut origins = BTreeSet::new();
     let mut all_bounded = true;
     for p in preds {
-        let r = resolve_reg(an, bin, bytes, func, p, p.insns.len(), want, depth + 1);
+        let r = resolve_reg(
+            an,
+            bin,
+            bytes,
+            func,
+            p,
+            p.insns.len(),
+            want,
+            depth + 1,
+            win64,
+        );
         all_bounded &= r.bounded;
-        match agreed {
-            None => agreed = Some(r.origin),
-            Some(o) if o == r.origin => {}
-            // Predecessors disagree on where the value came from; do not guess.
-            Some(_) => {
-                return Prov {
-                    origin: Origin::Unknown,
-                    bounded,
-                }
-            }
-        }
+        origins.extend(r.origins);
     }
     Prov {
-        origin: agreed.unwrap_or(Origin::Unknown),
+        origins,
         bounded: bounded || all_bounded,
     }
+}
+
+fn abi_arg_register(register: Register, win64: bool) -> bool {
+    let args: &[Register] = if win64 {
+        &[Register::RCX, Register::RDX, Register::R8, Register::R9]
+    } else {
+        &[
+            Register::RDI,
+            Register::RSI,
+            Register::RDX,
+            Register::RCX,
+            Register::R8,
+            Register::R9,
+        ]
+    };
+    args.contains(&register)
 }
 
 /// Does this instruction write (or conditionally write) the given 64-bit reg?
@@ -798,6 +894,15 @@ mod tests {
             Harness { bin, bytes }
         }
 
+        fn with_import(mut self, addr: u64, name: &str) -> Harness {
+            self.bin.symbols.push(Symbol {
+                addr,
+                name: name.into(),
+                kind: SymKind::Import,
+            });
+            self
+        }
+
         fn findings(&self) -> Vec<Finding> {
             let an = engine::analyze(&self.bin, &self.bytes, 10_000, &Db::default());
             run(&an, &self.bin, &self.bytes)
@@ -819,6 +924,34 @@ mod tests {
             .find(|x| x.pattern == "copy-underflow")
             .expect("expected copy-underflow");
         assert_eq!(hit.severity, 3, "an unclamped subtraction is high severity");
+    }
+
+    #[test]
+    fn dangerous_origin_on_one_branch_survives_the_join() {
+        // cmp eax,0 ; je constant ; imul edx,ecx ; jmp join ;
+        // constant: mov edx,0x20 ; join: call memcpy
+        // The third argument is dangerous on one feasible path and fixed on
+        // the other. A may-analysis must keep the multiplication visible.
+        let h = Harness::new(
+            "memcpy",
+            vec![
+                0x83, 0xf8, 0x00, // cmp eax, 0
+                0x74, 0x05, // je +5 -> constant
+                0x0f, 0xaf, 0xd1, // imul edx, ecx
+                0xeb, 0x05, // jmp +5 -> join
+                0xba, 0x20, 0x00, 0x00, 0x00, // mov edx, 0x20
+            ],
+        );
+        let findings = h.findings();
+        let hit = findings
+            .iter()
+            .find(|finding| finding.pattern == "copy-overflow")
+            .expect("multiplication on one incoming path should remain visible");
+        assert!(
+            hit.detail.contains("some incoming paths"),
+            "mixed provenance should be explicit: {}",
+            hit.detail
+        );
     }
 
     #[test]
@@ -935,7 +1068,7 @@ mod tests {
 
     #[test]
     fn strcpy_into_a_heap_pointer_is_a_plain_unbounded_copy() {
-        // mov rdi, [rbx] ; call strcpy — the destination is a loaded pointer,
+        // mov rdi, [rbx] ; call strcpy: the destination is a loaded pointer,
         // not a stack buffer, so it stays the generic unbounded-copy finding.
         let code = vec![0x48, 0x8b, 0x3b]; // mov rdi, [rbx]
         let f = Harness::new("strcpy", code).findings();
@@ -984,7 +1117,7 @@ mod tests {
 
     #[test]
     fn memcpy_with_a_constant_length_is_not_flagged() {
-        // mov edx, 0x10 ; call memcpy — a fixed length is not a bug.
+        // mov edx, 0x10 ; call memcpy: a fixed length is not a bug.
         let code = vec![0xba, 0x10, 0x00, 0x00, 0x00]; // mov edx, 16
         let f = Harness::new("memcpy", code).findings();
         assert!(
@@ -996,7 +1129,7 @@ mod tests {
 
     #[test]
     fn printf_with_a_runtime_format_is_flagged() {
-        // mov rdi, [rsi] ; call printf — format loaded from memory.
+        // mov rdi, [rsi] ; call printf: format loaded from memory.
         let code = vec![0x48, 0x8b, 0x3e]; // mov rdi, [rsi]
         let f = Harness::new("printf", code).findings();
         assert!(
@@ -1007,8 +1140,36 @@ mod tests {
     }
 
     #[test]
+    fn printf_with_a_function_argument_is_flagged_as_tainted() {
+        // SysV arg1 arrives in rdi and is forwarded directly to printf.
+        let findings = Harness::new("printf", vec![]).findings();
+        let hit = findings
+            .iter()
+            .find(|finding| finding.pattern == "format-string")
+            .expect("a function argument used as a format string is dangerous");
+        assert!(hit.detail.contains("function argument"), "{}", hit.detail);
+    }
+
+    #[test]
+    fn printf_with_getenv_return_is_flagged_as_external_input() {
+        // call [getenv@0x5000] ; mov rdi,rax ; call printf
+        let getenv_disp = (0x5000i64 - (0x1000i64 + 6)) as i32;
+        let mut code = vec![0xff, 0x15];
+        code.extend_from_slice(&getenv_disp.to_le_bytes());
+        code.extend_from_slice(&[0x48, 0x89, 0xc7]); // mov rdi, rax
+        let findings = Harness::new("printf", code)
+            .with_import(0x5000, "getenv")
+            .findings();
+        let hit = findings
+            .iter()
+            .find(|finding| finding.pattern == "format-string")
+            .expect("getenv data used as a format string is dangerous");
+        assert!(hit.detail.contains("external-input API"), "{}", hit.detail);
+    }
+
+    #[test]
     fn printf_with_a_fixed_format_pointer_is_not_flagged() {
-        // lea rdi, [rip+k] ; call printf — a constant format string is fine.
+        // lea rdi, [rip+k] ; call printf: a constant format string is fine.
         let code = vec![0x48, 0x8d, 0x3d, 0x10, 0x00, 0x00, 0x00]; // lea rdi,[rip+0x10]
         let f = Harness::new("printf", code).findings();
         assert!(
@@ -1034,7 +1195,7 @@ mod tests {
     #[test]
     fn a_value_set_before_an_intervening_call_is_not_attributed() {
         // mov edx, eax (a subtraction would flag, but here it is a plain move
-        // BEFORE a call) ; call something ; call memcpy — rdx does not survive
+        // BEFORE a call) ; call something ; call memcpy: rdx does not survive
         // the first call, so the sub is not the memcpy length.
         // Represented minimally: sub edx,eax ; call [rip] (other) ; then the
         // harness appends call memcpy. The sub precedes an intervening call.

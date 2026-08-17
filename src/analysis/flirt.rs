@@ -8,7 +8,7 @@
 //! handful of CRT/compiler-rt helpers that are worth naming. A nameless
 //! function that matches is given the helper's name instead of `sub_xxxx`.
 
-/// A function signature: a name plus a byte mask, FLIRT convention — `0x00`
+/// A function signature: a name plus a byte mask, FLIRT convention. `0x00`
 /// means "any byte", `0xFF` means "must equal the pattern byte". Matched at
 /// the function's entry point.
 pub struct Sig {

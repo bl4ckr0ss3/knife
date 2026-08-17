@@ -11,6 +11,22 @@ const MEM_EXECUTE: u32 = 0x2000_0000;
 const MEM_READ: u32 = 0x4000_0000;
 const MEM_WRITE: u32 = 0x8000_0000;
 
+/// Resolve a possibly-ordinal import name to a catalog-known API name. Ordinal
+/// imports arrive with goblin's synthetic `"ORDINAL N"`; the embedded native
+/// table maps `(module, ordinal)` back to a real name when it knows the pair,
+/// so flags (`sinks`, `caps`, `audit`) can see it. Unknown pairs keep the
+/// synthetic name rather than invent one.
+fn resolve_name(dll: &str, ordinal: u16, name: &str) -> String {
+    if name.starts_with("ORDINAL ") {
+        let module = dll.rsplit_once('.').map(|(s, _)| s).unwrap_or(dll);
+        crate::analysis::nt_ordinals::resolve_ordinal(module, ordinal)
+            .map(str::to_owned)
+            .unwrap_or_else(|| name.to_string())
+    } else {
+        name.to_string()
+    }
+}
+
 pub fn build(path: &str, bytes: &[u8], pe: PE) -> Binary {
     let arch = match pe.header.coff_header.machine {
         0x014c => Arch::X86,
@@ -41,25 +57,37 @@ pub fn build(path: &str, bytes: &[u8], pe: PE) -> Binary {
         .collect();
 
     // goblin yields one Import per function; group them by DLL.
-    let mut by_dll: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut by_dll: BTreeMap<String, Vec<(String, Option<u16>)>> = BTreeMap::new();
     for imp in &pe.imports {
-        by_dll
-            .entry(imp.dll.to_string())
-            .or_default()
-            .push(imp.name.to_string());
+        // Ordinal imports arrive with the synthetic name "ORDINAL N" and the
+        // real number in `imp.ordinal`. Kernel binaries are where this bites:
+        // name it from the embedded native-API table when we know it, so
+        // `sinks`/`caps`/`audit` see an API name instead of a dead ordinal.
+        let name = resolve_name(imp.dll, imp.ordinal, &imp.name);
+        by_dll.entry(imp.dll.to_string()).or_default().push((
+            name,
+            (imp.name.starts_with("ORDINAL ")).then_some(imp.ordinal),
+        ));
     }
     // preserve the library order from the import table where possible
     let mut imports: Vec<ImportedLib> = Vec::new();
     for lib in &pe.libraries {
         if let Some(fns) = by_dll.remove(*lib) {
+            let (functions, ordinals): (Vec<String>, Vec<Option<u16>>) = fns.into_iter().unzip();
             imports.push(ImportedLib {
                 name: lib.to_string(),
-                functions: fns,
+                functions,
+                ordinals,
             });
         }
     }
     for (name, functions) in by_dll {
-        imports.push(ImportedLib { name, functions });
+        let (functions, ordinals): (Vec<String>, Vec<Option<u16>>) = functions.into_iter().unzip();
+        imports.push(ImportedLib {
+            name,
+            functions,
+            ordinals,
+        });
     }
 
     let exports = pe
@@ -88,7 +116,7 @@ pub fn build(path: &str, bytes: &[u8], pe: PE) -> Binary {
             // is the import address table slot RVA. Code calls through the
             // slot, so the slot is the address worth recording.
             addr: imp.offset as u64,
-            name: format!("{module}!{}", imp.name),
+            name: format!("{module}!{}", resolve_name(imp.dll, imp.ordinal, &imp.name)),
             kind: SymKind::Import,
         });
     }

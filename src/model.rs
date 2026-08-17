@@ -1,7 +1,7 @@
 //! The format-neutral model every analyzer fills in. Everything downstream
 //! (triage, disasm target selection, JSON export) talks to this, not to goblin.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Format {
@@ -24,7 +24,7 @@ impl Format {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Arch {
     X86,
     X86_64,
@@ -91,6 +91,13 @@ impl Section {
 pub struct ImportedLib {
     pub name: String,
     pub functions: Vec<String>,
+    /// Parallel to `functions`: the PE import ordinal when the import was made
+    /// by ordinal (goblin names those `"ORDINAL N"`), `None` for by-name
+    /// imports and for non-PE formats. Kernel binaries are where this matters:
+    /// an unnamed ordinal import tells sinks/capabilities nothing unless the
+    /// number is carried through to the catalog.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ordinals: Vec<Option<u16>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -215,7 +222,7 @@ impl Binary {
     /// A minimal `Binary` for tests to fill in selectively. Adding a field to
     /// the model should not mean editing every test fixture that happens to
     /// construct one.
-    #[cfg(test)]
+    #[doc(hidden)]
     pub fn stub(format: Format, arch: Arch) -> Binary {
         Binary {
             path: "stub".into(),

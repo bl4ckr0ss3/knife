@@ -3,7 +3,7 @@
 //! The engine and the linear `dis` command need, per instruction, four things:
 //! a length, a flow class, a branch target, and a readable rendering. iced-x86
 //! is x86-only, so this module decodes the small ARM64 vocabulary that covers
-//! prologues, calls, branches, and the workhorse data instructions — anything
+//! prologues, calls, branches, and the workhorse data instructions. Anything
 //! else renders as its raw word, which is never a lie. Import veneers
 //! (`adrp`/`ldr`/`br` through a GOT page) stay invisible on purpose;
 //! resolving those is a later roadmap item.

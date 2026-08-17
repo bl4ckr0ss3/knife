@@ -13,7 +13,7 @@
 
 #![cfg(test)]
 
-use crate::analysis::{audit, engine, hardening, sinks};
+use crate::analysis::{audit, driver, engine, hardening, ir, sinks};
 use crate::db::Db;
 use crate::listing;
 use crate::model::Binary;
@@ -66,8 +66,17 @@ fn run_analyzers(bin: &Binary, bytes: &[u8]) {
     let base = engine::display_base(bin);
     let strings = listing::string_map(bin, bytes, base);
     for f in an.functions.iter().take(50) {
-        let _ = listing::function(&an, f, &Db::default(), base, &strings);
+        let _ = listing::function(&an, f, &Db::default(), base, &strings, None);
     }
+    // The decompiler is the one heavy recursive pass the other exercisers skip;
+    // a hostile file that drives expression propagation deep depends on it
+    // staying bounded, so it gets the same never-unwind guarantee here.
+    for f in an.functions.iter().take(50) {
+        let _ = ir::decompile(&an, bin, f, &strings, &Db::default());
+    }
+    // The driver pass runs the dispatch scan, reachability BFS, sink walk and
+    // signing parse. All of it must be panic-free on hostile input too.
+    let _ = driver::report(bin, bytes, &an, &strings);
     // The data view takes an arbitrary address; feed it the entry and a couple
     // of edge addresses to exercise its bounds handling.
     for a in [bin.entry, 0, u64::MAX, bin.image_base] {
@@ -156,6 +165,32 @@ fn fixtures() -> Vec<Vec<u8>> {
         elf_aarch64_plt_call(),
         elf_with_eh_frame_hdr(),
         pe_with_iat_call(),
+        pe_with_driver(),
         macho_with_bind(),
     ]
+}
+
+#[test]
+fn signing_walkers_never_panic_on_junk() {
+    // `signing::summarize` reads a PE certificate table through `sig_region`;
+    // throw arbitrary DER-shaped buffers and both a valid and an out-of-bounds
+    // region at it. The result is not inspected. It must simply not unwind.
+    use crate::analysis::signing;
+    use crate::model::{Arch, Format};
+    let mut rng = Lcg(0xdecafbad_01234567);
+    for _ in 0..400 {
+        let len = rng.upto(1536);
+        let buf: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
+        let mut sbin = Binary::stub(Format::Pe, Arch::X86_64);
+        sbin.sig_region = Some((0, len as u64));
+        let _ = signing::summarize(&sbin, &buf);
+        // An in-bounds offset with an oversized/truncated span.
+        if len >= 8 {
+            sbin.sig_region = Some(((len / 2) as u64, 4096));
+            let _ = signing::summarize(&sbin, &buf);
+        }
+        // An offset beyond the buffer.
+        sbin.sig_region = Some((len as u64 + 64, 64));
+        let _ = signing::summarize(&sbin, &buf);
+    }
 }

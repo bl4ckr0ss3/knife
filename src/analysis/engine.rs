@@ -10,12 +10,14 @@ use crate::model::{Binary, Format, SymKind};
 use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Formatter, Instruction, IntelFormatter, Mnemonic,
 };
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 // Several fields here (instruction length/flow, block end/successors, xref
 // kind) are part of the CFG model for the upcoming interactive/graph views and
 // are not all read by the current text output yet.
 #[allow(dead_code)]
+#[derive(Serialize, Deserialize)]
 pub struct EngineInsn {
     pub addr: u64,
     pub len: usize,
@@ -28,6 +30,7 @@ pub struct EngineInsn {
     pub target_name: Option<String>,
     /// A branch/call target address, if this instruction has one.
     pub target: Option<u64>,
+    #[serde(with = "flow_control_serde")]
     pub flow: FlowControl,
 }
 
@@ -56,6 +59,7 @@ impl EngineInsn {
 }
 
 #[allow(dead_code)]
+#[derive(Serialize, Deserialize)]
 pub struct BasicBlock {
     pub start: u64,
     pub end: u64,
@@ -63,6 +67,7 @@ pub struct BasicBlock {
     pub succ: Vec<u64>,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Function {
     pub addr: u64,
     pub name: String,
@@ -79,7 +84,7 @@ impl Function {
     /// A deterministic fingerprint of the function's raw instruction bytes.
     /// Blocks are visited in address order and every instruction contributes
     /// its address and bytes, so two otherwise-identical functions that differ
-    /// by a single edited byte hash differently — `knife diff` uses this to
+    /// by a single edited byte hash differently. `knife diff` uses this to
     /// flag a changed body even when the size lines up.
     pub fn body_hash(&self) -> u64 {
         let mut h = 0x9e37_79b9_7f4a_7c15u64;
@@ -98,13 +103,13 @@ impl Function {
 }
 
 #[allow(dead_code)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Xref {
     pub from: u64,
     pub kind: XrefKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum XrefKind {
     Call,
     Jump,
@@ -117,7 +122,7 @@ pub enum XrefKind {
 /// A reference *from* an instruction: what it reaches. The mirror of `Xref`,
 /// kept because "what does this line point at" is the question the listing and
 /// the interactive view ask at every cursor stop.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ref {
     pub to: u64,
     pub kind: XrefKind,
@@ -134,8 +139,13 @@ impl XrefKind {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Analysis {
     pub functions: Vec<Function>,
+    /// Function name -> index in `functions`. Kept private so callers cannot
+    /// make it disagree with the address-sorted function vector.
+    #[serde(skip)]
+    function_names: BTreeMap<String, usize>,
     pub xrefs_to: BTreeMap<u64, Vec<Xref>>,
     /// The reverse lookup: instruction address -> what it references, whether
     /// that is a call, a branch, or a data operand pointing at a string.
@@ -154,6 +164,16 @@ pub struct Analysis {
 }
 
 impl Analysis {
+    /// Rebuild lookup-only state omitted from the persistent cache.
+    pub(crate) fn rebuild_indexes(&mut self) {
+        self.function_names.clear();
+        for (index, function) in self.functions.iter().enumerate() {
+            self.function_names
+                .entry(function.name.clone())
+                .or_insert(index);
+        }
+    }
+
     pub fn label(&self, addr: u64) -> String {
         // Import slots have a name but no code, so they are not in `names`;
         // without this fallback an IAT entry renders as an anonymous `sub_`.
@@ -163,15 +183,32 @@ impl Analysis {
         }
     }
     pub fn find_function(&self, addr: u64) -> Option<&Function> {
-        self.functions.iter().find(|f| f.addr == addr)
+        self.functions
+            .binary_search_by_key(&addr, |f| f.addr)
+            .ok()
+            .map(|i| &self.functions[i])
     }
     pub fn find_by_name(&self, needle: &str) -> Option<&Function> {
-        self.functions.iter().find(|f| f.name == needle)
+        self.function_names.get(needle).map(|&i| &self.functions[i])
     }
 
     /// The function whose body contains `addr`, which is how a cross-reference
     /// address becomes "inside `parse_header`" rather than a bare number.
     pub fn function_at(&self, addr: u64) -> Option<&Function> {
+        // Functions are address-sorted, so an address is overwhelmingly likely
+        // to belong to the nearest preceding entry. Keep the full scan as a
+        // correctness fallback for overlaps and backward control-flow edges.
+        let next = self.functions.partition_point(|f| f.addr <= addr);
+        if next > 0 {
+            let candidate = &self.functions[next - 1];
+            if candidate
+                .blocks
+                .iter()
+                .any(|b| addr >= b.start && addr < b.end)
+            {
+                return Some(candidate);
+            }
+        }
         self.functions
             .iter()
             .find(|f| f.blocks.iter().any(|b| addr >= b.start && addr < b.end))
@@ -211,6 +248,39 @@ impl Analysis {
             }
         }
         out
+    }
+}
+
+/// `iced_x86::FlowControl` does not implement serde. Store its stable semantic
+/// variants explicitly rather than serializing the dependency's memory layout.
+mod flow_control_serde {
+    use super::*;
+
+    pub fn serialize<S>(flow: &FlowControl, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u8(*flow as u8)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<FlowControl, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u8::deserialize(deserializer)?;
+        match value {
+            0 => Ok(FlowControl::Next),
+            1 => Ok(FlowControl::UnconditionalBranch),
+            2 => Ok(FlowControl::IndirectBranch),
+            3 => Ok(FlowControl::ConditionalBranch),
+            4 => Ok(FlowControl::Return),
+            5 => Ok(FlowControl::Call),
+            6 => Ok(FlowControl::IndirectCall),
+            7 => Ok(FlowControl::Interrupt),
+            8 => Ok(FlowControl::XbeginXabortXend),
+            9 => Ok(FlowControl::Exception),
+            _ => Err(serde::de::Error::custom("invalid cached flow-control kind")),
+        }
     }
 }
 
@@ -384,9 +454,9 @@ fn data_ref(bin: &Binary, base: u64, insn: &Instruction) -> Option<u64> {
 /// x86 has no RIP-relative indexed addressing, so a switch works in exactly
 /// two shapes, both resolved here:
 ///
-/// * `jmp qword ptr [kind*8 + disp32]` — the displacement is the table's
+/// * `jmp qword ptr [kind*8 + disp32]`: the displacement is the table's
 ///   absolute address (non-PIE);
-/// * `lea rax, [rip+disp]; jmp qword ptr [rax*8]` — the LEA wrote the table
+/// * `lea rax, [rip+disp]; jmp qword ptr [rax*8]`: the LEA wrote the table
 ///   address into `regs`, MSVC's favorite for PIE.
 ///
 /// Anything else (bare `jmp rax`, unindexed memory jumps) has no table.
@@ -440,7 +510,9 @@ pub fn analyze(bin: &Binary, bytes: &[u8], max_insns: usize, db: &crate::db::Db)
                 imports.insert(va, s.name.clone());
             }
             SymKind::Func | SymKind::Export => {
-                names.entry(va).or_insert_with(|| s.name.clone());
+                names
+                    .entry(va)
+                    .or_insert_with(|| crate::analysis::demangle::display_name(&s.name));
             }
         }
     }
@@ -452,7 +524,15 @@ pub fn analyze(bin: &Binary, bytes: &[u8], max_insns: usize, db: &crate::db::Db)
     if in_exec(bin, base, entry_va) {
         seeds.push_back(entry_va);
         is_seed.insert(entry_va);
-        names.entry(entry_va).or_insert_with(|| "entry".to_string());
+        // A native-subsystem image is a kernel driver: its entry point is the
+        // driver's `DriverEntry`, and that is the name an analyst will look for.
+        names.entry(entry_va).or_insert_with(|| {
+            if bin.subsystem.as_deref() == Some("native") {
+                "DriverEntry".to_string()
+            } else {
+                "entry".to_string()
+            }
+        });
     }
     for s in bin.symbols.iter().chain(stubs.iter()) {
         let va = s.addr + base;
@@ -565,9 +645,16 @@ pub fn analyze(bin: &Binary, bytes: &[u8], max_insns: usize, db: &crate::db::Db)
         }
     }
     functions.sort_by_key(|f| f.addr);
+    let mut function_names = BTreeMap::new();
+    for (index, function) in functions.iter().enumerate() {
+        // Preserve the previous linear-search behavior for duplicate names:
+        // the lowest-address function wins.
+        function_names.entry(function.name.clone()).or_insert(index);
+    }
 
     Analysis {
         functions,
+        function_names,
         xrefs_to,
         xrefs_from,
         names,
@@ -602,7 +689,7 @@ fn build_function(
     let mut max_end = entry;
     // Addresses the code is known to have written into registers (only ever
     // via `lea r64,[rip+x]` / `mov r64, imm`), which is what makes a switch's
-    // table address knowable. Inaccurate across conditional paths by design —
+    // table address knowable. Inaccurate across conditional paths by design.
     // a stale entry can only *miss* a table, never invent one.
     let mut regs: HashMap<iced_x86::Register, u64> = HashMap::new();
 
@@ -1043,6 +1130,16 @@ mod tests {
         assert!(!f.blocks.is_empty());
         // It has no name, so it renders as sub_ like any discovered function.
         assert_eq!(with_hint.label(0x1002), "sub_1002");
+        assert_eq!(
+            with_hint
+                .find_by_name("sub_1002")
+                .map(|function| function.addr),
+            Some(0x1002)
+        );
+        assert_eq!(
+            with_hint.function_at(0x1003).map(|function| function.addr),
+            Some(0x1002)
+        );
     }
 
     #[test]

@@ -8,23 +8,53 @@
 
 use crate::analysis::{audit, engine, ir};
 use crate::listing::{self, Annot, Line};
-use crate::{Session, ANALYSIS_BUDGET};
+use crate::{workspace::Session, ANALYSIS_BUDGET};
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 
 const PROTOCOL: &str = "2024-11-05";
 
+/// The largest single frame we will buffer. MCP frames are one JSON object per
+/// line; nothing this server does needs more, so a client that streams a huge
+/// line fails closed (the rest of the line is drained and dropped) instead of
+/// making us allocate it all.
+const MAX_FRAME: usize = 16 * 1024 * 1024;
+
+/// Read one newline-delimited frame. `Ok(None)` is clean EOF; `Ok(Some(vec))`
+/// is a complete line without its newline; a line longer than `MAX_FRAME` is
+/// drained to its newline so the stream stays framed, and returned truncated so
+/// the caller can tell an oversized frame from a valid one.
+fn read_frame(reader: &mut impl BufRead) -> std::io::Result<Option<Vec<u8>>> {
+    let mut buf = Vec::with_capacity(1024);
+    let mut byte = [0u8; 1];
+    loop {
+        if reader.read(&mut byte)? == 0 {
+            return Ok(if buf.is_empty() { None } else { Some(buf) });
+        }
+        if byte[0] == b'\n' {
+            return Ok(Some(buf));
+        }
+        if buf.len() < MAX_FRAME {
+            buf.push(byte[0]);
+        }
+    }
+}
+
 /// Run the server until stdin closes.
 pub fn run() -> Result<()> {
     let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
     let mut out = std::io::stdout();
     // The last file analysed, cached so repeated tool calls on one target do not
     // re-run the whole engine each time.
     let mut cache: Option<(String, Session)> = None;
 
-    for line in stdin.lock().lines() {
-        let line = line?;
+    while let Some(frame) = read_frame(&mut reader)? {
+        if frame.len() >= MAX_FRAME {
+            continue; // oversized frame: drain-and-drop, fail closed
+        }
+        let line = String::from_utf8_lossy(&frame);
         if line.trim().is_empty() {
             continue;
         }
@@ -39,16 +69,24 @@ pub fn run() -> Result<()> {
             continue;
         };
 
-        let reply = match method {
-            "initialize" => ok(id, initialize()),
-            "ping" => ok(id, json!({})),
-            "tools/list" => ok(id, json!({ "tools": tool_list() })),
+        // The analysis it runs is a black box (dying inputs, adversarial bytes),
+        // so contain every request: a panic is reported as an error reply and
+        // the poisoned session is dropped so the next call re-analyzes clean.
+        let panic_id = id.clone();
+        let reply = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match method {
+            "initialize" => ok(id.clone(), initialize()),
+            "ping" => ok(id.clone(), json!({})),
+            "tools/list" => ok(id.clone(), json!({ "tools": tool_list() })),
             "tools/call" => match call_tool(&msg, &mut cache) {
-                Ok(text) => ok(id, tool_text(&text, false)),
-                Err(e) => ok(id, tool_text(&format!("error: {e:#}"), true)),
+                Ok(text) => ok(id.clone(), tool_text(&text, false)),
+                Err(e) => ok(id.clone(), tool_text(&format!("error: {e:#}"), true)),
             },
-            _ => err(id, -32601, "method not found"),
-        };
+            _ => err(id.clone(), -32601, "method not found"),
+        }))
+        .unwrap_or_else(|_| {
+            cache = None; // drop any state a panic may have poisoned
+            err(panic_id, -32603, "internal error: the analysis panicked")
+        });
         writeln!(out, "{}", serde_json::to_string(&reply)?)?;
         out.flush()?;
     }
@@ -234,7 +272,7 @@ fn list_functions(sess: &Session, args: &Value) -> String {
 fn decompile(sess: &Session, f: &engine::Function) -> String {
     let base = engine::display_base(&sess.bin);
     let strings = listing::string_map(&sess.bin, &sess.bytes, base);
-    ir::decompile(&sess.an, &sess.bin, f, &strings)
+    ir::decompile(&sess.an, &sess.bin, f, &strings, &sess.db)
         .into_iter()
         .map(|l| l.text)
         .collect::<Vec<_>>()
@@ -244,7 +282,12 @@ fn decompile(sess: &Session, f: &engine::Function) -> String {
 fn disassemble(sess: &Session, f: &engine::Function) -> String {
     let base = engine::display_base(&sess.bin);
     let strings = listing::string_map(&sess.bin, &sess.bytes, base);
-    listing::function(&sess.an, f, &sess.db, base, &strings)
+    let hints = if crate::analysis::driver::plausibly_a_driver(&sess.bin) {
+        crate::analysis::driver::listing_hints(&sess.bin, &sess.bytes, &sess.an)
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    listing::function(&sess.an, f, &sess.db, base, &strings, Some(&hints))
         .iter()
         .map(|l| render_line(l, base))
         .collect::<Vec<_>>()
@@ -265,7 +308,9 @@ fn render_line(l: &Line, base: u64) -> String {
             let mut s = format!("{:012x}  {mnemonic:<7} {operands}", addr + base);
             if let Some(a) = annot {
                 let t = match a {
-                    Annot::Note(t) | Annot::Symbol(t) | Annot::Local(t) => t.clone(),
+                    Annot::Note(t) | Annot::Symbol(t) | Annot::Local(t) | Annot::Hint(t) => {
+                        t.clone()
+                    }
                     Annot::Text(t) => format!("\"{t}\""),
                 };
                 s.push_str(&format!("  ; {t}"));

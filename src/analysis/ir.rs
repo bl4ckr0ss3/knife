@@ -14,15 +14,19 @@
 //! The reducible skeleton reads as nested C; the few edges that break nesting
 //! (shared `switch` tails, a jump into a common handler) become an explicit
 //! `goto` to a labelled block, so the flow is preserved exactly rather than
-//! approximated. It is still not a full decompiler: there is no type recovery.
+//! approximated. It is still not a full decompiler: type recovery is deliberately
+//! conservative and currently limited to ABI parameters, returns, literals, and
+//! known library prototypes.
 //! The honest rule holds throughout: an instruction the lifter does not model
 //! becomes an opaque `asm(...)` statement, never a guess.
 
 use crate::analysis::engine::{Analysis, Function};
 use crate::analysis::strings::Located;
+use crate::db::Db;
 use crate::model::{Binary, Format};
 use iced_x86::{
-    Decoder, DecoderOptions, Formatter, Instruction, IntelFormatter, Mnemonic, OpKind, Register,
+    Decoder, DecoderOptions, Formatter, Instruction, InstructionInfoFactory, IntelFormatter,
+    Mnemonic, OpAccess, OpKind, Register,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -33,6 +37,9 @@ use std::collections::{BTreeMap, BTreeSet};
 struct Rx<'a> {
     an: &'a Analysis,
     strings: &'a BTreeMap<u64, Located>,
+    db: &'a Db,
+    /// Base-relative function entry used to scope type bindings.
+    function: u64,
 }
 
 /// A short, escaped, quoted rendering of a string literal.
@@ -72,6 +79,9 @@ pub enum Expr {
     /// `Stack`, it is an address: `Mem` reads the global, `Addr` takes its address.
     Global(u64),
     Bin(&'static str, Box<Expr>, Box<Expr>),
+    /// A value selected by control flow at a CFG join. Inputs are deduplicated
+    /// and ordered by predecessor block, making the IR deterministic.
+    Phi(Vec<Expr>),
     /// A conditional value `cond ? a : b`, from a `cmov`.
     Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
     /// A resolved (or register-indirect) call with its recovered arguments.
@@ -120,6 +130,7 @@ pub fn decompile(
     bin: &Binary,
     f: &Function,
     strings: &BTreeMap<u64, Located>,
+    db: &Db,
 ) -> Vec<Line> {
     let win64 = bin.format == Format::Pe && an.bits == 64;
     let frame = has_frame_pointer(an, f);
@@ -151,6 +162,7 @@ pub fn decompile(
     // value defined on both arms of an if/else survives the join, while one
     // that differs on some path is dropped (conservative, never a guess).
     let rpo = reverse_postorder(&succ, 0);
+    let idom = dominators(&succ, 0);
     let mut entry: Vec<BTreeMap<Register, Expr>> = vec![BTreeMap::new(); n];
     let mut exit: Vec<BTreeMap<Register, Expr>> = vec![BTreeMap::new(); n];
     // The recovered comparison is carried the same way, so a `cmp` shared by
@@ -178,7 +190,11 @@ pub fn decompile(
         changed = false;
         guard += 1;
         for &i in &rpo {
-            let meet = meet_states(&preds[i], &exit);
+            // Expression-valued phi nodes converge for acyclic joins. Loop
+            // headers need stable SSA value IDs; until that pass exists, keep
+            // their merge conservative instead of recursively nesting phis.
+            let is_loop_header = preds[i].iter().any(|&p| dominates(i, p, &idom));
+            let meet = meet_states(&preds[i], &exit, !is_loop_header);
             let meet_c = meet_cmp(&preds[i], &exit_cmp);
             let meet_s = meet_stack(&preds[i], &exit_stk);
             let entry_changed =
@@ -197,6 +213,7 @@ pub fn decompile(
                     entry[i].clone(),
                     entry_cmp[i].clone(),
                     entry_stk[i].clone(),
+                    db,
                 );
                 blocks[i].stmts = stmts;
                 if exit_state != exit[i] || exit_c != exit_cmp[i] || exit_s != exit_stk[i] {
@@ -208,6 +225,11 @@ pub fn decompile(
             }
         }
     }
+
+    // A two-arm acyclic phi with a provable controlling branch is ordinary C's
+    // conditional operator. Lower only direct diamonds; complex joins keep an
+    // explicit `phi(...)` so the output never invents a condition.
+    lower_diamond_phis(&mut blocks, &preds, &succ, &idx);
 
     // Propagation happens during lifting (so a call snapshots each argument's
     // value at its push, not the register's final value). The passes left are
@@ -223,7 +245,90 @@ pub fn decompile(
     // Structure the control flow into nested if/else and while, with a goto for
     // the few edges that break nesting. The flat rendering is the fallback for a
     // graph structuring cannot accept at all (an unreachable or empty block).
-    structure(an, f, &blocks, strings).unwrap_or_else(|| render(an, f, &blocks, strings))
+    structure(an, bin, f, &blocks, strings, db)
+        .unwrap_or_else(|| render(an, bin, f, &blocks, strings, db))
+}
+
+fn lower_diamond_phis(
+    blocks: &mut [IrBlock],
+    preds: &[BTreeSet<usize>],
+    succ: &[Vec<usize>],
+    index: &BTreeMap<u64, usize>,
+) {
+    for join in 0..blocks.len() {
+        let incoming: Vec<usize> = preds[join].iter().copied().collect();
+        if incoming.len() != 2 {
+            continue;
+        }
+        let Some(control) = succ.iter().position(|edges| {
+            edges.len() == 2 && edges.contains(&incoming[0]) && edges.contains(&incoming[1])
+        }) else {
+            continue;
+        };
+        let Some((condition, target)) = blocks[control].stmts.iter().rev().find_map(|stmt| {
+            if let Stmt::Branch(condition, target) = stmt {
+                Some((condition.clone(), *target))
+            } else {
+                None
+            }
+        }) else {
+            continue;
+        };
+        let Some(&taken) = index.get(&target) else {
+            continue;
+        };
+        if !incoming.contains(&taken) {
+            continue;
+        }
+        let taken_pos = usize::from(incoming[1] == taken);
+        for statement in &mut blocks[join].stmts {
+            rewrite_stmt_phis(statement, &condition, taken_pos);
+        }
+    }
+}
+
+fn rewrite_stmt_phis(statement: &mut Stmt, condition: &Expr, taken_pos: usize) {
+    match statement {
+        Stmt::Set(dst, src) => {
+            rewrite_expr_phis(dst, condition, taken_pos);
+            rewrite_expr_phis(src, condition, taken_pos);
+        }
+        Stmt::CallVoid(expr)
+        | Stmt::Ret(Some(expr))
+        | Stmt::Branch(expr, _)
+        | Stmt::Switch(expr) => rewrite_expr_phis(expr, condition, taken_pos),
+        Stmt::Ret(None) | Stmt::Goto(_) | Stmt::Asm(_) => {}
+    }
+}
+
+fn rewrite_expr_phis(expr: &mut Expr, condition: &Expr, taken_pos: usize) {
+    match expr {
+        Expr::Phi(values) if values.len() == 2 => {
+            let fall_pos = 1 - taken_pos;
+            *expr = Expr::Ternary(
+                Box::new(condition.clone()),
+                Box::new(values[taken_pos].clone()),
+                Box::new(values[fall_pos].clone()),
+            );
+        }
+        Expr::Mem(inner) | Expr::Addr(inner) => rewrite_expr_phis(inner, condition, taken_pos),
+        Expr::Bin(_, left, right) => {
+            rewrite_expr_phis(left, condition, taken_pos);
+            rewrite_expr_phis(right, condition, taken_pos);
+        }
+        Expr::Phi(values) => values
+            .iter_mut()
+            .for_each(|value| rewrite_expr_phis(value, condition, taken_pos)),
+        Expr::Ternary(cond, yes, no) => {
+            rewrite_expr_phis(cond, condition, taken_pos);
+            rewrite_expr_phis(yes, condition, taken_pos);
+            rewrite_expr_phis(no, condition, taken_pos);
+        }
+        Expr::Call(_, args) => args
+            .iter_mut()
+            .for_each(|arg| rewrite_expr_phis(arg, condition, taken_pos)),
+        Expr::Const(_) | Expr::Reg(..) | Expr::Stack(_) | Expr::Global(_) | Expr::Opaque(_) => {}
+    }
 }
 
 /// The SSA merge rule for propagation state: a register keeps its value only
@@ -233,14 +338,34 @@ pub fn decompile(
 fn meet_states(
     preds: &BTreeSet<usize>,
     exit: &[BTreeMap<Register, Expr>],
+    allow_phi: bool,
 ) -> BTreeMap<Register, Expr> {
     let mut it = preds.iter();
     let Some(&first) = it.next() else {
         return BTreeMap::new();
     };
-    let mut out = exit[first].clone();
-    for &p in it {
-        out.retain(|k, v| exit[p].get(k) == Some(v));
+    let rest: Vec<usize> = it.copied().collect();
+    let mut out = BTreeMap::new();
+    for (&register, first_value) in &exit[first] {
+        let mut values = vec![first_value.clone()];
+        let mut complete = true;
+        for &p in &rest {
+            let Some(value) = exit[p].get(&register) else {
+                complete = false;
+                break;
+            };
+            if !values.contains(value) {
+                values.push(value.clone());
+            }
+        }
+        if complete && (values.len() == 1 || allow_phi) {
+            let value = if values.len() == 1 {
+                values.pop().expect("one merged value")
+            } else {
+                Expr::Phi(values)
+            };
+            out.insert(register, value);
+        }
     }
     out
 }
@@ -355,6 +480,7 @@ fn lift_block(
     entry: BTreeMap<Register, Expr>,
     entry_cmp: Option<Cmp>,
     entry_stack: StackSt,
+    db: &Db,
 ) -> (Vec<Stmt>, BTreeMap<Register, Expr>, Option<Cmp>, StackSt) {
     let mut st = Lift {
         regs: entry,
@@ -376,6 +502,7 @@ fn lift_block(
             win64,
             ins.target_name.as_deref(),
             &mut out,
+            db,
         );
     }
     (out, st.regs, st.cmp, st.stack)
@@ -598,7 +725,7 @@ fn update_stack(st: &mut Lift, d: &Instruction, ptr: i64) {
                         st.stack.alias.get(&base).copied()
                     };
                     if let Some(bo) = bo {
-                        let off = bo + mem_disp(d);
+                        let off = bo.saturating_add(mem_disp(d));
                         if is_sp {
                             st.stack.sp = Some(off);
                         } else {
@@ -614,11 +741,11 @@ fn update_stack(st: &mut Lift, d: &Instruction, ptr: i64) {
                     }
                     if is_sp {
                         if let Some(s) = st.stack.sp.as_mut() {
-                            *s += delta;
+                            *s = s.saturating_add(delta);
                         }
                         handled = true;
                     } else if let Some(o) = st.stack.alias.get(&dst).copied() {
-                        st.stack.alias.insert(dst, o + delta);
+                        st.stack.alias.insert(dst, o.saturating_add(delta));
                         handled = true;
                     }
                 }
@@ -646,6 +773,7 @@ fn lift_insn(
     win64: bool,
     target_name: Option<&str>,
     out: &mut Vec<Stmt>,
+    db: &Db,
 ) {
     use Mnemonic::*;
     let binset = |st: &Lift, op: &'static str| {
@@ -714,7 +842,7 @@ fn lift_insn(
             None
         }
         Call => {
-            let call = lift_call(d, st, an, bin, win64, target_name);
+            let call = lift_call(d, st, an, bin, win64, target_name, db);
             let ret = if an.bits == 32 {
                 Register::EAX
             } else {
@@ -825,10 +953,36 @@ fn update_state(st: &mut Lift, s: &Stmt) {
         if is_stack_reg(*root) {
             st.regs.remove(root);
         } else if is_pure(src) {
-            st.regs.insert(*root, src.clone());
+            // A hostile straight-line chain of dependent arithmetic (`add rax,1`
+            // repeated) would otherwise grow an arbitrarily deep expression tree
+            // as each instruction substitutes its operand's value, and every
+            // recursive pass over it (fold, liveness, rendering) would overflow
+            // the native stack. Cap what we carry: beyond this size we stop
+            // inlining the register and keep its name, so no tree ever recurses
+            // deeper than a couple of hundred levels.
+            if expr_nodes(src) > MAX_EXPR_NODES {
+                st.regs.insert(*root, reg(*root));
+            } else {
+                st.regs.insert(*root, src.clone());
+            }
         } else {
             st.regs.remove(root);
         }
+    }
+}
+
+/// How many nodes an expression tree has; the bound we use to stop propagating
+/// ever-deeper register substitutions (see `update_state`).
+const MAX_EXPR_NODES: usize = 512;
+
+fn expr_nodes(e: &Expr) -> usize {
+    match e {
+        Expr::Bin(_, l, r) => 1 + expr_nodes(l) + expr_nodes(r),
+        Expr::Mem(i) | Expr::Addr(i) => 1 + expr_nodes(i),
+        Expr::Ternary(c, a, b) => 1 + expr_nodes(c) + expr_nodes(a) + expr_nodes(b),
+        Expr::Phi(v) => 1 + v.iter().map(expr_nodes).sum::<usize>(),
+        Expr::Call(_, args) => 1 + args.iter().map(expr_nodes).sum::<usize>(),
+        Expr::Const(_) | Expr::Reg(..) | Expr::Stack(_) | Expr::Global(_) | Expr::Opaque(_) => 1,
     }
 }
 
@@ -839,10 +993,12 @@ fn lift_call(
     bin: &Binary,
     win64: bool,
     target_name: Option<&str>,
+    db: &Db,
 ) -> Expr {
+    let target = call_target(d, an, bin);
     let name = target_name
         .map(strip_module)
-        .or_else(|| call_target(d, an, bin).map(|t| an.label(t)))
+        .or_else(|| target.map(|t| an.label(t)))
         .unwrap_or_else(|| "sub".to_string());
 
     let args = if an.bits == 32 {
@@ -853,7 +1009,19 @@ fn lift_call(
         a
     } else {
         st.pushed.clear();
-        let n = arity(&name).unwrap_or(0);
+        // Known APIs have authoritative prototypes. For a direct call to code
+        // Knife recovered itself, conservatively inspect the callee instead:
+        // an ABI register is a parameter only when some entry-reachable path
+        // reads it before an unconditional write. Taking the highest used ABI
+        // slot preserves positional gaps (`rdx` implies a two-argument call).
+        let stored_arity = target.and_then(|address| {
+            db.prototype(address.wrapping_sub(an.display_base))
+                .map(|prototype| prototype.params.len())
+        });
+        let n = stored_arity
+            .or_else(|| arity(&name))
+            .or_else(|| target.and_then(|address| internal_arity(an, address, win64)))
+            .unwrap_or(0);
         arg_registers(win64)
             .iter()
             .take(n)
@@ -864,11 +1032,89 @@ fn lift_call(
     Expr::Call(name, args)
 }
 
+/// Recover a 64-bit internal callee's positional ABI arity from register
+/// use-before-definition. This is deliberately path-sensitive only for the
+/// one fact we need: after an unconditional write, that path can no longer
+/// prove the incoming register was consumed. Conditional writes leave the path
+/// live because the old argument can survive them.
+fn internal_arity(an: &Analysis, target: u64, win64: bool) -> Option<usize> {
+    let function = an.find_function(target)?;
+    let block_index: BTreeMap<u64, usize> = function
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.start, index))
+        .collect();
+    let entry = *block_index.get(&function.addr)?;
+    let mut highest = None;
+
+    for (position, &argument) in arg_registers(win64).iter().enumerate() {
+        let mut pending = vec![entry];
+        let mut visited = BTreeSet::new();
+        let mut consumed = false;
+
+        while let Some(index) = pending.pop() {
+            if !visited.insert(index) {
+                continue;
+            }
+            let block = &function.blocks[index];
+            let mut incoming_survives = true;
+            let mut info = InstructionInfoFactory::new();
+            for raw in &block.insns {
+                let Some(instruction) = decode(&raw.bytes, raw.addr, an.bits) else {
+                    continue;
+                };
+                let accesses: Vec<OpAccess> = info
+                    .info(&instruction)
+                    .used_registers()
+                    .iter()
+                    .filter(|used| {
+                        used.register().is_gpr() && used.register().full_register() == argument
+                    })
+                    .map(|used| used.access())
+                    .collect();
+                if accesses.iter().any(|access| {
+                    matches!(
+                        access,
+                        OpAccess::Read | OpAccess::CondRead | OpAccess::ReadWrite
+                    )
+                }) {
+                    consumed = true;
+                    break;
+                }
+                if accesses
+                    .iter()
+                    .any(|access| matches!(access, OpAccess::Write | OpAccess::ReadWrite))
+                {
+                    incoming_survives = false;
+                    break;
+                }
+            }
+            if consumed {
+                break;
+            }
+            if incoming_survives {
+                pending.extend(
+                    block
+                        .succ
+                        .iter()
+                        .filter_map(|successor| block_index.get(successor).copied()),
+                );
+            }
+        }
+        if consumed {
+            highest = Some(position + 1);
+        }
+    }
+    highest
+}
+
 fn is_pure(e: &Expr) -> bool {
     match e {
         Expr::Const(_) | Expr::Reg(..) | Expr::Stack(_) | Expr::Global(_) => true,
         Expr::Mem(a) | Expr::Addr(a) => is_pure(a),
         Expr::Bin(_, l, r) => is_pure(l) && is_pure(r),
+        Expr::Phi(values) => values.iter().all(is_pure),
         Expr::Ternary(c, a, b) => is_pure(c) && is_pure(a) && is_pure(b),
         // A call is never pure; an opaque value is not safe to duplicate.
         Expr::Call(..) | Expr::Opaque(_) => false,
@@ -880,6 +1126,7 @@ fn reads_mem(e: &Expr) -> bool {
         Expr::Mem(_) => true,
         Expr::Addr(a) => reads_mem(a),
         Expr::Bin(_, l, r) => reads_mem(l) || reads_mem(r),
+        Expr::Phi(values) => values.iter().any(reads_mem),
         Expr::Ternary(c, a, b) => reads_mem(c) || reads_mem(a) || reads_mem(b),
         Expr::Call(_, args) => args.iter().any(reads_mem),
         Expr::Const(_) | Expr::Reg(..) | Expr::Stack(_) | Expr::Global(_) | Expr::Opaque(_) => {
@@ -893,6 +1140,7 @@ fn contains_call(e: &Expr) -> bool {
         Expr::Call(..) => true,
         Expr::Mem(a) | Expr::Addr(a) => contains_call(a),
         Expr::Bin(_, l, r) => contains_call(l) || contains_call(r),
+        Expr::Phi(values) => values.iter().any(contains_call),
         Expr::Ternary(c, a, b) => contains_call(c) || contains_call(a) || contains_call(b),
         _ => false,
     }
@@ -1015,6 +1263,7 @@ fn reads_regs(e: &Expr, live: &mut BTreeSet<Register>) {
             reads_regs(l, live);
             reads_regs(r, live);
         }
+        Expr::Phi(values) => values.iter().for_each(|value| reads_regs(value, live)),
         Expr::Ternary(c, a, b) => {
             reads_regs(c, live);
             reads_regs(a, live);
@@ -1052,6 +1301,7 @@ fn fold(e: &mut Expr) {
                 }
             }
         }
+        Expr::Phi(values) => values.iter_mut().for_each(fold),
         Expr::Ternary(c, a, b) => {
             fold(c);
             fold(a);
@@ -1078,18 +1328,1024 @@ fn eval(op: &str, a: u64, b: u64) -> Option<u64> {
 
 // ── rendering ───────────────────────────────────────────────────────────────
 
-fn render(
+/// A deliberately small C type lattice. These are facts Knife can justify from
+/// the ABI and well-known prototypes; everything else remains an integer-sized
+/// opaque value instead of acquiring a speculative source-level type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CType {
+    Unknown,
+    Void,
+    Bool,
+    Int,
+    Size,
+    SignedSize,
+    CharPtr,
+    ConstCharPtr,
+    WCharPtr,
+    ConstWCharPtr,
+    VoidPtr,
+    ConstVoidPtr,
+}
+
+impl CType {
+    fn c(self) -> &'static str {
+        match self {
+            Self::Unknown => "uintptr_t",
+            Self::Void => "void",
+            Self::Bool => "bool",
+            Self::Int => "int",
+            Self::Size => "size_t",
+            Self::SignedSize => "ssize_t",
+            Self::CharPtr => "char *",
+            Self::ConstCharPtr => "const char *",
+            Self::WCharPtr => "wchar_t *",
+            Self::ConstWCharPtr => "const wchar_t *",
+            Self::VoidPtr => "void *",
+            Self::ConstVoidPtr => "const void *",
+        }
+    }
+
+    fn merge(self, other: Self) -> Self {
+        use CType::*;
+        match (self, other) {
+            (a, b) if a == b => a,
+            (Unknown, b) => b,
+            (a, Unknown) => a,
+            (CharPtr, ConstCharPtr) | (ConstCharPtr, CharPtr) => ConstCharPtr,
+            (WCharPtr, ConstWCharPtr) | (ConstWCharPtr, WCharPtr) => ConstWCharPtr,
+            (
+                CharPtr | ConstCharPtr | WCharPtr | ConstWCharPtr | VoidPtr | ConstVoidPtr,
+                CharPtr | ConstCharPtr | WCharPtr | ConstWCharPtr | VoidPtr | ConstVoidPtr,
+            ) => VoidPtr,
+            (Int | Size | SignedSize | Bool, Int | Size | SignedSize | Bool) => Unknown,
+            _ => Unknown,
+        }
+    }
+}
+
+fn stored_prototype<'a>(
     an: &Analysis,
+    db: &'a Db,
+    name: &str,
+) -> Option<&'a crate::db::UserPrototype> {
+    let function = an.find_by_name(name)?;
+    db.prototype(function.addr.wrapping_sub(an.display_base))
+}
+
+fn user_type_fact(value: &str) -> CType {
+    match value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .as_str()
+    {
+        "void" => CType::Void,
+        "bool" => CType::Bool,
+        "int" => CType::Int,
+        "size_t" => CType::Size,
+        "ssize_t" => CType::SignedSize,
+        "char *" => CType::CharPtr,
+        "const char *" => CType::ConstCharPtr,
+        "wchar_t *" => CType::WCharPtr,
+        "const wchar_t *" => CType::ConstWCharPtr,
+        "void *" => CType::VoidPtr,
+        "const void *" => CType::ConstVoidPtr,
+        other if other.contains('*') && other.starts_with("const ") => CType::ConstVoidPtr,
+        other if other.contains('*') => CType::VoidPtr,
+        _ => CType::Unknown,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Param {
+    Reg(Register),
+    Stack(i64),
+}
+
+fn prototype(name: &str) -> Option<(CType, &'static [CType])> {
+    use CType::*;
+    let bare = crate::analysis::thunks::bare_name(name);
+    Some(match bare {
+        "malloc" => (VoidPtr, &[Size]),
+        "calloc" => (VoidPtr, &[Size, Size]),
+        "realloc" => (VoidPtr, &[VoidPtr, Size]),
+        "free" => (Void, &[VoidPtr]),
+        "strlen" => (Size, &[ConstCharPtr]),
+        "atoi" => (Int, &[ConstCharPtr]),
+        "puts" | "system" => (Int, &[ConstCharPtr]),
+        "strcpy" | "strcat" | "lstrcpyA" | "lstrcatA" => (CharPtr, &[CharPtr, ConstCharPtr]),
+        "strncpy" | "strncat" => (CharPtr, &[CharPtr, ConstCharPtr, Size]),
+        "wcscpy" | "wcscat" | "lstrcpyW" | "lstrcatW" => (WCharPtr, &[WCharPtr, ConstWCharPtr]),
+        "wcslen" => (Size, &[ConstWCharPtr]),
+        "memcpy" | "memmove" => (VoidPtr, &[VoidPtr, ConstVoidPtr, Size]),
+        "memset" => (VoidPtr, &[VoidPtr, Int, Size]),
+        "strcmp" => (Int, &[ConstCharPtr, ConstCharPtr]),
+        "wcscmp" => (Int, &[ConstWCharPtr, ConstWCharPtr]),
+        "gets" => (CharPtr, &[CharPtr]),
+        "fgets" => (CharPtr, &[CharPtr, Int, VoidPtr]),
+        "RtlCopyMemory" | "CopyMemory" => (Void, &[VoidPtr, ConstVoidPtr, Size]),
+        "read" => (SignedSize, &[Int, VoidPtr, Size]),
+        "recv" => (Int, &[Int, VoidPtr, Size, Int]),
+        "getenv" | "GetCommandLineA" => (CharPtr, &[]),
+        "GetCommandLineW" => (WCharPtr, &[]),
+        _ => return None,
+    })
+}
+
+/// Summarize an internal function's return type without recursively invoking
+/// the decompiler. Every returning block must trace its final RAX/EAX write to
+/// the same known API return (possibly through another internal wrapper).
+fn internal_return_type(an: &Analysis, bin: &Binary, name: &str) -> Option<CType> {
+    let function = an.find_by_name(name)?;
+    let mut visiting = BTreeSet::new();
+    return_type_summary(an, bin, function, &mut visiting, 0)
+}
+
+fn return_type_summary(
+    an: &Analysis,
+    bin: &Binary,
+    function: &Function,
+    visiting: &mut BTreeSet<u64>,
+    depth: usize,
+) -> Option<CType> {
+    if depth >= 8 || !visiting.insert(function.addr) {
+        return None;
+    }
+    let mut summary: Option<CType> = None;
+    let mut saw_return = false;
+
+    for (block_index, block) in function.blocks.iter().enumerate() {
+        let is_return = block.insns.last().is_some_and(|raw| {
+            decode(&raw.bytes, raw.addr, an.bits)
+                .is_some_and(|instruction| instruction.mnemonic() == Mnemonic::Ret)
+        });
+        if !is_return {
+            continue;
+        }
+        saw_return = true;
+        let path_type = return_def_type(
+            an,
+            bin,
+            function,
+            block_index,
+            block.insns.len().saturating_sub(1),
+            visiting,
+            depth,
+            BTreeSet::new(),
+        );
+        let Some(path_type) = path_type else {
+            visiting.remove(&function.addr);
+            return None;
+        };
+        summary = Some(match summary {
+            None => path_type,
+            Some(previous) => {
+                let merged = previous.merge(path_type);
+                if merged == CType::Unknown {
+                    visiting.remove(&function.addr);
+                    return None;
+                }
+                merged
+            }
+        });
+    }
+    visiting.remove(&function.addr);
+    saw_return.then_some(summary).flatten()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn return_def_type(
+    an: &Analysis,
+    bin: &Binary,
+    function: &Function,
+    block_index: usize,
+    upto: usize,
+    visiting: &mut BTreeSet<u64>,
+    depth: usize,
+    mut seen: BTreeSet<usize>,
+) -> Option<CType> {
+    if !seen.insert(block_index) {
+        return None;
+    }
+    let block = &function.blocks[block_index];
+    let mut info = InstructionInfoFactory::new();
+    for raw in block.insns[..upto.min(block.insns.len())].iter().rev() {
+        let Some(instruction) = decode(&raw.bytes, raw.addr, an.bits) else {
+            continue;
+        };
+        // A call defines RAX/EAX by ABI convention, not by an architectural
+        // register effect encoded in the instruction. iced-x86 therefore does
+        // not report the return register as written; model it explicitly.
+        if instruction.mnemonic() == Mnemonic::Call {
+            let called =
+                raw.target_name.as_deref().map(strip_module).or_else(|| {
+                    call_target(&instruction, an, bin).map(|target| an.label(target))
+                })?;
+            return prototype(&called).map(|prototype| prototype.0).or_else(|| {
+                an.find_by_name(&called)
+                    .and_then(|callee| return_type_summary(an, bin, callee, visiting, depth + 1))
+            });
+        }
+        let writes_return = info.info(&instruction).used_registers().iter().any(|used| {
+            used.register().is_gpr()
+                && used.register().full_register() == Register::RAX
+                && matches!(
+                    used.access(),
+                    OpAccess::Write | OpAccess::ReadWrite | OpAccess::CondWrite
+                )
+        });
+        if !writes_return {
+            continue;
+        }
+        return None;
+    }
+
+    let predecessors: Vec<usize> = function
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, predecessor)| predecessor.succ.contains(&block.start))
+        .map(|(index, _)| index)
+        .collect();
+    let mut merged: Option<CType> = None;
+    for predecessor in predecessors {
+        let ty = return_def_type(
+            an,
+            bin,
+            function,
+            predecessor,
+            function.blocks[predecessor].insns.len(),
+            visiting,
+            depth,
+            seen.clone(),
+        )?;
+        merged = Some(match merged {
+            None => ty,
+            Some(previous) => {
+                let combined = previous.merge(ty);
+                if combined == CType::Unknown {
+                    return None;
+                }
+                combined
+            }
+        });
+    }
+    merged
+}
+
+fn internal_parameter_types(an: &Analysis, bin: &Binary, name: &str) -> Option<Vec<CType>> {
+    let function = an.find_by_name(name)?;
+    let mut visiting = BTreeSet::new();
+    parameter_type_summary(an, bin, function, &mut visiting, 0)
+}
+
+fn parameter_type_summary(
+    an: &Analysis,
+    bin: &Binary,
+    function: &Function,
+    visiting: &mut BTreeSet<u64>,
+    depth: usize,
+) -> Option<Vec<CType>> {
+    if an.bits != 64 || depth >= 8 || !visiting.insert(function.addr) {
+        return None;
+    }
+    let win64 = bin.format == Format::Pe;
+    let abi = arg_registers(win64);
+    let Some(arity) = internal_arity(an, function.addr, win64) else {
+        visiting.remove(&function.addr);
+        return None;
+    };
+    let index: BTreeMap<u64, usize> = function
+        .blocks
+        .iter()
+        .enumerate()
+        .map(|(position, block)| (block.start, position))
+        .collect();
+    let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); function.blocks.len()];
+    for (position, block) in function.blocks.iter().enumerate() {
+        for successor in &block.succ {
+            if let Some(&target) = index.get(successor) {
+                predecessors[target].push(position);
+            }
+        }
+    }
+    type Origins = BTreeMap<Register, BTreeSet<usize>>;
+    let mut entry = vec![Origins::new(); function.blocks.len()];
+    let mut exit = vec![Origins::new(); function.blocks.len()];
+    let mut facts: Vec<Option<CType>> = vec![None; arity];
+    let mut initial = Origins::new();
+    for (position, register) in abi.iter().take(arity).enumerate() {
+        initial.insert(*register, BTreeSet::from([position]));
+    }
+
+    let mut changed = true;
+    let mut guard = 0usize;
+    while changed && guard <= function.blocks.len().saturating_mul(abi.len() + 1) + 1 {
+        changed = false;
+        guard += 1;
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            let mut incoming = Origins::new();
+            if block.start == function.addr {
+                merge_origins(&mut incoming, &initial);
+            }
+            for predecessor in &predecessors[block_index] {
+                merge_origins(&mut incoming, &exit[*predecessor]);
+            }
+            if incoming != entry[block_index] {
+                entry[block_index] = incoming.clone();
+                changed = true;
+            }
+            let mut state = incoming;
+            let mut info = InstructionInfoFactory::new();
+            for raw in &block.insns {
+                let Some(instruction) = decode(&raw.bytes, raw.addr, an.bits) else {
+                    continue;
+                };
+                if instruction.mnemonic() == Mnemonic::Call {
+                    let called = raw.target_name.as_deref().map(strip_module).or_else(|| {
+                        call_target(&instruction, an, bin).map(|target| an.label(target))
+                    });
+                    if let Some(called) = called {
+                        let expected = prototype(&called)
+                            .map(|prototype| prototype.1.to_vec())
+                            .or_else(|| {
+                                an.find_by_name(&called).and_then(|callee| {
+                                    parameter_type_summary(an, bin, callee, visiting, depth + 1)
+                                })
+                            })
+                            .unwrap_or_default();
+                        for (call_position, expected_type) in expected.into_iter().enumerate() {
+                            if expected_type == CType::Unknown {
+                                continue;
+                            }
+                            let Some(register) = abi.get(call_position) else {
+                                break;
+                            };
+                            if let Some(origins) = state.get(register) {
+                                for &origin in origins {
+                                    merge_type_fact(&mut facts[origin], expected_type);
+                                }
+                            }
+                        }
+                    }
+                    for register in abi {
+                        state.remove(register);
+                    }
+                    state.remove(&Register::RAX);
+                    continue;
+                }
+
+                if instruction.mnemonic() == Mnemonic::Mov
+                    && instruction.op0_kind() == OpKind::Register
+                    && instruction.op1_kind() == OpKind::Register
+                {
+                    let destination = instruction.op0_register().full_register();
+                    let source = instruction.op1_register().full_register();
+                    match state.get(&source).cloned() {
+                        Some(origins) => {
+                            state.insert(destination, origins);
+                        }
+                        None => {
+                            state.remove(&destination);
+                        }
+                    }
+                    continue;
+                }
+                let written: Vec<Register> = info
+                    .info(&instruction)
+                    .used_registers()
+                    .iter()
+                    .filter(|used| {
+                        used.register().is_gpr()
+                            && matches!(
+                                used.access(),
+                                OpAccess::Write | OpAccess::ReadWrite | OpAccess::CondWrite
+                            )
+                    })
+                    .map(|used| used.register().full_register())
+                    .collect();
+                for register in written {
+                    state.remove(&register);
+                }
+            }
+            if state != exit[block_index] {
+                exit[block_index] = state;
+                changed = true;
+            }
+        }
+    }
+    visiting.remove(&function.addr);
+    Some(
+        facts
+            .into_iter()
+            .map(|fact| fact.unwrap_or(CType::Unknown))
+            .collect(),
+    )
+}
+
+fn merge_origins(
+    destination: &mut BTreeMap<Register, BTreeSet<usize>>,
+    source: &BTreeMap<Register, BTreeSet<usize>>,
+) {
+    for (register, origins) in source {
+        destination
+            .entry(*register)
+            .or_default()
+            .extend(origins.iter().copied());
+    }
+}
+
+fn merge_type_fact(fact: &mut Option<CType>, incoming: CType) {
+    *fact = Some(match *fact {
+        None => incoming,
+        Some(CType::Unknown) => CType::Unknown,
+        Some(previous) => previous.merge(incoming),
+    });
+}
+
+#[derive(Clone, Copy)]
+struct TypeCx<'a> {
+    strings: &'a BTreeMap<u64, Located>,
+    an: &'a Analysis,
+    bin: &'a Binary,
+    db: &'a Db,
+    function: u64,
+}
+
+fn field_type_fact(address: &Expr, cx: TypeCx<'_>) -> Option<CType> {
+    let Expr::Bin(op @ ("+" | "-"), base, offset) = address else {
+        return None;
+    };
+    let Expr::Const(offset) = offset.as_ref() else {
+        return None;
+    };
+    if !simple_field_base(base) || *offset == 0 {
+        return None;
+    }
+    let signed = i64::try_from(*offset).ok().and_then(|offset| {
+        if *op == "-" {
+            offset.checked_neg()
+        } else {
+            Some(offset)
+        }
+    })?;
+    let identity = field_base_identity(
+        base,
+        Rx {
+            an: cx.an,
+            strings: cx.strings,
+            db: cx.db,
+            function: cx.function,
+        },
+    )?;
+    let type_name = cx.db.bound_type(cx.function, &identity)?;
+    let data_type = cx
+        .db
+        .fields
+        .get(type_name)?
+        .get(&signed)?
+        .data_type
+        .as_deref()?;
+    Some(user_type_fact(data_type))
+}
+
+fn expr_type(e: &Expr, cx: TypeCx<'_>, return_cache: &mut BTreeMap<String, CType>) -> CType {
+    match e {
+        Expr::Const(v) if cx.strings.contains_key(v) => CType::ConstCharPtr,
+        Expr::Addr(_) => CType::VoidPtr,
+        Expr::Mem(address) => field_type_fact(address, cx).unwrap_or(CType::Unknown),
+        Expr::Call(name, _) => stored_prototype(cx.an, cx.db, name)
+            .map(|prototype| user_type_fact(&prototype.returns))
+            .or_else(|| prototype(name).map(|prototype| prototype.0))
+            .unwrap_or_else(|| {
+                if let Some(cached) = return_cache.get(name) {
+                    return *cached;
+                }
+                let recovered = internal_return_type(cx.an, cx.bin, name).unwrap_or(CType::Unknown);
+                return_cache.insert(name.clone(), recovered);
+                recovered
+            }),
+        Expr::Bin(op, _, _) if matches!(*op, "==" | "!=" | "<" | "<=" | ">" | ">=") => CType::Bool,
+        Expr::Ternary(_, a, b) => {
+            expr_type(a, cx, return_cache).merge(expr_type(b, cx, return_cache))
+        }
+        Expr::Phi(values) => values.iter().fold(CType::Unknown, |ty, value| {
+            ty.merge(expr_type(value, cx, return_cache))
+        }),
+        _ => CType::Unknown,
+    }
+}
+
+/// Local-storage classification does not need call-graph context. Keep this
+/// small variant for synthetic IR tests and for facts that are authoritative
+/// without resolving an internal callee.
+fn expr_type_shallow(e: &Expr, strings: &BTreeMap<u64, Located>) -> CType {
+    match e {
+        Expr::Const(v) if strings.contains_key(v) => CType::ConstCharPtr,
+        Expr::Addr(_) => CType::VoidPtr,
+        Expr::Call(name, _) => prototype(name).map_or(CType::Unknown, |prototype| prototype.0),
+        Expr::Bin(op, _, _) if matches!(*op, "==" | "!=" | "<" | "<=" | ">" | ">=") => CType::Bool,
+        Expr::Ternary(_, a, b) => {
+            expr_type_shallow(a, strings).merge(expr_type_shallow(b, strings))
+        }
+        Expr::Phi(values) => values.iter().fold(CType::Unknown, |ty, value| {
+            ty.merge(expr_type_shallow(value, strings))
+        }),
+        _ => CType::Unknown,
+    }
+}
+
+fn expr_type_with_regs(
+    e: &Expr,
+    regs: &BTreeMap<Register, CType>,
+    cx: TypeCx<'_>,
+    return_cache: &mut BTreeMap<String, CType>,
+) -> CType {
+    match e {
+        Expr::Reg(root, _) => regs.get(root).copied().unwrap_or(CType::Unknown),
+        _ => expr_type(e, cx, return_cache),
+    }
+}
+
+fn params_in(e: &Expr, out: &mut BTreeSet<Param>) {
+    match e {
+        Expr::Reg(root, _) => {
+            out.insert(Param::Reg(*root));
+        }
+        Expr::Mem(a) if matches!(a.as_ref(), Expr::Stack(off) if *off > 0) => {
+            if let Expr::Stack(off) = a.as_ref() {
+                out.insert(Param::Stack(*off));
+            }
+        }
+        Expr::Mem(a) | Expr::Addr(a) => params_in(a, out),
+        Expr::Bin(_, a, b) => {
+            params_in(a, out);
+            params_in(b, out);
+        }
+        Expr::Phi(values) => values.iter().for_each(|value| params_in(value, out)),
+        Expr::Ternary(c, a, b) => {
+            params_in(c, out);
+            params_in(a, out);
+            params_in(b, out);
+        }
+        Expr::Call(_, args) => args.iter().for_each(|arg| params_in(arg, out)),
+        _ => {}
+    }
+}
+
+fn address_base_register(e: &Expr) -> Option<Register> {
+    match e {
+        Expr::Reg(root, _) => Some(*root),
+        Expr::Bin("+" | "-", base, _) => address_base_register(base),
+        _ => None,
+    }
+}
+
+fn pointer_params_in(e: &Expr, facts: &mut BTreeMap<Param, CType>) {
+    if let Expr::Mem(address) = e {
+        if let Some(reg) = address_base_register(address) {
+            let param = Param::Reg(reg);
+            let old = facts.get(&param).copied().unwrap_or(CType::Unknown);
+            facts.insert(param, old.merge(CType::VoidPtr));
+        }
+    }
+    match e {
+        Expr::Mem(a) | Expr::Addr(a) => pointer_params_in(a, facts),
+        Expr::Bin(_, a, b) => {
+            pointer_params_in(a, facts);
+            pointer_params_in(b, facts);
+        }
+        Expr::Phi(values) => values
+            .iter()
+            .for_each(|value| pointer_params_in(value, facts)),
+        Expr::Ternary(c, a, b) => {
+            pointer_params_in(c, facts);
+            pointer_params_in(a, facts);
+            pointer_params_in(b, facts);
+        }
+        Expr::Call(_, args) => args.iter().for_each(|arg| pointer_params_in(arg, facts)),
+        Expr::Const(_) | Expr::Reg(..) | Expr::Stack(_) | Expr::Global(_) | Expr::Opaque(_) => {}
+    }
+}
+
+fn visit_stmt_exprs(s: &Stmt, mut visit: impl FnMut(&Expr)) {
+    match s {
+        Stmt::Set(_, src) => visit(src),
+        Stmt::CallVoid(e) | Stmt::Ret(Some(e)) | Stmt::Branch(e, _) | Stmt::Switch(e) => visit(e),
+        Stmt::Ret(None) | Stmt::Goto(_) | Stmt::Asm(_) => {}
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalKind {
+    Scalar(CType),
+    Bytes,
+    Chars,
+    WideChars,
+}
+
+impl LocalKind {
+    fn merge(self, other: Self) -> Self {
+        use LocalKind::*;
+        match (self, other) {
+            (a, b) if a == b => a,
+            (Scalar(a), Scalar(b)) => Scalar(a.merge(b)),
+            (Chars, Chars) => Chars,
+            (WideChars, WideChars) => WideChars,
+            // Addressed storage with incompatible pointee evidence remains raw
+            // bytes. That is less specific, but never invents a character width.
+            _ => Bytes,
+        }
+    }
+
+    fn declaration(self, off: i64, bound_type: Option<&str>, alias: Option<&str>) -> String {
+        let recovered = slot_name(off);
+        let name = alias.unwrap_or(&recovered);
+        if let Some(type_name) = bound_type {
+            return format!("{type_name} * {name};");
+        }
+        match self {
+            Self::Scalar(ty) => format!("{} {name};", ty.c()),
+            Self::Bytes => format!("uint8_t {name}[]; /* extent unresolved */"),
+            Self::Chars => format!("char {name}[]; /* extent unresolved */"),
+            Self::WideChars => format!("wchar_t {name}[]; /* extent unresolved */"),
+        }
+    }
+}
+
+fn local_kind_for_pointer(expected: Option<CType>) -> LocalKind {
+    match expected {
+        Some(CType::CharPtr | CType::ConstCharPtr) => LocalKind::Chars,
+        Some(CType::WCharPtr | CType::ConstWCharPtr) => LocalKind::WideChars,
+        _ => LocalKind::Bytes,
+    }
+}
+
+fn record_local(locals: &mut BTreeMap<i64, LocalKind>, off: i64, kind: LocalKind) {
+    if off >= 0 {
+        return;
+    }
+    locals
+        .entry(off)
+        .and_modify(|old| *old = old.merge(kind))
+        .or_insert(kind);
+}
+
+fn locals_in_expr(
+    e: &Expr,
+    expected: Option<CType>,
+    strings: &BTreeMap<u64, Located>,
+    locals: &mut BTreeMap<i64, LocalKind>,
+    context: Option<(&Analysis, &Binary, &Db)>,
+    parameter_cache: &mut BTreeMap<String, Option<Vec<CType>>>,
+) {
+    match e {
+        Expr::Addr(a) if matches!(a.as_ref(), Expr::Stack(off) if *off < 0) => {
+            if let Expr::Stack(off) = a.as_ref() {
+                record_local(locals, *off, local_kind_for_pointer(expected));
+            }
+        }
+        Expr::Mem(a) if matches!(a.as_ref(), Expr::Stack(off) if *off < 0) => {
+            if let Expr::Stack(off) = a.as_ref() {
+                record_local(
+                    locals,
+                    *off,
+                    LocalKind::Scalar(expected.unwrap_or(CType::Unknown)),
+                );
+            }
+        }
+        Expr::Call(name, args) => {
+            let expected_args = context
+                .and_then(|(an, _, db)| stored_prototype(an, db, name))
+                .map(|prototype| {
+                    prototype
+                        .params
+                        .iter()
+                        .map(|param| user_type_fact(param))
+                        .collect()
+                })
+                .or_else(|| prototype(name).map(|prototype| prototype.1.to_vec()))
+                .or_else(|| {
+                    context.and_then(|(an, bin, _)| {
+                        parameter_cache
+                            .entry(name.clone())
+                            .or_insert_with(|| internal_parameter_types(an, bin, name))
+                            .clone()
+                    })
+                })
+                .unwrap_or_default();
+            for (index, arg) in args.iter().enumerate() {
+                locals_in_expr(
+                    arg,
+                    expected_args.get(index).copied(),
+                    strings,
+                    locals,
+                    context,
+                    parameter_cache,
+                );
+            }
+        }
+        Expr::Mem(a) => locals_in_expr(
+            a,
+            Some(CType::VoidPtr),
+            strings,
+            locals,
+            context,
+            parameter_cache,
+        ),
+        Expr::Addr(a) => locals_in_expr(a, expected, strings, locals, context, parameter_cache),
+        Expr::Bin(_, a, b) => {
+            locals_in_expr(a, expected, strings, locals, context, parameter_cache);
+            locals_in_expr(b, expected, strings, locals, context, parameter_cache);
+        }
+        Expr::Phi(values) => {
+            for value in values {
+                locals_in_expr(value, expected, strings, locals, context, parameter_cache);
+            }
+        }
+        Expr::Ternary(c, a, b) => {
+            locals_in_expr(
+                c,
+                Some(CType::Bool),
+                strings,
+                locals,
+                context,
+                parameter_cache,
+            );
+            locals_in_expr(a, expected, strings, locals, context, parameter_cache);
+            locals_in_expr(b, expected, strings, locals, context, parameter_cache);
+        }
+        Expr::Const(_) | Expr::Reg(..) | Expr::Stack(_) | Expr::Global(_) | Expr::Opaque(_) => {
+            let _ = strings;
+        }
+    }
+}
+
+#[cfg(test)]
+fn local_declarations(
+    blocks: &[IrBlock],
+    strings: &BTreeMap<u64, Located>,
+    db: &Db,
+    function: u64,
+) -> Vec<String> {
+    local_declarations_impl(blocks, strings, db, function, None)
+}
+
+fn local_declarations_with_context(
+    blocks: &[IrBlock],
+    strings: &BTreeMap<u64, Located>,
+    db: &Db,
+    function: u64,
+    an: &Analysis,
+    bin: &Binary,
+) -> Vec<String> {
+    local_declarations_impl(blocks, strings, db, function, Some((an, bin, db)))
+}
+
+fn local_declarations_impl(
+    blocks: &[IrBlock],
+    strings: &BTreeMap<u64, Located>,
+    db: &Db,
+    function: u64,
+    context: Option<(&Analysis, &Binary, &Db)>,
+) -> Vec<String> {
+    let mut locals = BTreeMap::new();
+    let mut parameter_cache = BTreeMap::new();
+    for block in blocks {
+        for stmt in &block.stmts {
+            match stmt {
+                Stmt::Set(dst, src) => {
+                    if let Expr::Mem(a) = dst {
+                        if let Expr::Stack(off) = a.as_ref() {
+                            record_local(
+                                &mut locals,
+                                *off,
+                                LocalKind::Scalar(expr_type_shallow(src, strings)),
+                            );
+                        }
+                    }
+                    locals_in_expr(
+                        dst,
+                        None,
+                        strings,
+                        &mut locals,
+                        context,
+                        &mut parameter_cache,
+                    );
+                    locals_in_expr(
+                        src,
+                        None,
+                        strings,
+                        &mut locals,
+                        context,
+                        &mut parameter_cache,
+                    );
+                }
+                Stmt::CallVoid(e) | Stmt::Ret(Some(e)) | Stmt::Branch(e, _) | Stmt::Switch(e) => {
+                    locals_in_expr(e, None, strings, &mut locals, context, &mut parameter_cache)
+                }
+                Stmt::Ret(None) | Stmt::Goto(_) | Stmt::Asm(_) => {}
+            }
+        }
+    }
+    locals
+        .into_iter()
+        .map(|(off, kind)| {
+            let base = slot_name(off);
+            kind.declaration(
+                off,
+                db.bound_type(function, &base),
+                db.variable_name(function, &base),
+            )
+        })
+        .collect()
+}
+
+fn function_signature(
+    an: &Analysis,
+    bin: &Binary,
     f: &Function,
     blocks: &[IrBlock],
     strings: &BTreeMap<u64, Located>,
+    db: &Db,
+) -> String {
+    let function = f.addr.wrapping_sub(an.display_base);
+    let abi_regs: &[Register] = if an.bits == 32 {
+        &[]
+    } else if bin.format == Format::Pe {
+        &[Register::RCX, Register::RDX, Register::R8, Register::R9]
+    } else {
+        &[
+            Register::RDI,
+            Register::RSI,
+            Register::RDX,
+            Register::RCX,
+            Register::R8,
+            Register::R9,
+        ]
+    };
+    let mut found = BTreeSet::new();
+    let mut facts: BTreeMap<Param, CType> = BTreeMap::new();
+    let mut ret = CType::Void;
+    let mut has_value_return = false;
+    let mut value_regs: BTreeMap<Register, CType> = BTreeMap::new();
+    let mut return_cache = BTreeMap::new();
+    let mut parameter_cache: BTreeMap<String, Option<Vec<CType>>> = BTreeMap::new();
+    let type_cx = TypeCx {
+        strings,
+        an,
+        bin,
+        db,
+        function,
+    };
+
+    // Recover register value types first. Merging all assignments is
+    // conservative across branches and register reuse: disagreement drops back
+    // to uintptr_t rather than choosing whichever assignment was visited last.
+    for block in blocks {
+        for stmt in &block.stmts {
+            if let Stmt::Set(Expr::Reg(root, _), src) = stmt {
+                let ty = expr_type_with_regs(src, &value_regs, type_cx, &mut return_cache);
+                let old = value_regs.get(root).copied().unwrap_or(CType::Unknown);
+                value_regs.insert(*root, old.merge(ty));
+            }
+        }
+    }
+
+    for block in blocks {
+        for stmt in &block.stmts {
+            visit_stmt_exprs(stmt, |e| {
+                params_in(e, &mut found);
+                pointer_params_in(e, &mut facts);
+                if let Expr::Call(name, args) = e {
+                    let expected = stored_prototype(an, db, name)
+                        .map(|prototype| {
+                            prototype
+                                .params
+                                .iter()
+                                .map(|param| user_type_fact(param))
+                                .collect()
+                        })
+                        .or_else(|| prototype(name).map(|prototype| prototype.1.to_vec()))
+                        .or_else(|| {
+                            parameter_cache
+                                .entry(name.clone())
+                                .or_insert_with(|| internal_parameter_types(an, bin, name))
+                                .clone()
+                        });
+                    if let Some(expected) = expected {
+                        for (arg, ty) in args.iter().zip(&expected) {
+                            let mut used = BTreeSet::new();
+                            params_in(arg, &mut used);
+                            for param in used {
+                                let old = facts.get(&param).copied().unwrap_or(CType::Unknown);
+                                facts.insert(param, old.merge(*ty));
+                            }
+                        }
+                    }
+                }
+            });
+            if let Stmt::Ret(Some(value)) = stmt {
+                let ty = expr_type_with_regs(value, &value_regs, type_cx, &mut return_cache);
+                ret = if has_value_return { ret.merge(ty) } else { ty };
+                has_value_return = true;
+            }
+        }
+    }
+    if has_value_return && ret == CType::Void {
+        ret = CType::Unknown;
+    }
+    found.retain(|param| match param {
+        Param::Reg(reg) => abi_regs.contains(reg),
+        Param::Stack(_) => an.bits == 32,
+    });
+
+    let mut ordered = Vec::new();
+    for reg in abi_regs {
+        let param = Param::Reg(*reg);
+        if found.remove(&param) {
+            ordered.push(param);
+        }
+    }
+    ordered.extend(found);
+    let name = if f.name.is_empty() {
+        format!("sub_{:x}", f.addr + an.display_base)
+    } else {
+        f.name.clone()
+    };
+    if let Some(prototype) = db.prototype(function) {
+        let params = prototype
+            .params
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| {
+                let recovered = if let Some(register) = abi_regs.get(index) {
+                    format!("{register:?}").to_lowercase()
+                } else if an.bits == 32 {
+                    slot_name(((index + 1) * 4) as i64)
+                } else {
+                    format!("arg_{}", index + 1)
+                };
+                let param_name = db.variable_name(function, &recovered).unwrap_or(&recovered);
+                format!("{ty} {param_name}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("{} {}({params}) {{", prototype.returns, name);
+    }
+    let args: Vec<String> = ordered
+        .into_iter()
+        .map(|param| {
+            let recovered = match param {
+                Param::Reg(reg) => format!("{reg:?}").to_lowercase(),
+                Param::Stack(off) => slot_name(off),
+            };
+            let name = db
+                .variable_name(function, &recovered)
+                .unwrap_or(&recovered)
+                .to_string();
+            let ty = db
+                .bound_type(function, &recovered)
+                .map(|type_name| format!("{type_name} *"))
+                .unwrap_or_else(|| {
+                    facts
+                        .get(&param)
+                        .copied()
+                        .unwrap_or(CType::Unknown)
+                        .c()
+                        .to_string()
+                });
+            format!("{ty} {name}")
+        })
+        .collect();
+    format!("{} {}({}) {{", ret.c(), name, args.join(", "))
+}
+
+fn render(
+    an: &Analysis,
+    bin: &Binary,
+    f: &Function,
+    blocks: &[IrBlock],
+    strings: &BTreeMap<u64, Located>,
+    db: &Db,
 ) -> Vec<Line> {
-    let r = Rx { an, strings };
+    let function = f.addr.wrapping_sub(an.display_base);
+    let r = Rx {
+        an,
+        strings,
+        db,
+        function,
+    };
     let base = an.display_base;
     let mut out = vec![Line {
         label: true,
-        text: format!("sub_{:x}() {{", f.addr + base),
+        text: function_signature(an, bin, f, blocks, strings, db),
     }];
+    out.extend(
+        local_declarations_with_context(blocks, strings, db, function, an, bin)
+            .into_iter()
+            .map(|text| Line { label: false, text }),
+    );
     for (i, b) in blocks.iter().enumerate() {
         if i > 0 {
             out.push(Line {
@@ -1353,11 +2609,19 @@ fn dominates(a: usize, b: usize, idom: &[usize]) -> bool {
 /// block, or an empty function).
 fn structure(
     an: &Analysis,
+    bin: &Binary,
     f: &Function,
     blocks: &[IrBlock],
     strings: &BTreeMap<u64, Located>,
+    db: &Db,
 ) -> Option<Vec<Line>> {
-    let r = Rx { an, strings };
+    let function = f.addr.wrapping_sub(an.display_base);
+    let r = Rx {
+        an,
+        strings,
+        db,
+        function,
+    };
     let cfg = build_cfg(blocks);
     let n = cfg.body.len();
     if n == 0 {
@@ -1424,8 +2688,16 @@ fn structure(
     };
     out.lines.push(Line {
         label: true,
-        text: format!("sub_{:x}() {{", f.addr + base),
+        text: function_signature(an, bin, f, blocks, strings, db),
     });
+    out.lines.extend(
+        local_declarations_with_context(blocks, strings, db, function, an, bin)
+            .into_iter()
+            .map(|text| Line {
+                label: false,
+                text: format!("    {text}"),
+            }),
+    );
     out.emit(0, None, None, 1);
     out.lines.push(Line {
         label: true,
@@ -1786,10 +3058,27 @@ fn render_stmt(s: &Stmt, base: u64, r: Rx) -> String {
 /// `arg_8` for an argument (above it), `frame` for the base itself.
 fn slot_name(off: i64) -> String {
     match off.cmp(&0) {
-        std::cmp::Ordering::Less => format!("var_{:x}", -off),
+        std::cmp::Ordering::Less => format!("var_{:x}", off.wrapping_neg()),
         std::cmp::Ordering::Greater => format!("arg_{off:x}"),
         std::cmp::Ordering::Equal => "frame".to_string(),
     }
+}
+
+fn display_base(r: Rx, recovered: String) -> String {
+    r.db.variable_name(r.function, &recovered)
+        .unwrap_or(&recovered)
+        .to_string()
+}
+
+fn display_register(r: Rx, root: Register, shown: Register) -> String {
+    let shown = format!("{shown:?}").to_lowercase();
+    if let Some(alias) = r.db.variable_name(r.function, &shown) {
+        return alias.to_string();
+    }
+    let full = format!("{:?}", root.full_register()).to_lowercase();
+    r.db.variable_name(r.function, &full)
+        .unwrap_or(&shown)
+        .to_string()
 }
 
 /// The name of a global: its symbol or import name when the engine knows one,
@@ -1812,6 +3101,45 @@ fn global_addr(r: Rx, va: u64) -> String {
     }
 }
 
+fn simple_field_base(e: &Expr) -> bool {
+    match e {
+        Expr::Reg(root, _) => !is_stack_reg(*root),
+        Expr::Mem(_) | Expr::Global(_) | Expr::Call(_, _) => true,
+        _ => false,
+    }
+}
+
+fn field_base_identity(e: &Expr, r: Rx) -> Option<String> {
+    let identity = match e {
+        Expr::Reg(_, shown) => format!("{shown:?}").to_lowercase(),
+        Expr::Mem(a) => match a.as_ref() {
+            Expr::Stack(off) => slot_name(*off),
+            _ => return None,
+        },
+        Expr::Global(va) => global_name(r.an, *va),
+        Expr::Call(name, _) => crate::analysis::thunks::bare_name(name).to_string(),
+        _ => return None,
+    };
+    crate::db::valid_base(&identity).then_some(identity)
+}
+
+fn render_field(base: &Expr, op: &str, offset: u64, r: Rx) -> String {
+    let shown_base = render_expr(base, r);
+    let signed = if op == "-" {
+        i64::try_from(offset).ok().and_then(i64::checked_neg)
+    } else {
+        i64::try_from(offset).ok()
+    };
+    let named = field_base_identity(base, r).and_then(|identity| {
+        signed.and_then(|offset| r.db.field_name(r.function, &identity, offset))
+    });
+    match (named, op) {
+        (Some(name), _) => format!("{shown_base}->{name}"),
+        (None, "-") => format!("{shown_base}->field_m{offset:x}"),
+        (None, _) => format!("{shown_base}->field_{offset:x}"),
+    }
+}
+
 fn render_expr(e: &Expr, r: Rx) -> String {
     match e {
         // An immediate that is exactly the address of a string literal is a
@@ -1820,22 +3148,35 @@ fn render_expr(e: &Expr, r: Rx) -> String {
             Some(s) => quote(&s.text),
             None => format!("0x{v:x}"),
         },
-        Expr::Reg(_, shown) => format!("{shown:?}").to_lowercase(),
-        Expr::Stack(off) => slot_name(*off),
+        Expr::Reg(root, shown) => display_register(r, *root, *shown),
+        Expr::Stack(off) => display_base(r, slot_name(*off)),
         Expr::Global(va) => global_name(r.an, *va),
         // A frame slot or global reads as its name, not `*(name)`; its address
         // reads as `&name`, or the quoted text when it points at a string.
         Expr::Mem(a) => match a.as_ref() {
-            Expr::Stack(off) => slot_name(*off),
+            Expr::Stack(off) => display_base(r, slot_name(*off)),
             Expr::Global(va) => global_name(r.an, *va),
+            Expr::Bin(op @ ("+" | "-"), base, offset)
+                if simple_field_base(base)
+                    && matches!(offset.as_ref(), Expr::Const(value) if *value != 0) =>
+            {
+                let Expr::Const(offset) = offset.as_ref() else {
+                    unreachable!("guarded above")
+                };
+                render_field(base, op, *offset, r)
+            }
             _ => format!("*({})", render_expr(a, r)),
         },
         Expr::Addr(a) => match a.as_ref() {
-            Expr::Stack(off) => format!("&{}", slot_name(*off)),
+            Expr::Stack(off) => format!("&{}", display_base(r, slot_name(*off))),
             Expr::Global(va) => global_addr(r, *va),
             _ => format!("&({})", render_expr(a, r)),
         },
         Expr::Bin(op, l, r2) => format!("{} {op} {}", render_expr(l, r), render_expr(r2, r)),
+        Expr::Phi(values) => {
+            let values: Vec<String> = values.iter().map(|value| render_expr(value, r)).collect();
+            format!("phi({})", values.join(", "))
+        }
         Expr::Ternary(c, a, b) => format!(
             "{} ? {} : {}",
             render_expr(c, r),
@@ -2011,12 +3352,13 @@ fn arg_registers(win64: bool) -> &'static [Register] {
 
 fn arity(name: &str) -> Option<usize> {
     let bare = crate::analysis::thunks::bare_name(name);
-    Some(match bare {
+    let legacy = match bare {
         "malloc" | "free" | "atoi" | "puts" | "strlen" | "system" => 1,
         "strcpy" | "strcat" | "lstrcpyA" | "lstrcpyW" | "lstrcatA" | "lstrcatW" => 2,
         "memcpy" | "memmove" | "memset" | "strncpy" | "strncat" | "snprintf" => 3,
-        _ => return None,
-    })
+        _ => return prototype(name).map(|(_, args)| args.len()),
+    };
+    Some(legacy)
 }
 
 #[cfg(test)]
@@ -2054,7 +3396,301 @@ mod tests {
         bytes.extend_from_slice(&code);
         let an = engine::analyze(&bin, &bytes, 10_000, &Db::default());
         let f = an.find_function(va).unwrap();
-        decompile(&an, &bin, f, &BTreeMap::new())
+        decompile(&an, &bin, f, &BTreeMap::new(), &Db::default())
+    }
+
+    #[test]
+    fn an_internal_x64_call_recovers_arguments_from_the_callee() {
+        let va = 0x1000u64;
+        // caller: mov ecx,7; mov edx,9; call 0x1020; ret
+        let mut code = vec![
+            0xb9, 0x07, 0x00, 0x00, 0x00, 0xba, 0x09, 0x00, 0x00, 0x00, 0xe8, 0x11, 0x00, 0x00,
+            0x00, 0xc3,
+        ];
+        code.resize(0x20, 0x90);
+        // callee: lea eax,[rcx+rdx]; ret. Both incoming ABI registers are read
+        // before definition, proving a two-argument internal function.
+        code.extend_from_slice(&[0x8d, 0x04, 0x11, 0xc3]);
+        let mut bin = Binary::stub(Format::Pe, Arch::X86_64);
+        bin.entry = va;
+        bin.sections = vec![Section {
+            name: ".text".into(),
+            vaddr: va,
+            vsize: code.len() as u64,
+            file_off: va,
+            file_size: code.len() as u64,
+            entropy: 0.0,
+            read: true,
+            write: false,
+            exec: true,
+        }];
+        let mut bytes = vec![0u8; va as usize];
+        bytes.extend_from_slice(&code);
+        let an = engine::analyze(&bin, &bytes, 10_000, &Db::default());
+        let caller = an.find_function(va).expect("caller");
+        let lines = decompile(&an, &bin, caller, &BTreeMap::new(), &Db::default());
+        let joined = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("sub_1020(0x7, 0x9)"),
+            "callee-derived arity should preserve both arguments:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn an_internal_wrapper_propagates_a_known_return_type() {
+        let va = 0x1000u64;
+        // caller: call wrapper; ret
+        let mut code = vec![0xe8, 0x1b, 0x00, 0x00, 0x00, 0xc3];
+        code.resize(0x20, 0x90);
+        // wrapper: mov ecx,0x20; call [malloc_slot]; ret
+        code.extend_from_slice(&[
+            0xb9, 0x20, 0x00, 0x00, 0x00, 0xff, 0x15, 0xd5, 0x0f, 0x00, 0x00, 0xc3,
+        ]);
+        let mut bin = Binary::stub(Format::Pe, Arch::X86_64);
+        bin.entry = va;
+        bin.sections = vec![Section {
+            name: ".text".into(),
+            vaddr: va,
+            vsize: code.len() as u64,
+            file_off: va,
+            file_size: code.len() as u64,
+            entropy: 0.0,
+            read: true,
+            write: false,
+            exec: true,
+        }];
+        bin.symbols = vec![Symbol {
+            addr: 0x2000,
+            name: "malloc".into(),
+            kind: SymKind::Import,
+        }];
+        let mut bytes = vec![0u8; va as usize];
+        bytes.extend_from_slice(&code);
+        let an = engine::analyze(&bin, &bytes, 10_000, &Db::default());
+        let caller = an.find_function(va).expect("caller");
+        let lines = decompile(&an, &bin, caller, &BTreeMap::new(), &Db::default());
+        assert_eq!(
+            internal_return_type(&an, &bin, "sub_1020"),
+            Some(CType::VoidPtr),
+            "the wrapper itself must have a stable summary"
+        );
+        let signatures = an
+            .functions
+            .iter()
+            .map(|function| {
+                let rendered = decompile(&an, &bin, function, &BTreeMap::new(), &Db::default());
+                format!(
+                    "{:x} {} => {}\n{}",
+                    function.addr,
+                    function.name,
+                    rendered.first().map_or("", |line| line.text.as_str()),
+                    rendered
+                        .iter()
+                        .map(|line| line.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            lines
+                .first()
+                .is_some_and(|line| line.text.starts_with("void * entry(")),
+            "wrapper return type should reach the caller:\n{signatures}"
+        );
+    }
+
+    #[test]
+    fn an_overwritten_wrapper_return_does_not_propagate_a_stale_type() {
+        let va = 0x1000u64;
+        let mut code = vec![0xe8, 0x1b, 0x00, 0x00, 0x00, 0xc3];
+        code.resize(0x20, 0x90);
+        // The call returns void *, but xor eax,eax replaces that value before
+        // ret, so the wrapper's source-level return type is not proven.
+        code.extend_from_slice(&[
+            0xb9, 0x20, 0x00, 0x00, 0x00, 0xff, 0x15, 0xd5, 0x0f, 0x00, 0x00, 0x31, 0xc0, 0xc3,
+        ]);
+        let mut bin = Binary::stub(Format::Pe, Arch::X86_64);
+        bin.entry = va;
+        bin.sections = vec![Section {
+            name: ".text".into(),
+            vaddr: va,
+            vsize: code.len() as u64,
+            file_off: va,
+            file_size: code.len() as u64,
+            entropy: 0.0,
+            read: true,
+            write: false,
+            exec: true,
+        }];
+        bin.symbols = vec![Symbol {
+            addr: 0x2000,
+            name: "malloc".into(),
+            kind: SymKind::Import,
+        }];
+        let mut bytes = vec![0u8; va as usize];
+        bytes.extend_from_slice(&code);
+        let an = engine::analyze(&bin, &bytes, 10_000, &Db::default());
+        assert_eq!(internal_return_type(&an, &bin, "sub_1020"), None);
+        let caller = an.find_function(va).expect("caller");
+        let lines = decompile(&an, &bin, caller, &BTreeMap::new(), &Db::default());
+        assert!(
+            lines
+                .first()
+                .is_some_and(|line| line.text.starts_with("uintptr_t entry(")),
+            "an overwritten call result must remain conservative: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_internal_callee_propagates_a_parameter_type_to_its_caller() {
+        let va = 0x1000u64;
+        // caller: return sub_1020(rcx)
+        let mut code = vec![0xe8, 0x1b, 0x00, 0x00, 0x00, 0xc3];
+        code.resize(0x20, 0x90);
+        // wrapper: preserve rcx through rax, then pass it to strlen. The copy
+        // makes the incoming parameter use explicit in machine semantics while
+        // exercising provenance across a register hop.
+        code.extend_from_slice(&[
+            0x48, 0x89, 0xc8, // mov rax,rcx
+            0x48, 0x89, 0xc1, // mov rcx,rax
+            0xff, 0x15, 0xd4, 0x0f, 0x00, 0x00, // call [strlen_slot]
+            0xc3,
+        ]);
+        let mut bin = Binary::stub(Format::Pe, Arch::X86_64);
+        bin.entry = va;
+        bin.sections = vec![Section {
+            name: ".text".into(),
+            vaddr: va,
+            vsize: code.len() as u64,
+            file_off: va,
+            file_size: code.len() as u64,
+            entropy: 0.0,
+            read: true,
+            write: false,
+            exec: true,
+        }];
+        bin.symbols = vec![Symbol {
+            addr: 0x2000,
+            name: "strlen".into(),
+            kind: SymKind::Import,
+        }];
+        let mut bytes = vec![0u8; va as usize];
+        bytes.extend_from_slice(&code);
+        let an = engine::analyze(&bin, &bytes, 10_000, &Db::default());
+        assert_eq!(
+            internal_parameter_types(&an, &bin, "sub_1020"),
+            Some(vec![CType::ConstCharPtr])
+        );
+        let caller = an.find_function(va).expect("caller");
+        let lines = decompile(&an, &bin, caller, &BTreeMap::new(), &Db::default());
+        assert!(
+            lines
+                .first()
+                .is_some_and(|line| { line.text.starts_with("size_t entry(const char * rcx)") }),
+            "callee parameter evidence should type the caller: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_overwritten_callee_argument_does_not_propagate_a_stale_type() {
+        let va = 0x1000u64;
+        let mut code = vec![0xe8, 0x1b, 0x00, 0x00, 0x00, 0xc3];
+        code.resize(0x20, 0x90);
+        // rcx is observed, proving the wrapper has one input, but is replaced
+        // before strlen. The API's pointer constraint belongs to zero, not to
+        // the original caller argument.
+        code.extend_from_slice(&[
+            0x48, 0x89, 0xc8, // mov rax,rcx
+            0x31, 0xc9, // xor ecx,ecx
+            0xff, 0x15, 0xd5, 0x0f, 0x00, 0x00, // call [strlen_slot]
+            0xc3,
+        ]);
+        let mut bin = Binary::stub(Format::Pe, Arch::X86_64);
+        bin.entry = va;
+        bin.sections = vec![Section {
+            name: ".text".into(),
+            vaddr: va,
+            vsize: code.len() as u64,
+            file_off: va,
+            file_size: code.len() as u64,
+            entropy: 0.0,
+            read: true,
+            write: false,
+            exec: true,
+        }];
+        bin.symbols = vec![Symbol {
+            addr: 0x2000,
+            name: "strlen".into(),
+            kind: SymKind::Import,
+        }];
+        let mut bytes = vec![0u8; va as usize];
+        bytes.extend_from_slice(&code);
+        let an = engine::analyze(&bin, &bytes, 10_000, &Db::default());
+        assert_eq!(
+            internal_parameter_types(&an, &bin, "sub_1020"),
+            Some(vec![CType::Unknown])
+        );
+        let caller = an.find_function(va).expect("caller");
+        let lines = decompile(&an, &bin, caller, &BTreeMap::new(), &Db::default());
+        assert!(
+            lines
+                .first()
+                .is_some_and(|line| line.text.starts_with("size_t entry(uintptr_t rcx)")),
+            "overwritten provenance must remain pointer-sized and unknown: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_internal_callee_types_a_callers_stack_buffer() {
+        let va = 0x1000u64;
+        // caller: allocate a frame, pass &var_8 to the wrapper, restore, ret.
+        let mut code = vec![
+            0x48, 0x83, 0xec, 0x28, // sub rsp,0x28
+            0x48, 0x8d, 0x4c, 0x24, 0x20, // lea rcx,[rsp+0x20]
+            0xe8, 0x32, 0x00, 0x00, 0x00, // call 0x1040
+            0x48, 0x83, 0xc4, 0x28, // add rsp,0x28
+            0xc3,
+        ];
+        code.resize(0x40, 0x90);
+        // wrapper forwards its input to strlen through rax.
+        code.extend_from_slice(&[
+            0x48, 0x89, 0xc8, 0x48, 0x89, 0xc1, 0xff, 0x15, 0xb4, 0x0f, 0x00, 0x00, 0xc3,
+        ]);
+        let mut bin = Binary::stub(Format::Pe, Arch::X86_64);
+        bin.entry = va;
+        bin.sections = vec![Section {
+            name: ".text".into(),
+            vaddr: va,
+            vsize: code.len() as u64,
+            file_off: va,
+            file_size: code.len() as u64,
+            entropy: 0.0,
+            read: true,
+            write: false,
+            exec: true,
+        }];
+        bin.symbols = vec![Symbol {
+            addr: 0x2000,
+            name: "strlen".into(),
+            kind: SymKind::Import,
+        }];
+        let mut bytes = vec![0u8; va as usize];
+        bytes.extend_from_slice(&code);
+        let an = engine::analyze(&bin, &bytes, 10_000, &Db::default());
+        let caller = an.find_function(va).expect("caller");
+        let lines = decompile(&an, &bin, caller, &BTreeMap::new(), &Db::default());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text.trim() == "char var_8[]; /* extent unresolved */"),
+            "the wrapper's pointee type should reach caller storage: {lines:?}"
+        );
     }
 
     #[test]
@@ -2105,6 +3741,85 @@ mod tests {
         );
     }
 
+    fn framed_copy(name: &str) -> Vec<Line> {
+        // push ebp; mov ebp,esp; sub esp,20h; source=arg_8; dest=&var_20.
+        lines_x86(
+            name,
+            vec![
+                0x55, 0x8b, 0xec, 0x83, 0xec, 0x20, 0x8b, 0x45, 0x08, 0x50, 0x8d, 0x45, 0xe0, 0x50,
+            ],
+        )
+    }
+
+    #[test]
+    fn a_narrow_string_api_recovers_a_character_stack_buffer() {
+        let joined = framed_copy("lstrcpyA")
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("char var_20[]; /* extent unresolved */"),
+            "the destination local should be declared from lstrcpyA's prototype:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn a_wide_string_api_recovers_a_wide_character_stack_buffer() {
+        let joined = framed_copy("lstrcpyW")
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("wchar_t var_20[]; /* extent unresolved */"),
+            "the destination local should be declared from lstrcpyW's prototype:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn conflicting_pointee_evidence_degrades_a_local_to_raw_bytes() {
+        let local = Expr::Addr(Box::new(Expr::Stack(-0x20)));
+        let blocks = [IrBlock {
+            start: 0x1000,
+            stmts: vec![
+                Stmt::CallVoid(Expr::Call(
+                    "lstrcpyA".into(),
+                    vec![local.clone(), Expr::Opaque("src_a".into())],
+                )),
+                Stmt::CallVoid(Expr::Call(
+                    "lstrcpyW".into(),
+                    vec![local, Expr::Opaque("src_w".into())],
+                )),
+            ],
+            succ: Vec::new(),
+        }];
+        assert_eq!(
+            local_declarations(&blocks, &BTreeMap::new(), &Db::default(), 0),
+            vec!["uint8_t var_20[]; /* extent unresolved */"]
+        );
+    }
+
+    #[test]
+    fn a_direct_stack_slot_recovers_a_scalar_type() {
+        let blocks = [IrBlock {
+            start: 0x1000,
+            stmts: vec![Stmt::Set(
+                Expr::Mem(Box::new(Expr::Stack(-8))),
+                Expr::Bin(
+                    "==",
+                    Box::new(Expr::Reg(Register::RAX, Register::EAX)),
+                    Box::new(Expr::Const(0)),
+                ),
+            )],
+            succ: Vec::new(),
+        }];
+        assert_eq!(
+            local_declarations(&blocks, &BTreeMap::new(), &Db::default(), 0),
+            vec!["bool var_8;"]
+        );
+    }
+
     #[test]
     fn an_unmodelled_instruction_stays_verbatim() {
         let lines = lines_x86("puts", vec![0x0f, 0xa2]); // cpuid
@@ -2134,11 +3849,15 @@ mod tests {
         bytes.extend_from_slice(&code);
         let an = engine::analyze(&bin, &bytes, 10_000, &Db::default());
         let f = an.find_function(va).unwrap();
-        decompile(&an, &bin, f, &BTreeMap::new())
+        decompile(&an, &bin, f, &BTreeMap::new(), &Db::default())
     }
 
     /// The same, for a 64-bit PE with no import slot.
     fn lines_x64_raw(code: Vec<u8>) -> Vec<Line> {
+        lines_x64_raw_with_db(code, &Db::default())
+    }
+
+    fn lines_x64_raw_with_db(code: Vec<u8>, db: &Db) -> Vec<Line> {
         let va = 0x1000u64;
         let mut bin = Binary::stub(Format::Pe, Arch::X86_64);
         bin.entry = va;
@@ -2155,9 +3874,265 @@ mod tests {
         }];
         let mut bytes = vec![0u8; va as usize];
         bytes.extend_from_slice(&code);
+        let an = engine::analyze(&bin, &bytes, 10_000, db);
+        let f = an.find_function(va).unwrap();
+        decompile(&an, &bin, f, &BTreeMap::new(), db)
+    }
+
+    fn lines_x64_call(name: &str) -> Vec<Line> {
+        let (va, slot) = (0x1000u64, 0x2000u64);
+        // call qword ptr [rip + 0xffa] -> import slot 0x2000; ret
+        let code = [0xff, 0x15, 0xfa, 0x0f, 0x00, 0x00, 0xc3];
+        let mut bin = Binary::stub(Format::Pe, Arch::X86_64);
+        bin.entry = va;
+        bin.sections = vec![Section {
+            name: ".text".into(),
+            vaddr: va,
+            vsize: code.len() as u64,
+            file_off: va,
+            file_size: code.len() as u64,
+            entropy: 0.0,
+            read: true,
+            write: false,
+            exec: true,
+        }];
+        bin.symbols = vec![Symbol {
+            addr: slot,
+            name: name.into(),
+            kind: SymKind::Import,
+        }];
+        let mut bytes = vec![0u8; va as usize];
+        bytes.extend_from_slice(&code);
         let an = engine::analyze(&bin, &bytes, 10_000, &Db::default());
         let f = an.find_function(va).unwrap();
-        decompile(&an, &bin, f, &BTreeMap::new())
+        decompile(&an, &bin, f, &BTreeMap::new(), &Db::default())
+    }
+
+    #[test]
+    fn a_known_api_recovers_the_function_parameter_and_return_types() {
+        let lines = lines_x64_call("strlen");
+        let signature = &lines[0].text;
+        assert!(
+            signature.starts_with("size_t ") && signature.contains("(const char * rcx)"),
+            "strlen's prototype should constrain the wrapper signature, got: {:?}",
+            lines.iter().map(|line| &line.text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_unknown_abi_value_stays_explicitly_pointer_sized() {
+        // mov rax, rcx; ret -- there is no evidence for a narrower semantic type.
+        let lines = lines_x64_raw(vec![0x48, 0x8b, 0xc1, 0xc3]);
+        let signature = &lines[0].text;
+        assert!(
+            signature.starts_with("uintptr_t ") && signature.contains("(uintptr_t rcx)"),
+            "unknown types must stay honest and ABI-sized, got: {signature}"
+        );
+    }
+
+    #[test]
+    fn a_user_prototype_overrides_the_recovered_signature_exactly() {
+        let mut db = Db::default();
+        db.set_prototype(
+            0x1000,
+            "bool",
+            &[
+                "CONTEXT *".into(),
+                "const uint8_t *".into(),
+                "size_t".into(),
+            ],
+        )
+        .unwrap();
+        let lines = lines_x64_raw_with_db(vec![0x48, 0x8b, 0xc1, 0xc3], &db);
+        assert_eq!(
+            lines[0].text,
+            "bool entry(CONTEXT * rcx, const uint8_t * rdx, size_t r8) {"
+        );
+    }
+
+    #[test]
+    fn a_user_prototype_controls_internal_call_arity_and_return_type() {
+        let va = 0x1000u64;
+        // caller sets two ABI arguments; callee itself is an opaque `ret`, so
+        // byte-derived analysis alone cannot recover either its arity or type.
+        let mut code = vec![
+            0xb9, 0x07, 0x00, 0x00, 0x00, 0xba, 0x09, 0x00, 0x00, 0x00, 0xe8, 0x11, 0x00, 0x00,
+            0x00, 0xc3,
+        ];
+        code.resize(0x20, 0x90);
+        code.push(0xc3);
+        let mut bin = Binary::stub(Format::Pe, Arch::X86_64);
+        bin.entry = va;
+        bin.sections = vec![Section {
+            name: ".text".into(),
+            vaddr: va,
+            vsize: code.len() as u64,
+            file_off: va,
+            file_size: code.len() as u64,
+            entropy: 0.0,
+            read: true,
+            write: false,
+            exec: true,
+        }];
+        let mut bytes = vec![0u8; va as usize];
+        bytes.extend_from_slice(&code);
+        let mut db = Db::default();
+        db.set_prototype(0x1020, "bool", &["int".into(), "size_t".into()])
+            .unwrap();
+        let an = engine::analyze(&bin, &bytes, 10_000, &db);
+        let caller = an.find_function(va).expect("caller");
+        let lines = decompile(&an, &bin, caller, &BTreeMap::new(), &db);
+        let joined = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(lines[0].text.starts_with("bool entry()"), "{joined}");
+        assert!(joined.contains("sub_1020(0x7, 0x9)"), "{joined}");
+    }
+
+    #[test]
+    fn a_constant_pointer_offset_becomes_a_synthetic_field() {
+        // mov eax,[rcx+8]; ret
+        let lines = lines_x64_raw(vec![0x8b, 0x41, 0x08, 0xc3]);
+        let joined = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            lines[0].text.contains("(void * rcx)"),
+            "dereference use should constrain the ABI parameter: {joined}"
+        );
+        assert!(
+            joined.contains("eax = rcx->field_8;"),
+            "constant member displacement should become a stable field: {joined}"
+        );
+    }
+
+    #[test]
+    fn a_bound_user_type_replaces_the_signature_and_synthetic_field() {
+        let mut db = Db::default();
+        db.set_typed_field("CONTEXT", 8, "length", Some("bool"))
+            .unwrap();
+        db.bind_type(0x1000, "rcx", "CONTEXT").unwrap();
+        let lines = lines_x64_raw_with_db(vec![0x8b, 0x41, 0x08, 0xc3], &db);
+        let joined = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            lines[0].text.contains("CONTEXT * rcx"),
+            "the bound type should override void *: {joined}"
+        );
+        assert!(
+            joined.contains("rcx->length") && !joined.contains("field_8"),
+            "the user field should replace the synthetic name: {joined}"
+        );
+        assert!(
+            lines[0].text.starts_with("bool entry("),
+            "the typed load should constrain the recovered return: {joined}"
+        );
+    }
+
+    #[test]
+    fn a_function_scoped_variable_alias_renders_without_breaking_field_facts() {
+        let mut db = Db::default();
+        db.set_typed_field("CONTEXT", 8, "length", Some("size_t"))
+            .unwrap();
+        db.bind_type(0x1000, "rcx", "CONTEXT").unwrap();
+        db.set_variable(0x1000, "rcx", "request").unwrap();
+        let lines = lines_x64_raw_with_db(vec![0x48, 0x8b, 0x41, 0x08, 0xc3], &db);
+        let joined = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(lines[0].text.contains("CONTEXT * request"), "{joined}");
+        assert!(joined.contains("request->length"), "{joined}");
+        assert!(!joined.contains("rcx->"), "{joined}");
+    }
+
+    #[test]
+    fn an_exact_prototype_uses_variable_aliases_for_parameter_names() {
+        let mut db = Db::default();
+        db.set_prototype(0x1000, "bool", &["CONTEXT *".into()])
+            .unwrap();
+        db.set_variable(0x1000, "rcx", "context").unwrap();
+        // mov eax,ecx; ret -- the alias belongs to full rcx but should also
+        // label its 32-bit use instead of mixing `context` and `ecx`.
+        let lines = lines_x64_raw_with_db(vec![0x8b, 0xc1, 0xc3], &db);
+        assert_eq!(lines[0].text, "bool entry(CONTEXT * context) {");
+        assert!(lines.iter().any(|line| line.text.contains("eax = context")));
+    }
+
+    #[test]
+    fn a_constant_pointer_store_uses_the_same_field_notation() {
+        // mov [rcx+10h],edx; ret
+        let joined = lines_x64_raw(vec![0x89, 0x51, 0x10, 0xc3])
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("rcx->field_10 = edx;"),
+            "field writes should match field reads: {joined}"
+        );
+    }
+
+    #[test]
+    fn indexed_memory_stays_exact_pointer_arithmetic() {
+        // mov eax,[rcx+rdx*4+8]; ret
+        let lines = lines_x64_raw(vec![0x8b, 0x44, 0x91, 0x08, 0xc3]);
+        let joined = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("rdx * 0x4"),
+            "the scaled index must survive: {joined}"
+        );
+        assert!(
+            !joined.contains("field_8"),
+            "an indexed address is not enough evidence for an aggregate field: {joined}"
+        );
+        assert!(
+            lines[0].text.contains("void * rcx") && lines[0].text.contains("uintptr_t rdx"),
+            "only the address base should become a pointer: {joined}"
+        );
+    }
+
+    #[test]
+    fn a_negative_pointer_offset_has_an_unambiguous_field_name() {
+        // mov eax,[rcx-8]; ret
+        let joined = lines_x64_raw(vec![0x8b, 0x41, 0xf8, 0xc3])
+            .into_iter()
+            .map(|line| line.text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains("rcx->field_m8"),
+            "negative offsets need a stable name: {joined}"
+        );
+    }
+
+    #[test]
+    fn a_local_used_as_a_field_base_becomes_a_pointer() {
+        let blocks = [IrBlock {
+            start: 0x1000,
+            stmts: vec![Stmt::Ret(Some(Expr::Mem(Box::new(Expr::Bin(
+                "+",
+                Box::new(Expr::Mem(Box::new(Expr::Stack(-8)))),
+                Box::new(Expr::Const(8)),
+            )))))],
+            succ: Vec::new(),
+        }];
+        assert_eq!(
+            local_declarations(&blocks, &BTreeMap::new(), &Db::default(), 0),
+            vec!["void * var_8;"]
+        );
     }
 
     #[test]
@@ -2278,7 +4253,7 @@ mod tests {
         let an = engine::analyze(&bin, &bytes, 10_000, &Db::default());
         let strings = crate::listing::string_map(&bin, &bytes, engine::display_base(&bin));
         let f = an.find_function(va).unwrap();
-        let joined = decompile(&an, &bin, f, &strings)
+        let joined = decompile(&an, &bin, f, &strings, &Db::default())
             .into_iter()
             .map(|l| l.text)
             .collect::<Vec<_>>()
@@ -2325,7 +4300,7 @@ mod tests {
         let an = engine::analyze(&bin, &bytes, 10_000, &Db::default());
         let strings = crate::listing::string_map(&bin, &bytes, 0);
         let f = an.find_function(va).unwrap();
-        let joined = decompile(&an, &bin, f, &strings)
+        let joined = decompile(&an, &bin, f, &strings, &Db::default())
             .into_iter()
             .map(|l| l.text)
             .collect::<Vec<_>>()
@@ -2583,6 +4558,32 @@ mod tests {
         assert!(
             text.iter().any(|s| s.contains("puts(0x7)")),
             "the constant defined on both arms flows through the join: {text:?}"
+        );
+    }
+
+    #[test]
+    fn differing_values_on_two_arms_become_a_conditional_value() {
+        // cmp [ebp+8],0 ; je else ; mov eax,7 ; jmp end ; else: mov eax,9 ;
+        // end: push eax ; call puts. A conservative merge used to discard eax
+        // here. Preserve both reaching definitions explicitly instead.
+        let code = vec![
+            0x83, 0x7d, 0x08, 0x00, // cmp dword [ebp+8], 0
+            0x74, 0x07, // je +7  -> else
+            0xb8, 0x07, 0x00, 0x00, 0x00, // mov eax, 7
+            0xeb, 0x05, // jmp +5 -> end
+            0xb8, 0x09, 0x00, 0x00, 0x00, // mov eax, 9   (else)
+            0x50, // push eax
+        ];
+        let lines = lines_x86("puts", code);
+        let text: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
+        assert!(
+            text.iter()
+                .any(|line| line.contains("puts(") && line.contains("? 0x9 : 0x7")),
+            "the controlling branch should select both reaching values: {text:?}"
+        );
+        assert!(
+            text.iter().all(|line| !line.contains("phi(")),
+            "a provable direct diamond should lower to C syntax: {text:?}"
         );
     }
 }

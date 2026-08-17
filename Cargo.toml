@@ -2,7 +2,7 @@
 # The `knife` name is taken on crates.io, so the crate publishes as `reknife`
 # while the installed command stays `knife` (see [[bin]] below).
 name = "reknife"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 rust-version = "1.88"
 description = "A reverse engineer's binary Swiss-army knife: parse, triage, and disassemble PE/ELF/Mach-O. Installs as `knife`."
@@ -40,12 +40,16 @@ sha1 = "0.10"
 md-5 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+bincode = { version = "2", features = ["serde"] }
 regex = "1"
 memmap2 = "0.9"
 owo-colors = "4"
 anyhow = "1"
-yara-x = "1.5.0"
+yara-x = "=1.5.0"
 ratatui = "0.30"
+cpp_demangle = "0.5.1"
+msvc-demangler = "0.11.0"
+rustc-demangle = "0.1.28"
 
 [profile.release]
 opt-level = 3

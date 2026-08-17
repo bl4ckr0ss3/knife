@@ -2,7 +2,7 @@
 //! flatten its per-format structures into our neutral `Binary` model.
 
 mod elf;
-#[cfg(test)]
+#[doc(hidden)]
 pub mod fixture;
 mod macho;
 mod pe;

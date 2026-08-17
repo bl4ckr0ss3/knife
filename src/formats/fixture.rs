@@ -9,8 +9,6 @@
 //! else, so the tests exercise the whole chain and run identically on every
 //! platform.
 
-#![cfg(test)]
-
 const EHDR: usize = 64;
 const PHDR: usize = 56;
 const SHDR: usize = 64;
@@ -528,6 +526,208 @@ pub fn pe_with_iat_call() -> Vec<u8> {
 // Mach-O
 // ────────────────────────────────────────────────────────────────────────────
 
+/// A 64-bit x86_64 native-subsystem kernel driver with a realistic BYOVD
+/// shape: `DriverEntry` at the entry point, ntoskrnl imports (device-creation,
+/// symbolic-link, IRP-stack, MmMapIoSpace, RtlCopyMemory) mixed with one
+/// ordinal import, a `.pdata` exception directory seeding two functions, a
+/// stored `MajorFunction[14]` dispatch hook, an IOCTL constant compare, and a
+/// physical-memory map call in the dispatch handler. This is what the driver
+/// pass (`knife drv`) and the kernel sinks work against.
+///
+/// Identity mapping again: image_base is 0 and RVA equals file offset, so the
+/// displacement arithmetic below is the same trick the other PE fixture uses.
+pub fn pe_with_driver() -> Vec<u8> {
+    let mut f = vec![0u8; 0x6800];
+
+    // ── DOS + COFF + optional header (offsets follow the standard PE32+ layout) ──
+    f[0..2].copy_from_slice(b"MZ");
+    put32(&mut f, 0x3c, 0x80);
+    f[0x80..0x84].copy_from_slice(b"PE\0\0");
+    put16(&mut f, 0x84, 0x8664); // machine = x86-64
+    put16(&mut f, 0x86, 4); // number of sections
+    put32(&mut f, 0x88, 1); // time date stamp
+    put16(&mut f, 0x94, 0xf0); // size of optional header
+    put16(&mut f, 0x96, 0x22); // EXECUTABLE | LARGE_ADDRESS_AWARE
+    put16(&mut f, 0x98, 0x20b); // optional header magic (PE32+)
+    put32(&mut f, 0x9c, 0x200); // size of code
+    put32(&mut f, 0xa0, 0x400); // size of initialized data
+    put32(&mut f, 0xa8, 0x1000); // entry point = DriverEntry
+    put32(&mut f, 0xac, 0x1000); // base of code
+    put64(&mut f, 0xb0, 0); // image base
+    put32(&mut f, 0xb8, 0x1000); // section alignment
+    put32(&mut f, 0xbc, 0x200); // file alignment
+    put16(&mut f, 0xc0, 6); // major OS version
+    put16(&mut f, 0xc8, 6); // major subsystem version
+    put32(&mut f, 0xd0, 0x6800); // size of image
+    put32(&mut f, 0xd4, 0x200); // size of headers
+    put16(&mut f, 0xdc, 1); // subsystem = native
+    put16(&mut f, 0xde, 0x40); // DLL characteristics: DYNAMIC_BASE
+    put64(&mut f, 0xe0, 0x10_0000); // size of stack reserve
+    put64(&mut f, 0xe8, 0x1000); // size of stack commit
+    put64(&mut f, 0xf0, 0x10_0000); // size of heap reserve
+    put64(&mut f, 0xf8, 0x1000); // size of heap commit
+    put32(&mut f, 0x104, 16); // number of RVA and sizes
+    let dir = |i: usize| 0x108 + i * 8;
+    put32(&mut f, dir(1), 0x3000); // import table (RVA, size)
+    put32(&mut f, dir(1) + 4, 0x28);
+    put32(&mut f, dir(3), 0x2800); // exception directory (.pdata)
+    put32(&mut f, dir(3) + 4, 0x24);
+    put32(&mut f, dir(12), 0x3300); // import address table
+    put32(&mut f, dir(12) + 4, 0x40);
+
+    // ── section headers ──
+    const SEC_RX: u32 = 0x6000_0020; // code | read | exec
+    const SEC_R: u32 = 0x4000_0040; // initialized data | read
+    const SEC_RW: u32 = 0xC000_0040; // initialized data | read | write
+    let sh = |i: usize| 0x188 + i * 40;
+    f[sh(0)..sh(0) + 8].copy_from_slice(b".text\x00\x00\x00");
+    put32(&mut f, sh(0) + 0x08, 0x240); // virtual size
+    put32(&mut f, sh(0) + 0x0c, 0x1000); // virtual address
+    put32(&mut f, sh(0) + 0x10, 0x240); // size of raw data
+    put32(&mut f, sh(0) + 0x14, 0x1000); // pointer to raw data
+    put32(&mut f, sh(0) + 0x24, SEC_RX);
+    f[sh(1)..sh(1) + 8].copy_from_slice(b".rdata\x00\x00");
+    put32(&mut f, sh(1) + 0x08, 0x400);
+    put32(&mut f, sh(1) + 0x0c, 0x2000);
+    put32(&mut f, sh(1) + 0x10, 0x400);
+    put32(&mut f, sh(1) + 0x14, 0x2000);
+    put32(&mut f, sh(1) + 0x24, SEC_R);
+    f[sh(2)..sh(2) + 8].copy_from_slice(b".pdata\x00\x00");
+    put32(&mut f, sh(2) + 0x08, 0x30);
+    put32(&mut f, sh(2) + 0x0c, 0x2800);
+    put32(&mut f, sh(2) + 0x10, 0x30);
+    put32(&mut f, sh(2) + 0x14, 0x2800);
+    put32(&mut f, sh(2) + 0x24, SEC_R);
+    f[sh(3)..sh(3) + 8].copy_from_slice(b".idata\x00\x00");
+    put32(&mut f, sh(3) + 0x08, 0x600);
+    put32(&mut f, sh(3) + 0x0c, 0x3000);
+    put32(&mut f, sh(3) + 0x10, 0x600);
+    put32(&mut f, sh(3) + 0x14, 0x3000);
+    put32(&mut f, sh(3) + 0x24, SEC_RW);
+
+    // ── .rdata: UNICODE_STRINGs + device names ──
+    // \Device\Knifelab: struct at 0x2000, string at 0x2010.
+    put16(&mut f, 0x2000, 0x12);
+    put16(&mut f, 0x2000 + 2, 0x12);
+    put64(&mut f, 0x2000 + 8, 0x2010);
+    f[0x2010..0x2010 + b"\\Device\\Knifelab\0".len()].copy_from_slice(b"\\Device\\Knifelab\0");
+    // \DosDevices\Knifelab: struct at 0x2080, string at 0x2090.
+    put16(&mut f, 0x2080, 0x16);
+    put16(&mut f, 0x2080 + 2, 0x16);
+    put64(&mut f, 0x2080 + 8, 0x2090);
+    f[0x2090..0x2090 + b"\\DosDevices\\Knifelab\0".len()]
+        .copy_from_slice(b"\\DosDevices\\Knifelab\0");
+
+    // ── .pdata: DriverEntry (0x1000), DispatchDeviceControl (0x1100),
+    //          and an unreferenced helper (0x1200) ──
+    put32(&mut f, 0x2800, 0x1000);
+    put32(&mut f, 0x2800 + 4, 0x1050);
+    put32(&mut f, 0x2800 + 8, 0);
+    put32(&mut f, 0x2800 + 12, 0x1100);
+    put32(&mut f, 0x2800 + 16, 0x1150);
+    put32(&mut f, 0x2800 + 20, 0);
+    put32(&mut f, 0x2800 + 24, 0x1200);
+    put32(&mut f, 0x2800 + 28, 0x1220);
+    put32(&mut f, 0x2800 + 32, 0);
+
+    // ── .idata: ntoskrnl, five by-name + one ordinal ──
+    let desc = 0x3000;
+    put32(&mut f, desc, 0x3100); // OriginalFirstThunk
+    put32(&mut f, desc + 0x10, 0x3300); // FirstThunk
+    put32(&mut f, desc + 0x0c, 0x3200); // Name
+                                        // INT: five hint/name pointers, one ordinal (KeInitializeMutex = 1310), terminator.
+    put32(&mut f, 0x3100, 0x3400);
+    put32(&mut f, 0x3100 + 8, 0x3420);
+    put32(&mut f, 0x3100 + 16, 0x3430);
+    put32(&mut f, 0x3100 + 24, 0x3440);
+    put32(&mut f, 0x3100 + 32, 0x3450);
+    put64(&mut f, 0x3100 + 40, 0x8000_0000_0000_0000 | 1310);
+    // IAT: same slots, in the order code calls them.
+    put32(&mut f, 0x3300, 0x3400); // IoCreateDevice
+    put32(&mut f, 0x3308, 0x3420); // IoCreateSymbolicLink
+    put32(&mut f, 0x3310, 0x3430); // IoGetCurrentIrpStackLocation
+    put32(&mut f, 0x3318, 0x3440); // MmMapIoSpace
+    put32(&mut f, 0x3320, 0x3450); // RtlCopyMemory
+    f[0x3200..0x3200 + b"ntoskrnl.dll\0".len()].copy_from_slice(b"ntoskrnl.dll\0");
+    // hint/name blobs
+    f[0x3400..0x3400 + b"\0\0IoCreateDevice\0".len()].copy_from_slice(b"\0\0IoCreateDevice\0");
+    f[0x3420..0x3420 + b"\0\0IoCreateSymbolicLink\0".len()]
+        .copy_from_slice(b"\0\0IoCreateSymbolicLink\0");
+    f[0x3430..0x3430 + b"\0\0IoGetCurrentIrpStackLocation\0".len()]
+        .copy_from_slice(b"\0\0IoGetCurrentIrpStackLocation\0");
+    f[0x3440..0x3440 + b"\0\0MmMapIoSpace\0".len()].copy_from_slice(b"\0\0MmMapIoSpace\0");
+    f[0x3450..0x3450 + b"\0\0RtlCopyMemory\0".len()].copy_from_slice(b"\0\0RtlCopyMemory\0");
+
+    // ── .text: DriverEntry @0x1000 ──
+    let e = 0x1000usize;
+    f[e] = 0x53; // push rbx
+    f[e + 1..e + 5].copy_from_slice(&[0x48, 0x83, 0xec, 0x28]); // sub rsp, 0x28
+    f[e + 5..e + 8].copy_from_slice(&[0x48, 0x89, 0xcb]); // mov rbx, rcx  (DriverObject)
+    f[e + 8..e + 11].copy_from_slice(&[0x48, 0x8d, 0x0d]); // lea rcx,[rip+..] -> 0x2000 (device name)
+    put32(&mut f, e + 11, (0x2000u64 - (e as u64 + 15)) as u32);
+    f[e + 15..e + 17].copy_from_slice(&[0x33, 0xd2]); // xor edx, edx
+    f[e + 17..e + 23].copy_from_slice(&[0x41, 0xb8, 0x22, 0, 0, 0]); // mov r8d, 0x22
+    f[e + 23..e + 26].copy_from_slice(&[0x4c, 0x8d, 0x0d]); // lea r9,[rip+..] -> 0x2020 (device object out)
+    put32(&mut f, e + 26, (0x2020u64 - (e as u64 + 30)) as u32);
+    f[e + 30..e + 32].copy_from_slice(&[0xff, 0x15]); // call [rip+..] -> IoCreateDevice
+    put32(&mut f, e + 32, (0x3300u64 - (e as u64 + 36)) as u32);
+    // lea rax,[rip+..] -> 0x1100; mov [rbx+0xe0], rax  (MajorFunction[14] = DispatchDeviceControl)
+    f[e + 36..e + 39].copy_from_slice(&[0x48, 0x8d, 0x05]);
+    put32(&mut f, e + 39, (0x1100u64 - (e as u64 + 43)) as u32);
+    f[e + 43..e + 50].copy_from_slice(&[0x48, 0x89, 0x83, 0xe0, 0, 0, 0]);
+    // lea rcx,[rip+..] -> 0x2080; call IoCreateSymbolicLink
+    f[e + 50..e + 53].copy_from_slice(&[0x48, 0x8d, 0x0d]);
+    put32(&mut f, e + 53, (0x2080u64 - (e as u64 + 57)) as u32);
+    f[e + 57..e + 59].copy_from_slice(&[0xff, 0x15]);
+    put32(&mut f, e + 59, (0x3308u64 - (e as u64 + 63)) as u32);
+    f[e + 63..e + 65].copy_from_slice(&[0x33, 0xc0]); // xor eax, eax
+    f[e + 65..e + 69].copy_from_slice(&[0x48, 0x83, 0xc4, 0x28]); // add rsp, 0x28
+    f[e + 69] = 0x5b; // pop rbx
+    f[e + 70] = 0xc3; // ret
+
+    // ── .text: DispatchDeviceControl @0x1100 ──
+    let d = 0x1100usize;
+    f[d..d + 4].copy_from_slice(&[0x48, 0x83, 0xec, 0x28]); // sub rsp, 0x28
+    f[d + 4..d + 6].copy_from_slice(&[0xff, 0x15]); // call [rip+..] -> IoGetCurrentIrpStackLocation
+    put32(&mut f, d + 6, (0x3310u64 - (d as u64 + 10)) as u32);
+    f[d + 10..d + 13].copy_from_slice(&[0x8b, 0x40, 0x10]); // mov eax,[rax+0x10]  IoControlCode
+    f[d + 13..d + 18].copy_from_slice(&[0x3d, 0x40, 0xc0, 0x22, 0x00]); // cmp eax, 0x0022c040 (CTL_CODE device 0x22)
+    f[d + 18..d + 20].copy_from_slice(&[0x75, 0x2a]); // jne done (0x113e)
+                                                      // IOCTL 0x0022c040 matched: an attacker-sized copy whose length comes from
+                                                      // InputBufferLength minus a constant (the copy-underflow the audit looks
+                                                      // for), then the physical mapping the driver tests exercise.
+    f[d + 20..d + 23].copy_from_slice(&[0x8b, 0x40, 0x18]); // mov eax,[rax+0x18]  InputBufferLength
+    f[d + 23..d + 26].copy_from_slice(&[0x83, 0xe8, 0x04]); // sub eax, 4
+    f[d + 26..d + 29].copy_from_slice(&[0x41, 0x89, 0xc0]); // mov r8d, eax  (length)
+    f[d + 29..d + 32].copy_from_slice(&[0x48, 0x8d, 0x0d]); // lea rcx,[rip+..] -> 0x2010 (dst)
+    put32(&mut f, d + 32, (0x2010u64 - (d as u64 + 36)) as u32);
+    f[d + 36..d + 39].copy_from_slice(&[0x48, 0x8d, 0x15]); // lea rdx,[rip+..] -> 0x2090 (src)
+    put32(&mut f, d + 39, (0x2090u64 - (d as u64 + 43)) as u32);
+    f[d + 43..d + 45].copy_from_slice(&[0xff, 0x15]); // call [rip+..] -> RtlCopyMemory
+    put32(&mut f, d + 45, (0x3320u64 - (d as u64 + 49)) as u32);
+    f[d + 49..d + 52].copy_from_slice(&[0x48, 0x8d, 0x0d]); // lea rcx,[rip+..] -> 0x2010 (phys target)
+    put32(&mut f, d + 52, (0x2010u64 - (d as u64 + 56)) as u32);
+    f[d + 56..d + 58].copy_from_slice(&[0xff, 0x15]); // call [rip+..] -> MmMapIoSpace
+    put32(&mut f, d + 58, (0x3318u64 - (d as u64 + 62)) as u32);
+    f[d + 62..d + 64].copy_from_slice(&[0x33, 0xc0]); // xor eax, eax
+    f[d + 64..d + 68].copy_from_slice(&[0x48, 0x83, 0xc4, 0x28]);
+    f[d + 68] = 0xc3; // ret
+
+    // ── .text: an unreferenced helper (0x1200) that calls an imported kernel
+    // API (the ordinal slot 0x3328 = KeInitializeMutex) but is never reached
+    // from the entry or any dispatch handler. Reachability analysis must mark
+    // its primitive NOT user-mode reachable. ──
+    let h = 0x1200usize;
+    f[h..h + 4].copy_from_slice(&[0x48, 0x83, 0xec, 0x28]); // sub rsp, 0x28
+    f[h + 4..h + 6].copy_from_slice(&[0xff, 0x15]); // call [rip+..] -> 0x3328
+    put32(&mut f, h + 6, (0x3328u64 - (h as u64 + 10)) as u32);
+    f[h + 10..h + 12].copy_from_slice(&[0x33, 0xc0]); // xor eax, eax
+    f[h + 12..h + 16].copy_from_slice(&[0x48, 0x83, 0xc4, 0x28]);
+    f[h + 16] = 0xc3; // ret
+
+    f
+}
+
 /// A 64-bit x86_64 Mach-O that imports `puts` and binds it to a GOT slot
 /// through dyld bind opcodes.
 ///
@@ -734,6 +934,53 @@ mod tests {
         // entry's function must exist and call something
         let caller = an.functions.iter().find(|f| f.addr == PE_TEXT).unwrap();
         assert_eq!(caller.calls, vec![PE_IAT]);
+    }
+
+    #[test]
+    fn the_driver_fixture_parses_as_native_with_kernel_imports() {
+        let bytes = pe_with_driver();
+        let bin = crate::formats::analyze("fixture.sys", &bytes).expect("parses");
+        assert_eq!(bin.format, Format::Pe);
+        assert_eq!(bin.bits, 64);
+        assert_eq!(bin.subsystem.as_deref(), Some("native"));
+        assert_eq!(bin.entry, 0x1000);
+        let lib = bin
+            .imports
+            .iter()
+            .find(|l| l.name == "ntoskrnl.dll")
+            .expect("ntoskrnl imported");
+        assert!(lib.functions.iter().any(|n| n == "IoCreateDevice"));
+        assert!(lib.functions.iter().any(|n| n == "MmMapIoSpace"));
+        // The ordinal import carries its number and resolves to a real name via
+        // the generated table (KeInitializeMutex is a genuine ntoskrnl export).
+        assert!(lib.ordinals.iter().any(|o| o.is_some()));
+        assert!(lib.functions.iter().any(|n| n == "KeInitializeMutex"));
+        // .pdata seeded the two function hints.
+        assert!(bin.func_hints.contains(&0x1100));
+    }
+
+    #[test]
+    fn the_driver_fixture_engine_lands_on_pdata_and_kernel_sinks() {
+        let bytes = pe_with_driver();
+        let bin = crate::formats::analyze("fixture.sys", &bytes).unwrap();
+        let an = crate::analysis::engine::analyze(&bin, &bytes, 100_000, &crate::db::Db::default());
+        assert!(an.functions.iter().any(|f| f.addr == 0x1000), "DriverEntry");
+        assert!(
+            an.functions.iter().any(|f| f.addr == 0x1100),
+            "DispatchDeviceControl, seeded from .pdata"
+        );
+        // The kernel catalog is reachable through the same sink machinery.
+        let hits = crate::analysis::sinks::find(&an);
+        let phys = hits
+            .iter()
+            .find(|h| h.api == "MmMapIoSpace")
+            .expect("physical-mem sink flagged from kernel catalog");
+        assert!(!phys.sites.is_empty());
+        let dev = hits
+            .iter()
+            .find(|h| h.api == "IoCreateDevice")
+            .expect("device-create flagged from kernel catalog");
+        assert!(!dev.sites.is_empty());
     }
 
     #[test]

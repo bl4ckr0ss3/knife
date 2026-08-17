@@ -130,7 +130,7 @@ fn scan_x86(
 /// loaded from the GOT slot the relocation named. Both register spellings the
 /// toolchains actually emit are matched, an optional `bti c` guard is
 /// absorbed into the stub head, and a slot that no import named is not a
-/// veneer — the same two-sided contract the x86 scan keeps.
+/// veneer, using the same two-sided contract the x86 scan keeps.
 fn scan_aarch64(
     data: &[u8],
     sec_va: u64,
@@ -181,7 +181,7 @@ fn scan_aarch64(
 }
 
 /// True when `w0 w1 w2` is a GOT veneer: `adrp ra, pg; ldr rt, [ra, #lo];
-/// br rt` with ra, rt in {x16, x17} — the only registers the ABI allows an
+/// br rt` with ra, rt in {x16, x17}, the only registers the ABI allows an
 /// intra-procedure-call sequence to clobber, which is what binds the search
 /// to real linker output.
 fn is_veneer(w0: u32, w1: u32, w2: u32) -> bool {

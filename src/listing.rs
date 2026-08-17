@@ -23,6 +23,9 @@ pub enum Annot {
     Local(String),
     /// A string literal an operand points at, quoted by the renderer.
     Text(String),
+    /// A derived type hint (e.g. `MajorFunction[...]`, `Parameters.DeviceIoControl.*`).
+    /// Lowest priority: only rendered when nothing above applies.
+    Hint(String),
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +68,7 @@ pub fn function(
     db: &Db,
     base: u64,
     strings: &BTreeMap<u64, Located>,
+    hints: Option<&BTreeMap<u64, String>>,
 ) -> Vec<Line> {
     let mut out = Vec::new();
     for (i, block) in f.blocks.iter().enumerate() {
@@ -84,7 +88,7 @@ pub fn function(
 
             // Your own note outranks a derived annotation: if you wrote
             // something about this instruction, that is what you want to read.
-            let annot = if let Some(n) = db.notes.get(&a.wrapping_sub(base)) {
+            let mut annot = if let Some(n) = db.notes.get(&a.wrapping_sub(base)) {
                 Some(Annot::Note(n.clone()))
             } else if let Some(name) = &ins.target_name {
                 Some(Annot::Symbol(name.clone()))
@@ -98,6 +102,13 @@ pub fn function(
             } else {
                 string_annot(an, strings, ins.addr)
             };
+            // A field-name hint is the weakest annotation: only when there is
+            // nothing more specific to say about this instruction.
+            if annot.is_none() {
+                annot = hints
+                    .and_then(|m| m.get(&ins.addr))
+                    .map(|s| Annot::Hint(s.clone()));
+            }
 
             out.push(Line::Insn {
                 addr: ins.addr,
@@ -221,7 +232,14 @@ mod tests {
         let (bin, bytes) = code_at(0x1000, &code);
         let an = engine::analyze(&bin, &bytes, 1000, &Db::default());
         let f = an.find_function(0x1000).unwrap();
-        let lines = function(&an, f, &Db::default(), 0, &string_map(&bin, &bytes, 0));
+        let lines = function(
+            &an,
+            f,
+            &Db::default(),
+            0,
+            &string_map(&bin, &bytes, 0),
+            None,
+        );
 
         assert!(
             lines.iter().any(|l| matches!(l, Line::Label { .. })),
@@ -240,6 +258,50 @@ mod tests {
     }
 
     #[test]
+    fn a_field_hint_is_lowest_priority() {
+        let code = [0x8b, 0x40, 0x10, 0xc3]; // mov eax,[rax+0x10] ; ret
+        let (bin, bytes) = code_at(0x1000, &code);
+        let an = engine::analyze(&bin, &bytes, 1000, &Db::default());
+        let f = an.find_function(0x1000).unwrap();
+        let strings = string_map(&bin, &bytes, 0);
+
+        // No hint, no annotation.
+        let plain = function(&an, f, &Db::default(), 0, &strings, None);
+        assert!(!plain.iter().any(|l| matches!(
+            l,
+            Line::Insn {
+                annot: Some(Annot::Hint(_)),
+                ..
+            }
+        )));
+
+        // With a hint map for that instruction the annotation appears.
+        let mut hints = BTreeMap::new();
+        hints.insert(
+            0x1000u64,
+            "Parameters.DeviceIoControl.IoControlCode".to_string(),
+        );
+        let hinted = function(&an, f, &Db::default(), 0, &strings, Some(&hints));
+        assert!(hinted.iter().any(|l| {
+            matches!(
+                l,
+                Line::Insn { addr: 0x1000, annot: Some(Annot::Hint(t)), .. } if t == "Parameters.DeviceIoControl.IoControlCode"
+            )
+        }));
+
+        // A note still wins over a hint on the same instruction.
+        let mut db = Db::default();
+        db.set_note(0x1000, "hand written");
+        let noted = function(&an, f, &db, 0, &strings, Some(&hints));
+        assert!(noted.iter().any(|l| {
+            matches!(
+                l,
+                Line::Insn { addr: 0x1000, annot: Some(Annot::Note(n)), .. } if n == "hand written"
+            )
+        }));
+    }
+
+    #[test]
     fn a_note_replaces_the_derived_annotation() {
         let code = [0x74, 0x00, 0xc3]; // je +0 ; ret
         let (bin, bytes) = code_at(0x1000, &code);
@@ -248,7 +310,7 @@ mod tests {
         let strings = string_map(&bin, &bytes, 0);
 
         // Without a note the conditional is annotated with its local target.
-        let plain = function(&an, f, &Db::default(), 0, &strings);
+        let plain = function(&an, f, &Db::default(), 0, &strings, None);
         assert!(matches!(
             plain.iter().find(|l| l.addr() == 0x1000),
             Some(Line::Insn {
@@ -259,7 +321,7 @@ mod tests {
 
         let mut db = Db::default();
         db.set_note(0x1000, "bounds check");
-        let noted = function(&an, f, &db, 0, &strings);
+        let noted = function(&an, f, &db, 0, &strings, None);
         assert_eq!(
             noted.iter().find(|l| l.addr() == 0x1000).and_then(|l| {
                 match l {
@@ -304,7 +366,14 @@ mod tests {
         bytes.extend_from_slice(b"hello");
         let an = engine::analyze(&bin, &bytes, 1000, &Db::default());
         let f = an.find_function(0x1000).unwrap();
-        let lines = function(&an, f, &Db::default(), 0, &string_map(&bin, &bytes, 0));
+        let lines = function(
+            &an,
+            f,
+            &Db::default(),
+            0,
+            &string_map(&bin, &bytes, 0),
+            None,
+        );
 
         let annot = lines
             .iter()

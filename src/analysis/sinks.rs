@@ -519,7 +519,11 @@ impl Hit {
 
 /// Match the binary's imports against the catalogue and attach call sites.
 pub fn find(an: &Analysis) -> Vec<Hit> {
-    let catalog: BTreeMap<&str, &SinkDef> = CATALOG.iter().map(|d| (d.api, d)).collect();
+    let catalog: BTreeMap<&str, &SinkDef> = CATALOG
+        .iter()
+        .chain(crate::analysis::ntapi::KERNEL_CATALOG.iter())
+        .map(|d| (d.api, d))
+        .collect();
 
     // An API can be reachable through several addresses (a stub and its slot,
     // or the same name imported from two modules), so group by name first.
