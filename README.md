@@ -253,8 +253,6 @@ terminal already agrees with you.
 knife tui ./target
 ```
 
-![knife tui: functions, disassembly, pseudocode, CFG, and driver analysis](assets/demo.gif)
-
 ### Safe binary patch workspace
 
 Knife treats edits as analysis facts, not destructive writes. The original
