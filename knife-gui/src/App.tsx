@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -13,6 +13,10 @@ import {
   type XrefRow,
   type Cfg,
   type SymbolRow,
+  type TargetRow,
+  type LineActions,
+  type FactRow,
+  type PatchRun,
 } from "./api";
 import { FunctionList } from "./components/FunctionList";
 import { CodeView } from "./components/CodeView";
@@ -22,11 +26,15 @@ import { AttackSurface } from "./components/AttackSurface";
 import { GraphView } from "./components/GraphView";
 import { StringsList } from "./components/StringsList";
 import { Palette } from "./components/Palette";
+import { LineMenu, pseudoMenu, type MenuItem } from "./components/LineMenu";
+import { FactsList } from "./components/FactsList";
+import { PatchList } from "./components/PatchList";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { Console } from "./components/Console";
 import { SymbolList } from "./components/SymbolList";
 
 type Tab = "disasm" | "pseudo" | "graph";
-type LeftView = "functions" | "attack" | "strings" | "imports" | "exports";
+type LeftView = "functions" | "attack" | "strings" | "imports" | "exports" | "facts" | "patches";
 
 const FN_LIMIT = 20000;
 
@@ -74,6 +82,7 @@ function Divider({ onDrag }: { onDrag: (dx: number) => void }) {
 
 export default function App() {
   const [opened, setOpened] = useState<OpenResult | null>(null);
+  const [targets, setTargets] = useState<TargetRow[]>([]);
   const [busy, setBusy] = useState(false);
   const [phase, setPhase] = useState("");
   // Pane sizes are dragged, not fixed: a wide monitor should give the code more
@@ -107,10 +116,23 @@ export default function App() {
   const [cfg, setCfg] = useState<Cfg | null>(null);
   const [strings, setStrings] = useState<StringRow[]>([]);
   const [symbols, setSymbols] = useState<SymbolRow[]>([]);
+  const [facts, setFacts] = useState<FactRow[]>([]);
+  const [patches, setPatches] = useState<PatchRun[]>([]);
   const [findings, setFindings] = useState<Finding[]>([]);
   const [detail, setDetail] = useState<BinaryDetail | null>(null);
 
   const [palette, setPalette] = useState(false);
+  const [acts, setActs] = useState<LineActions[]>([]);
+  const [irSel, setIrSel] = useState<number | null>(null);
+  const [menu, setMenu] = useState<{ at: { x: number; y: number }; items: MenuItem[] } | null>(null);
+  // One prompt serves every analyst edit: title, prefilled value, and what to
+  // do with the answer.
+  const [prompt, setPrompt] = useState<{
+    title: string;
+    value: string;
+    hint?: string;
+    run: (value: string) => void;
+  } | null>(null);
   const [console_, setConsole] = useState(() => loadNum("knife.console", 0) === 1);
   const [renaming, setRenaming] = useState(false);
   const [renameText, setRenameText] = useState("");
@@ -122,12 +144,15 @@ export default function App() {
   const openFunction = useCallback(
     async (selector: string, push = true) => {
       try {
-        const [ls, irs, graph] = await Promise.all([
+        const [ls, irs, graph, la] = await Promise.all([
           api.disassemble(selector),
           api.decompile(selector),
           api.cfg(selector).catch(() => null),
+          api.lineActions(selector).catch(() => [] as LineActions[]),
         ]);
         setCfg(graph);
+        setActs(la);
+        setIrSel(null);
         const entry = ls.length ? ls[0].addr : selector;
         setHistory((h) => (push && current && current !== entry ? [...h, current] : h));
         setLines(ls);
@@ -142,6 +167,20 @@ export default function App() {
     },
     [current],
   );
+
+  /// Load every view for whichever target is currently active.
+  const loadViews = useCallback(async () => {
+    const [fns, fnd, det] = await Promise.all([
+      api.listFunctions(undefined, false, FN_LIMIT),
+      api.attackSurface(),
+      api.binaryDetail(),
+    ]);
+    setFunctions(fns);
+    setFindings(fnd);
+    setDetail(det);
+    api.strings(undefined, true, 5000).then(setStrings).catch(() => setStrings([]));
+    return fns;
+  }, []);
 
   const reloadAnalysis = useCallback(async () => {
     try {
@@ -173,15 +212,8 @@ export default function App() {
         setXrefs([]);
         setHistory([]);
         setFilter("");
-        const [fns, fnd, det] = await Promise.all([
-          api.listFunctions(undefined, false, FN_LIMIT),
-          api.attackSurface(),
-          api.binaryDetail(),
-        ]);
-        setFunctions(fns);
-        setFindings(fnd);
-        setDetail(det);
-        api.strings(undefined, true, 5000).then(setStrings).catch(() => setStrings([]));
+        const fns = await loadViews();
+        api.listTargets().then(setTargets).catch(() => {});
         if (fns.length) void openFunction(fns[0].addr, false);
       } catch (e) {
         setError(String(e));
@@ -190,7 +222,58 @@ export default function App() {
         setPhase("");
       }
     },
-    [openFunction],
+    [openFunction, loadViews],
+  );
+
+  const switchTo = useCallback(
+    async (path: string) => {
+      try {
+        await api.selectTarget(path);
+        const res = await api.openTarget(path); // already loaded: just re-reads the summary
+        setOpened(res);
+        setCurrent(null);
+        setSelected(null);
+        setLines([]);
+        setIr([]);
+        setCfg(null);
+        setHistory([]);
+        setFilter("");
+        const fns = await loadViews();
+        setTargets(await api.listTargets());
+        if (fns.length) void openFunction(fns[0].addr, false);
+      } catch (e) {
+        setError(String(e));
+      }
+    },
+    [loadViews, openFunction, setError],
+  );
+
+  const closeTab = useCallback(
+    async (path: string) => {
+      try {
+        await api.closeTarget(path);
+        const rows = await api.listTargets();
+        setTargets(rows);
+        const next = rows.find((t) => t.active);
+        if (next) {
+          void switchTo(next.path);
+        } else {
+          // Nothing left open: back to the welcome screen.
+          setOpened(null);
+          setFunctions([]);
+          setFindings([]);
+          setDetail(null);
+          setStrings([]);
+          setCurrent(null);
+          setLines([]);
+          setIr([]);
+          setCfg(null);
+        }
+      } catch (e) {
+        setError(String(e));
+      }
+    },
+    [switchTo, setError],
   );
 
   const pickAndOpen = useCallback(async () => {
@@ -214,7 +297,11 @@ export default function App() {
   // when the target changes.
   useEffect(() => {
     if (!opened) return;
-    if (leftView === "imports") {
+    if (leftView === "facts") {
+      api.analystFacts().then(setFacts).catch(() => setFacts([]));
+    } else if (leftView === "patches") {
+      api.patchRuns().then(setPatches).catch(() => setPatches([]));
+    } else if (leftView === "imports") {
       api.imports().then(setSymbols).catch(() => setSymbols([]));
     } else if (leftView === "exports") {
       api.exports().then(setSymbols).catch(() => setSymbols([]));
@@ -273,7 +360,7 @@ export default function App() {
         back();
         return;
       }
-      if (typing || !opened) return;
+      if (typing || !opened || prompt || menu) return;
 
       switch (e.key) {
         case "g":
@@ -295,20 +382,69 @@ export default function App() {
           setTab((t) => (t === "graph" ? "disasm" : "graph"));
           break;
         case "s":
-          setLeftView((v) =>
-            v === "functions"
-              ? "attack"
-              : v === "attack"
-                ? "strings"
-                : v === "strings"
-                  ? "imports"
-                  : v === "imports"
-                    ? "exports"
-                    : "functions",
-          );
+          setLeftView((v) => {
+            const order: LeftView[] = [
+              "functions",
+              "attack",
+              "strings",
+              "imports",
+              "exports",
+              "facts",
+              "patches",
+            ];
+            return order[(order.indexOf(v) + 1) % order.length];
+          });
           break;
         case "x":
           setXrefDir((d) => (d === "to" ? "from" : "to"));
+          break;
+        case "t":
+          if (tab === "pseudo" && irSel !== null && acts[irSel]?.field) {
+            e.preventDefault();
+            editHandlers.bindType(acts[irSel].field!.base);
+          }
+          break;
+        case "e":
+          if (tab === "pseudo" && irSel !== null) {
+            const f = acts[irSel]?.field;
+            if (f?.type_name) {
+              e.preventDefault();
+              editHandlers.nameField(f.type_name, f.offset, f.member);
+            }
+          }
+          break;
+        case "l":
+          if (tab === "pseudo" && irSel !== null && acts[irSel]?.variable) {
+            e.preventDefault();
+            editHandlers.renameVar(acts[irSel].variable!);
+          }
+          break;
+        case "p":
+          if (tab === "pseudo" && current) {
+            e.preventDefault();
+            editHandlers.setPrototype();
+          }
+          break;
+        case "P":
+          if (tab === "disasm" && selected) {
+            e.preventDefault();
+            const line = lines.find((l) => l.kind === "insn" && l.addr === selected);
+            ask(
+              `Stage bytes at ${selected}`,
+              "",
+              "hex bytes, empty to restore the run",
+              async (v) => {
+                try {
+                  if (v.trim()) await api.stagePatch(selected, v);
+                  else await api.clearPatch(selected);
+                  await afterEdit();
+                } catch (err) {
+                  setError(String(err));
+                }
+              },
+            );
+            void line;
+          }
           break;
         case "n":
           if (current) {
@@ -329,6 +465,90 @@ export default function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   });
+
+  /// Re-read the current function after an analyst edit, so the pseudocode
+  /// shows the new type, name, or prototype immediately.
+  const afterEdit = useCallback(async () => {
+    await reloadAnalysis();
+    if (current) await openFunction(current, false);
+    // The fact inventory and the patch list are what an edit changed, so keep
+    // them current whether or not their pane happens to be open.
+    api.analystFacts().then(setFacts).catch(() => {});
+    api.patchRuns().then(setPatches).catch(() => {});
+  }, [reloadAnalysis, current, openFunction]);
+
+  const ask = useCallback(
+    (title: string, value: string, hint: string, run: (v: string) => void) =>
+      setPrompt({ title, value, hint, run }),
+    [],
+  );
+
+  const editHandlers = useMemo(
+    () => ({
+      bindType: (base: string) =>
+        ask(`Bind a type to ${base}`, "", "a type name, empty to clear", async (v) => {
+          try {
+            if (!current) return;
+            if (v.trim()) await api.bindType(current, base, v);
+            else await api.clearBinding(current, base);
+            await afterEdit();
+          } catch (e) {
+            setError(String(e));
+          }
+        }),
+      nameField: (typeName: string, offset: number, member: string) =>
+        ask(
+          `Name ${typeName} field at ${offset < 0 ? "-" : "+"}0x${Math.abs(offset).toString(16)}`,
+          member.startsWith("field_") ? "" : member,
+          "a field name, empty to clear",
+          async (v) => {
+            try {
+              if (v.trim()) await api.setField(typeName, offset, v);
+              else await api.clearField(typeName, offset);
+              await afterEdit();
+            } catch (e) {
+              setError(String(e));
+            }
+          },
+        ),
+      renameVar: (base: string) =>
+        ask(`Rename ${base}`, "", "a variable name, empty to clear", async (v) => {
+          try {
+            if (!current) return;
+            if (v.trim()) await api.setVariable(current, base, v);
+            else await api.clearVariable(current, base);
+            await afterEdit();
+          } catch (e) {
+            setError(String(e));
+          }
+        }),
+      setPrototype: () =>
+        ask("Prototype", "", "RETURN (PARAM, PARAM), empty to clear", async (v) => {
+          try {
+            if (!current) return;
+            const text = v.trim();
+            if (!text) {
+              await api.clearPrototype(current);
+            } else {
+              // `bool (CONTEXT *, size_t)` splits into a return type and a
+              // parameter list, the same syntax the terminal interface takes.
+              const open = text.indexOf("(");
+              const returns = (open < 0 ? text : text.slice(0, open)).trim();
+              const inner = open < 0 ? "" : text.slice(open + 1).replace(/\)\s*$/, "");
+              const params = inner
+                .split(",")
+                .map((p) => p.trim())
+                .filter(Boolean);
+              await api.setPrototype(current, returns, params);
+            }
+            await afterEdit();
+          } catch (e) {
+            setError(String(e));
+          }
+        }),
+    }),
+    [ask, current, afterEdit, setError],
+  );
 
   const back = useCallback(() => {
     setHistory((h) => {
@@ -383,6 +603,31 @@ export default function App() {
         </button>
       </div>
 
+      {targets.length > 0 && (
+        <div className="tabbar">
+          {targets.map((t) => (
+            <div
+              key={t.path}
+              className={"ttab" + (t.active ? " active" : "")}
+              title={t.path}
+              onClick={() => !t.active && switchTo(t.path)}
+            >
+              <span className="tname">{t.title}</span>
+              <span
+                className="tclose"
+                title="Close"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void closeTab(t.path);
+                }}
+              >
+                ✕
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
       <div className="body">
         <div className="rail">
           <button
@@ -404,7 +649,7 @@ export default function App() {
             title="Strings"
             onClick={() => setLeftView("strings")}
           >
-            "
+            T
           </button>
           <button
             className={leftView === "imports" ? "active" : ""}
@@ -419,6 +664,20 @@ export default function App() {
             onClick={() => setLeftView("exports")}
           >
             ↑
+          </button>
+          <button
+            className={leftView === "facts" ? "active" : ""}
+            title="Types and analyst facts"
+            onClick={() => setLeftView("facts")}
+          >
+            {"{}"}
+          </button>
+          <button
+            className={leftView === "patches" ? "active" : ""}
+            title="Staged patches"
+            onClick={() => setLeftView("patches")}
+          >
+            ±
           </button>
           <button
             className={console_ ? "active" : ""}
@@ -462,6 +721,54 @@ export default function App() {
                     />
                   </div>
                   <FunctionList rows={functions} current={current} onPick={(a) => openFunction(a)} />
+                </>
+              ) : leftView === "facts" ? (
+                <>
+                  <div className="panel-head">
+                    <span>analyst facts</span>
+                    <span className="count">({facts.length})</span>
+                  </div>
+                  <div className="filter">
+                    <input
+                      placeholder="filter types, prototypes, bindings…"
+                      onChange={(e) =>
+                        api
+                          .analystFacts(e.target.value || undefined)
+                          .then(setFacts)
+                          .catch(() => setFacts([]))
+                      }
+                    />
+                  </div>
+                  <FactsList rows={facts} onJump={(a) => openFunction(a)} />
+                </>
+              ) : leftView === "patches" ? (
+                <>
+                  <div className="panel-head">
+                    <span>staged patches</span>
+                    <span className="count">({patches.length})</span>
+                  </div>
+                  <PatchList
+                    runs={patches}
+                    onJump={(a) => openFunction(a)}
+                    onClear={async (offset) => {
+                      try {
+                        await api.clearPatch(offset);
+                        await afterEdit();
+                      } catch (e) {
+                        setError(String(e));
+                      }
+                    }}
+                    onExport={async () => {
+                      const out = await saveDialog({ title: "Export patched binary" });
+                      if (typeof out !== "string") return;
+                      try {
+                        const msg = await api.exportPatched(out);
+                        setToasts((t) => [...t, { id: Date.now(), text: msg }]);
+                      } catch (e) {
+                        setError(String(e));
+                      }
+                    }}
+                  />
                 </>
               ) : leftView === "imports" || leftView === "exports" ? (
                 <>
@@ -610,8 +917,13 @@ export default function App() {
                   lines={lines}
                   ir={ir}
                   selected={selected}
+                  irSelected={irSel}
                   onSelect={setSelected}
+                  onSelectIr={setIrSel}
                   onFollow={(sel) => openFunction(sel)}
+                  onLineMenu={(i, at) =>
+                    setMenu({ at, items: pseudoMenu(acts[i], editHandlers) })
+                  }
                 />
               )}
 
@@ -643,7 +955,7 @@ export default function App() {
           })()}
           <div className="spacer" />
           <span className="sb-keys">
-            ctrl+p open · ctrl+` console · g goto · / filter · d pseudo · f graph · s pane · x xrefs · n name · c note
+            ctrl+p open   ctrl+` console   g goto   / filter   d pseudo   f graph   s pane   x xrefs   n name   c note   t type   e field   l var   p proto   P patch
           </span>
         </div>
       )}
@@ -668,6 +980,38 @@ export default function App() {
             <div className="spinner" />
             <div className="lphase">{phase || "analyzing"}…</div>
             <div className="lhint">reading the bytes on disk · the target is never executed</div>
+          </div>
+        </div>
+      )}
+
+      {menu && (
+        <LineMenu at={menu.at} items={menu.items} onClose={() => setMenu(null)} />
+      )}
+
+      {prompt && (
+        <div className="overlay" onMouseDown={() => setPrompt(null)}>
+          <div className="askbox" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="asktitle">{prompt.title}</div>
+            <input
+              className="palette-input"
+              autoFocus
+              defaultValue={prompt.value}
+              placeholder={prompt.hint}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  const v = (e.target as HTMLInputElement).value;
+                  setPrompt(null);
+                  prompt.run(v);
+                } else if (e.key === "Escape") {
+                  setPrompt(null);
+                }
+              }}
+            />
+            <div className="askfoot">
+              <span>{prompt.hint}</span>
+              <span>↵ apply</span>
+              <span>esc cancel</span>
+            </div>
           </div>
         </div>
       )}

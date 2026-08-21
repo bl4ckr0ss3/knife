@@ -1,20 +1,26 @@
-/* knife's own palette, lifted from the TUI renderer (src/tui/render.rs) so the
-   GUI, the terminal view, and the reports read as one tool: cyan accent, warm
-   greys, colour tied to meaning. */
+/* The knife brand palette: red, silver, black. Taken from the character sheet
+   in icons/source.png, and consistent with the printed reports, whose accent
+   has always been red (src/output.rs).
+
+   Colour is tied to meaning here and that survives the retheme: red chrome is
+   the brand, but mint / amber / critical keep their jobs on mitigation state,
+   finding severity, and graph edges. Critical stays the brighter red so a
+   severity marker never reads as ordinary chrome sitting beside it. */
 :root {
-  --accent: #5cc8d7;
+  --accent: #b03034;
+  --accent-hi: #bc2c2b;
   --critical: #f06464;
-  --muted: #a6adbb;
-  --faint: #596273;
+  --muted: #8e8b8b;
+  --faint: #5d5a5a;
   --mint: #79c99e;
   --amber: #e3b341;
-  --canvas: #0b1016;
-  --panel: #111923;
-  --panel-2: #0d141c;
-  --sel-bg: #1d2b36;
-  --sel-fg: #e7ecf2;
-  --text: #e7ecf2;
-  --border: #1b2531;
+  --canvas: #0b0a0a;
+  --panel: #171616;
+  --panel-2: #121111;
+  --sel-bg: #2f2224;
+  --sel-fg: #e8e6e6;
+  --text: #c4c3c3;
+  --border: #2b2a2b;
   --mono: "Cascadia Mono", "JetBrains Mono", "Consolas", ui-monospace, monospace;
 }
 
@@ -54,7 +60,7 @@ body {
   align-items: center;
   gap: 14px;
   padding: 0 12px;
-  background: linear-gradient(180deg, #0e1620, #0a1017);
+  background: linear-gradient(180deg, #181616, #0d0c0c);
   border-bottom: 1px solid var(--border);
 }
 
@@ -116,12 +122,12 @@ body {
 
 .rail button:hover {
   color: var(--muted);
-  background: #131c26;
+  background: #211d1e;
 }
 
 .rail button.active {
   color: var(--accent);
-  background: #14202b;
+  background: #2a1e20;
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
@@ -144,7 +150,7 @@ body {
   color: var(--accent);
   font-size: 12px;
   border-bottom: 1px solid var(--border);
-  background: #0f1720;
+  background: #141313;
 }
 
 .panel-head .count {
@@ -181,7 +187,7 @@ body {
 .filter input,
 .inline-input {
   width: 100%;
-  background: #0a121a;
+  background: #100f0f;
   border: 1px solid var(--border);
   color: var(--text);
   font-family: var(--mono);
@@ -213,7 +219,7 @@ body {
 }
 
 .fn-row:hover {
-  background: #131e28;
+  background: #201c1d;
 }
 
 .fn-row.sel {
@@ -250,7 +256,7 @@ body {
   gap: 2px;
   padding: 0 8px;
   border-bottom: 1px solid var(--border);
-  background: #0f1720;
+  background: #141313;
 }
 
 .tabs .tab {
@@ -281,7 +287,7 @@ body {
 }
 
 .tabs button.act {
-  background: #14202b;
+  background: #2a1e20;
   color: var(--muted);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -401,7 +407,7 @@ body {
 }
 
 .xref-row:hover {
-  background: #131e28;
+  background: #201c1d;
 }
 
 .xref-row .k {
@@ -427,7 +433,7 @@ body {
 }
 
 .seg button.active {
-  background: #14202b;
+  background: #2a1e20;
   color: var(--accent);
 }
 
@@ -435,11 +441,11 @@ body {
 .finding {
   padding: 4px 10px;
   cursor: pointer;
-  border-bottom: 1px solid #0e161e;
+  border-bottom: 1px solid #191717;
 }
 
 .finding:hover {
-  background: #131e28;
+  background: #201c1d;
 }
 
 .finding.sel {
@@ -551,21 +557,25 @@ body {
 }
 
 .mit .st {
-  min-width: 12px;
+  min-width: 26px;
   font-weight: 700;
 }
 
-.mit .st.On {
+.mit .st.info {
   color: var(--mint);
 }
-.mit .st.Partial {
+.mit .st.warn {
   color: var(--amber);
 }
-.mit .st.Off {
+.mit .st.bad {
   color: var(--critical);
 }
-.mit .st.NotApplicable {
+.mit .st.na {
   color: var(--faint);
+}
+
+.mit .nm.bad {
+  color: var(--critical);
 }
 
 .mit .nm {
@@ -592,7 +602,7 @@ body {
 }
 
 .btn {
-  background: #14202b;
+  background: #2a1e20;
   color: var(--muted);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -618,11 +628,11 @@ body {
   height: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: #1c2836;
+  background: #332f30;
   border-radius: 6px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #263748;
+  background: #413c3d;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
@@ -635,7 +645,7 @@ body {
   min-height: 0;
   overflow: hidden;
   background:
-    radial-gradient(circle at 1px 1px, #16212c 1px, transparent 0) 0 0 / 24px 24px,
+    radial-gradient(circle at 1px 1px, #221f20 1px, transparent 0) 0 0 / 24px 24px,
     var(--panel);
 }
 
@@ -665,7 +675,7 @@ body {
   display: flex;
   align-items: center;
   gap: 4px;
-  background: #0e1620cc;
+  background: #181616cc;
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 3px 6px;
@@ -686,7 +696,7 @@ body {
 
 .graph-tools button:hover {
   color: var(--accent);
-  background: #16232f;
+  background: #2a2426;
 }
 
 .graph-tools .zoom {
@@ -704,7 +714,7 @@ body {
 }
 
 .block rect {
-  fill: #0f1925;
+  fill: #1a1818;
   stroke: var(--border);
   stroke-width: 1.5;
 }
@@ -719,7 +729,7 @@ body {
 
 .block.sel rect {
   stroke: var(--accent);
-  fill: #12202c;
+  fill: #241d1f;
 }
 
 .block text {
@@ -757,7 +767,7 @@ body {
 .overlay {
   position: fixed;
   inset: 0;
-  background: #05080ccc;
+  background: #070606cc;
   backdrop-filter: blur(2px);
   z-index: 50;
   display: flex;
@@ -780,7 +790,7 @@ body {
 .palette-input {
   border: 0;
   border-bottom: 1px solid var(--border);
-  background: #0a121a;
+  background: #100f0f;
   color: var(--text);
   font-family: var(--mono);
   font-size: 14px;
@@ -845,7 +855,7 @@ body {
   gap: 16px;
   padding: 5px 14px;
   border-top: 1px solid var(--border);
-  background: #0f1720;
+  background: #141313;
   color: var(--faint);
   font-size: 11px;
 }
@@ -858,7 +868,7 @@ body {
   align-items: center;
   gap: 12px;
   padding: 0 12px;
-  background: #0d141c;
+  background: #121111;
   border-top: 1px solid var(--border);
   font-size: 11px;
   white-space: nowrap;
@@ -953,7 +963,7 @@ body {
   gap: 8px;
   padding: 6px 12px;
   border-top: 1px solid var(--border);
-  background: #0a121a;
+  background: #100f0f;
 }
 
 .cin .prompt {
@@ -1032,7 +1042,7 @@ body {
   color: var(--amber);
   font-size: 11px;
   letter-spacing: 0.4px;
-  background: #0e1620;
+  background: #181616;
   border-top: 1px solid var(--border);
 }
 
@@ -1054,7 +1064,7 @@ body {
 }
 
 .toast {
-  background: #1a1216;
+  background: #241417;
   border: 1px solid var(--critical);
   border-left-width: 3px;
   color: #f4c9c9;
@@ -1071,4 +1081,297 @@ body {
     opacity: 0;
     transform: translateY(6px);
   }
+}
+
+/* ── open-target tabs ─────────────────────────────────────────────────── */
+.tabbar {
+  height: 30px;
+  flex: 0 0 30px;
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  padding: 0 8px;
+  background: #0d0c0c;
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+
+.ttab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  color: var(--faint);
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  font-size: 12px;
+  white-space: nowrap;
+  max-width: 260px;
+}
+
+.ttab:hover {
+  color: var(--muted);
+  background: #1c1919;
+}
+
+.ttab.active {
+  color: var(--accent);
+  background: var(--panel);
+  border-bottom-color: var(--accent);
+}
+
+.ttab .tname {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ttab .tclose {
+  color: var(--faint);
+  font-size: 10px;
+  opacity: 0.6;
+}
+
+.ttab .tclose:hover {
+  color: var(--critical);
+  opacity: 1;
+}
+
+/* ── collapsible detail sections ──────────────────────────────────────── */
+.detail-sec h4 {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.detail-sec h4:hover .stitle {
+  color: var(--text);
+}
+
+.detail-sec h4 .caret {
+  color: var(--faint);
+  font-size: 9px;
+}
+
+.detail-sec h4 .sright {
+  margin-left: auto;
+  font-weight: 400;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.sr-bad {
+  color: var(--critical);
+}
+
+.sr-ok {
+  color: var(--mint);
+}
+
+.sr-dim {
+  color: var(--faint);
+}
+
+.mit .st.info,
+.mit .st.na,
+.mit .st.warn,
+.mit .st.bad {
+  min-width: 26px;
+}
+
+/* ── find bar ─────────────────────────────────────────────────────────── */
+.findbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border);
+  background: #141313;
+}
+
+.findbar .inline-input {
+  flex: 1;
+}
+
+.findbar .fcount {
+  color: var(--faint);
+  font-size: 11px;
+  min-width: 62px;
+  text-align: right;
+}
+
+.code .ln.hit,
+.code .ir.hit {
+  background: #2e2712;
+  box-shadow: inset 2px 0 0 var(--amber);
+}
+
+.code .ln.hit.cur,
+.code .ir.hit.cur {
+  background: #3d3316;
+}
+
+/* ── line context menu ────────────────────────────────────────────────── */
+.linemenu {
+  position: fixed;
+  z-index: 70;
+  min-width: 240px;
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  box-shadow: 0 14px 36px #000b;
+  padding: 4px;
+  overflow: hidden;
+}
+
+.lmitem {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 5px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.lmitem:hover {
+  background: var(--sel-bg);
+}
+
+.lmitem.disabled {
+  color: var(--faint);
+  cursor: default;
+}
+
+.lmitem.disabled:hover {
+  background: transparent;
+}
+
+.lmhint {
+  margin-left: auto;
+  color: var(--faint);
+  font-size: 11px;
+}
+
+/* ── the edit prompt ──────────────────────────────────────────────────── */
+.askbox {
+  width: min(560px, 76vw);
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  box-shadow: 0 18px 48px #000a;
+  overflow: hidden;
+}
+
+.asktitle {
+  padding: 10px 14px 0;
+  color: var(--accent);
+  font-size: 12px;
+}
+
+.askfoot {
+  display: flex;
+  gap: 16px;
+  padding: 5px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--faint);
+  font-size: 11px;
+}
+
+/* a selected pseudocode line */
+.code .ir.sel {
+  background: var(--sel-bg);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.code .ir {
+  cursor: default;
+}
+
+/* ── analyst facts ────────────────────────────────────────────────────── */
+.fact-detail {
+  color: var(--faint);
+  font-size: 11px;
+  margin-left: auto;
+  max-width: 55%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.empty-hint {
+  padding: 18px 14px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+  line-height: 1.8;
+}
+
+.empty-hint span {
+  color: var(--faint);
+  font-size: 11px;
+}
+
+/* ── staged patches ───────────────────────────────────────────────────── */
+.patch {
+  padding: 6px 10px;
+  border-bottom: 1px solid #191717;
+}
+
+.patch .top {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.patch .paddr {
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.patch .paddr:hover {
+  text-decoration: underline;
+}
+
+.patch .plen {
+  color: var(--faint);
+  font-size: 11px;
+}
+
+.patch .pclear {
+  margin-left: auto;
+  color: var(--faint);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.patch .pclear:hover {
+  color: var(--critical);
+}
+
+.patch .pbytes {
+  display: flex;
+  gap: 8px;
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+.patch .was {
+  color: var(--faint);
+  text-decoration: line-through;
+}
+
+.patch .arrow {
+  color: var(--faint);
+}
+
+.patch .now {
+  color: var(--mint);
+}
+
+.btn.wide {
+  width: 100%;
 }

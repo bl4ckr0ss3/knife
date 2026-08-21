@@ -201,7 +201,12 @@ pub struct HashesDto {
 #[derive(Serialize)]
 pub struct MitigationDto {
     pub name: &'static str,
+    /// Human wording: "enabled" / "partial" / "disabled" / "n/a".
     pub state: &'static str,
+    /// The shared marker vocabulary — info / warn / bad / na — which is what
+    /// drives the colour and the `[+]` `[=]` `[-]` mark. Sent alongside the
+    /// label because the two are not interchangeable.
+    pub kind: &'static str,
     pub detail: String,
     pub impact: &'static str,
 }
@@ -271,6 +276,7 @@ pub fn mitigations(report: &hardening::Report) -> MitigationsDto {
             .map(|f| MitigationDto {
                 name: f.name,
                 state: f.state.label(),
+                kind: f.state.kind(),
                 detail: f.detail.clone(),
                 impact: f.impact,
             })

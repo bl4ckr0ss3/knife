@@ -715,6 +715,21 @@ impl Db {
         (self.names.remove(&at), self.notes.remove(&at))
     }
 
+    /// Remove only the name at an address, keeping any note. Returns what was
+    /// there.
+    ///
+    /// A front end that edits the two separately needs to clear them
+    /// separately: erasing a comment because a name was cleared, or the
+    /// reverse, loses work the analyst did not ask to lose.
+    pub fn clear_name(&mut self, at: u64) -> Option<String> {
+        self.names.remove(&at)
+    }
+
+    /// Remove only the note at an address, keeping any name.
+    pub fn clear_note(&mut self, at: u64) -> Option<String> {
+        self.notes.remove(&at)
+    }
+
     /// Write the database out, creating its directory if needed.
     ///
     /// Writing goes through a temporary file and a rename, so an interrupted
@@ -976,6 +991,30 @@ mod tests {
         p.push(format!("knife-db-test-{tag}-{}.json", std::process::id()));
         let _ = std::fs::remove_file(&p);
         p
+    }
+
+    #[test]
+    fn a_name_and_a_note_at_one_address_clear_independently() {
+        // Both live keyed by the same address, so clearing one must not take
+        // the other with it: they are separate pieces of analyst work.
+        let mut db = Db::default();
+        db.set_name(0x1400, "parse_header");
+        db.set_note(0x1400, "length is attacker controlled");
+
+        assert_eq!(db.clear_name(0x1400).as_deref(), Some("parse_header"));
+        assert!(db.names.get(&0x1400).is_none());
+        assert_eq!(
+            db.notes.get(&0x1400).map(String::as_str),
+            Some("length is attacker controlled"),
+            "clearing the name must leave the note"
+        );
+
+        assert_eq!(
+            db.clear_note(0x1400).as_deref(),
+            Some("length is attacker controlled")
+        );
+        assert!(db.notes.get(&0x1400).is_none());
+        assert!(db.is_empty());
     }
 
     #[test]

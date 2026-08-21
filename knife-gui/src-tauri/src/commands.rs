@@ -7,7 +7,7 @@ use crate::dto::{
     hex, CfgDto, CfgEdge, CfgNode, FindingDto, FnRow, IrLineDto, LineDto, OpenResult, StringRow,
     XrefRow,
 };
-use crate::state::AppState;
+use crate::state::{AppState, TargetRow};
 use anyhow::{anyhow, Result};
 use reknife::analysis::engine::{self, Analysis, Function};
 use reknife::analysis::{graphs, ir};
@@ -351,4 +351,22 @@ pub fn strings_list(
             Ok(rows)
         })
         .map_err(|e| e.to_string())
+}
+
+/// The open targets, in tab order.
+#[tauri::command]
+pub fn list_targets(state: State<AppState>) -> Vec<TargetRow> {
+    state.targets()
+}
+
+/// Show an already-open target.
+#[tauri::command]
+pub fn select_target(state: State<AppState>, path: String) -> Result<(), String> {
+    state.select(&path).map_err(|e| e.to_string())
+}
+
+/// Close a target and free its analysis.
+#[tauri::command]
+pub fn close_target(state: State<AppState>, path: String) -> Result<(), String> {
+    state.close(&path).map_err(|e| e.to_string())
 }

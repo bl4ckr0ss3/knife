@@ -26,38 +26,53 @@ function cardHeight(n: CfgNode) {
 /**
  * Place blocks in top-down layers.
  *
- * The layer is the shortest forward distance from the entry, so control flows
- * downward and a loop is visibly an edge pointing back up. Back edges are
- * excluded from the walk or every loop would drag its target into a deeper
- * layer than the code actually reaches it at. Blocks nothing reaches (they
- * exist: exception handlers, data the recovery could not attribute) go in a
- * final layer of their own rather than being dropped.
+ * The layer is the *longest* forward distance from the entry, not the shortest.
+ * That distinction matters: with shortest-path layering, a block reachable both
+ * directly from the entry and by falling through its sibling lands in the same
+ * layer as that sibling, and the edge between them is drawn sideways — through
+ * the card, as it turns out. Taking the longest path guarantees every forward
+ * edge descends at least one layer, so control genuinely reads downward and no
+ * edge has to cross a block to arrive.
+ *
+ * Back edges are excluded from the walk (a loop would otherwise push its own
+ * target down forever) and drawn afterwards as returns. Blocks nothing reaches
+ * — exception handlers, code the recovery could not attribute — go in a final
+ * layer of their own rather than being dropped.
  */
 function layout(cfg: Cfg) {
   const byId = new Map(cfg.nodes.map((n) => [n.id, n]));
   const forward = new Map<string, string[]>();
+  const indeg = new Map<string, number>();
+  for (const n of cfg.nodes) indeg.set(n.id, 0);
   for (const e of cfg.edges) {
-    if (e.back) continue;
+    if (e.back || !byId.has(e.from) || !byId.has(e.to)) continue;
     if (!forward.has(e.from)) forward.set(e.from, []);
     forward.get(e.from)!.push(e.to);
+    indeg.set(e.to, (indeg.get(e.to) ?? 0) + 1);
   }
 
+  // Longest-path layering over the acyclic part, by Kahn's topological order.
   const layer = new Map<string, number>();
   const queue: string[] = [];
-  if (byId.has(cfg.entry)) {
-    layer.set(cfg.entry, 0);
-    queue.push(cfg.entry);
-  }
-  while (queue.length) {
-    const id = queue.shift()!;
-    const d = layer.get(id)!;
-    for (const next of forward.get(id) ?? []) {
-      if (!layer.has(next)) {
-        layer.set(next, d + 1);
-        queue.push(next);
-      }
+  for (const n of cfg.nodes) {
+    if ((indeg.get(n.id) ?? 0) === 0) {
+      layer.set(n.id, 0);
+      queue.push(n.id);
     }
   }
+  const remaining = new Map(indeg);
+  while (queue.length) {
+    const id = queue.shift()!;
+    const d = layer.get(id) ?? 0;
+    for (const next of forward.get(id) ?? []) {
+      layer.set(next, Math.max(layer.get(next) ?? 0, d + 1));
+      const left = (remaining.get(next) ?? 1) - 1;
+      remaining.set(next, left);
+      if (left === 0) queue.push(next);
+    }
+  }
+  // Anything the topological pass could not settle (a cycle the back-edge flag
+  // did not cover) still needs a home.
   const deepest = Math.max(-1, ...[...layer.values()]);
   for (const n of cfg.nodes) if (!layer.has(n.id)) layer.set(n.id, deepest + 1);
 
@@ -194,10 +209,14 @@ export function GraphView({
             const x2 = b.x + b.w / 2;
             const y2 = b.y;
             // A back edge loops out to the side so it never hides under the
-            // forward path it returns along.
+            // forward path it returns along. A forward edge that skips layers
+            // bows outward by the same logic — otherwise it would cross every
+            // card in between.
+            const skips = Math.abs(b.y - (a.y + a.h)) > GAP_Y * 1.5;
+            const bow = skips ? (x2 >= x1 ? 1 : -1) * (CARD_W / 2 + GAP_X) : 0;
             const d = e.back
               ? `M ${x1} ${y1} C ${x1 + 220} ${y1 + 30}, ${x2 + 220} ${y2 - 30}, ${x2} ${y2}`
-              : `M ${x1} ${y1} C ${x1} ${y1 + GAP_Y / 2}, ${x2} ${y2 - GAP_Y / 2}, ${x2} ${y2}`;
+              : `M ${x1} ${y1} C ${x1 + bow} ${y1 + GAP_Y / 2}, ${x2 + bow} ${y2 - GAP_Y / 2}, ${x2} ${y2}`;
             return (
               <path
                 key={i}

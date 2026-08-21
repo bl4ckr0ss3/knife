@@ -16,6 +16,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 
+# Windows hands the taskbar whatever icon the window reports, and by default
+# that is a 16x16 bitmap stretched to whatever the display scaling asks for.
+# Setting the real ones needs the Win32 calls directly.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 # The analysis engine. Path dependency on the sibling crate at the repo root;
 # reknife is unmodified and unaware of the GUI.
 reknife = { path = "../.." }

@@ -1,29 +1,47 @@
 import type { IrLine, Line } from "../api";
 
 // The centre pane: disassembly or decompiled pseudocode. A single click selects
-// an instruction (so a note can be attached to it); clicking an underlined
-// operand, or double-clicking a line, follows the call/branch.
+// a line (so a note, or a type binding, can be attached to it); clicking an
+// underlined operand, or double-clicking, follows the call or branch.
 export function CodeView({
   tab,
   lines,
   ir,
   selected,
+  irSelected,
   onSelect,
+  onSelectIr,
   onFollow,
+  onLineMenu,
 }: {
   tab: "disasm" | "pseudo";
   lines: Line[];
   ir: IrLine[];
   selected: string | null;
+  irSelected: number | null;
   onSelect: (addr: string) => void;
+  onSelectIr: (index: number) => void;
   onFollow: (selector: string) => void;
+  onLineMenu: (index: number, at: { x: number; y: number }) => void;
 }) {
   if (tab === "pseudo") {
+    // Right-click is where the workbench lives: bind a type, name a field,
+    // rename a variable, set the prototype. Selecting the line first is what
+    // lets the keyboard equivalents (t / e / l / p) know what they act on.
     return (
       <div className="code">
         {ir.map((l, i) => (
-          <div key={i} className={"ir" + (l.label ? " label" : "")}>
-            {l.text || " "}
+          <div
+            key={i}
+            className={"ir" + (l.label ? " label" : "") + (irSelected === i ? " sel" : "")}
+            onClick={() => onSelectIr(i)}
+            onContextMenu={(e) => {
+              e.preventDefault();
+              onSelectIr(i);
+              onLineMenu(i, { x: e.clientX, y: e.clientY });
+            }}
+          >
+            {l.text || " "}
           </div>
         ))}
       </div>

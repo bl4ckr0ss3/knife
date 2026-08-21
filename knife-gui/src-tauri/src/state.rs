@@ -38,10 +38,29 @@ pub struct Loaded {
     pub detail: serde_json::Value,
 }
 
-/// The shared backend state: at most one loaded target for now.
+/// Every target the window has open, and which one the views are showing.
+///
+/// Order is insertion order, which is the tab order. Each entry holds a whole
+/// analysis — the image bytes included — so several large binaries at once cost
+/// real memory; closing a tab is what frees it.
+#[derive(Default)]
+struct Inner {
+    open: Vec<Loaded>,
+    active: usize,
+}
+
+/// The shared backend state.
 #[derive(Default)]
 pub struct AppState {
-    inner: Mutex<Option<Loaded>>,
+    inner: Mutex<Inner>,
+}
+
+/// One row in the target tab bar.
+#[derive(serde::Serialize)]
+pub struct TargetRow {
+    pub path: String,
+    pub title: String,
+    pub active: bool,
 }
 
 impl AppState {
@@ -53,7 +72,10 @@ impl AppState {
     /// hung; naming the stage costs nothing and tells the truth.
     pub fn open(&self, path: &str, phase: &dyn Fn(&str)) -> Result<()> {
         let mut guard = self.inner.lock().unwrap();
-        if guard.as_ref().is_some_and(|l| l.path == Path::new(path)) {
+        // Already open: switching to it is instant, and re-analysing a target
+        // the window is already holding would be pure waste.
+        if let Some(i) = guard.open.iter().position(|l| l.path == Path::new(path)) {
+            guard.active = i;
             return Ok(());
         }
         let loaded = catch_unwind(AssertUnwindSafe(|| -> Result<Loaded> {
@@ -75,14 +97,69 @@ impl AppState {
             Ok(loaded)
         }))
         .map_err(|_| anyhow!("the analysis panicked while loading this file"))??;
-        *guard = Some(loaded);
+        guard.open.push(loaded);
+        guard.active = guard.open.len() - 1;
         Ok(())
+    }
+
+    /// Show an already-open target.
+    pub fn select(&self, path: &str) -> Result<()> {
+        let mut guard = self.inner.lock().unwrap();
+        let i = guard
+            .open
+            .iter()
+            .position(|l| l.path == Path::new(path))
+            .ok_or_else(|| anyhow!("{path} is not open"))?;
+        guard.active = i;
+        Ok(())
+    }
+
+    /// Close a target and free its analysis, keeping the selection sensible.
+    pub fn close(&self, path: &str) -> Result<()> {
+        let mut guard = self.inner.lock().unwrap();
+        let Some(i) = guard.open.iter().position(|l| l.path == Path::new(path)) else {
+            return Ok(());
+        };
+        guard.open.remove(i);
+        // Closing a tab before the active one shifts it left; closing the last
+        // one steps back rather than off the end.
+        let active = guard.active;
+        guard.active = if guard.open.is_empty() {
+            0
+        } else if i < active {
+            active - 1
+        } else {
+            active.min(guard.open.len() - 1)
+        };
+        Ok(())
+    }
+
+    /// The open targets, in tab order.
+    pub fn targets(&self) -> Vec<TargetRow> {
+        let guard = self.inner.lock().unwrap();
+        guard
+            .open
+            .iter()
+            .enumerate()
+            .map(|(i, l)| TargetRow {
+                path: l.path.to_string_lossy().into_owned(),
+                title: l
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| l.path.to_string_lossy().into_owned()),
+                active: i == guard.active,
+            })
+            .collect()
     }
 
     /// Read the loaded workspace, panic-contained. Errors if nothing is open.
     pub fn read<T>(&self, f: impl FnOnce(&Loaded) -> Result<T>) -> Result<T> {
         let guard = self.inner.lock().unwrap();
-        let loaded = guard.as_ref().ok_or_else(|| anyhow!("no target is open"))?;
+        let loaded = guard
+            .open
+            .get(guard.active)
+            .ok_or_else(|| anyhow!("no target is open"))?;
         catch_unwind(AssertUnwindSafe(|| f(loaded)))
             .map_err(|_| anyhow!("the analysis panicked"))?
     }
@@ -91,7 +168,11 @@ impl AppState {
     /// database; no re-analysis, so a comment on a huge image is instant.
     pub fn annotate<T>(&self, f: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
         let mut guard = self.inner.lock().unwrap();
-        let loaded = guard.as_mut().ok_or_else(|| anyhow!("no target is open"))?;
+        let active = guard.active;
+        let loaded = guard
+            .open
+            .get_mut(active)
+            .ok_or_else(|| anyhow!("no target is open"))?;
         catch_unwind(AssertUnwindSafe(|| {
             let out = f(&mut loaded.session)?;
             loaded.session.db.save()?;
@@ -105,7 +186,11 @@ impl AppState {
     /// `refresh_analysis`. Uses `ANALYSIS_BUDGET` so the on-disk cache stays valid.
     pub fn edit<T>(&self, f: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
         let mut guard = self.inner.lock().unwrap();
-        let loaded = guard.as_mut().ok_or_else(|| anyhow!("no target is open"))?;
+        let active = guard.active;
+        let loaded = guard
+            .open
+            .get_mut(active)
+            .ok_or_else(|| anyhow!("no target is open"))?;
         let out = catch_unwind(AssertUnwindSafe(|| {
             let out = f(&mut loaded.session)?;
             loaded.session.db.save()?;

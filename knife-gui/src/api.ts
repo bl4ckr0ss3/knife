@@ -79,6 +79,7 @@ export interface Hashes {
 export interface Mitigation {
   name: string;
   state: string;
+  kind: "info" | "warn" | "bad" | "na";
   detail: string;
   impact: string;
 }
@@ -173,6 +174,39 @@ export interface SymbolRow {
   refs: number;
 }
 
+export interface TargetRow {
+  path: string;
+  title: string;
+  active: boolean;
+}
+
+export interface FieldRef {
+  base: string;
+  offset: number;
+  type_name: string | null;
+  member: string;
+}
+
+export interface LineActions {
+  field: FieldRef | null;
+  variable: string | null;
+}
+
+export interface FactRow {
+  kind: "prototype" | "structure" | "binding" | "variable";
+  name: string;
+  detail: string;
+  addr: string | null;
+}
+
+export interface PatchRun {
+  offset: string;
+  vaddr: string | null;
+  original: string;
+  bytes: string;
+  len: number;
+}
+
 export const api = {
   openTarget: (path: string) => invoke<OpenResult>("open_target", { path }),
   listFunctions: (filter?: string, namedOnly?: boolean, limit?: number) =>
@@ -186,9 +220,38 @@ export const api = {
   cfg: (selector: string) => invoke<Cfg>("cfg", { selector }),
   strings: (filter?: string, referencedOnly?: boolean, limit?: number) =>
     invoke<StringRow[]>("strings_list", { filter, referencedOnly, limit }),
+  listTargets: () => invoke<TargetRow[]>("list_targets"),
+  selectTarget: (path: string) => invoke<void>("select_target", { path }),
+  closeTarget: (path: string) => invoke<void>("close_target", { path }),
   imports: (filter?: string) => invoke<SymbolRow[]>("imports", { filter }),
   exports: (filter?: string) => invoke<SymbolRow[]>("exports", { filter }),
   consoleExec: (line: string) => invoke<ConsoleLine[]>("console_exec", { line }),
   setName: (addr: string, name: string) => invoke<void>("set_name", { addr, name }),
   setNote: (addr: string, note: string) => invoke<void>("set_note", { addr, note }),
+
+  // ── analyst workspace: everything that writes to the shared database ──
+  clearName: (addr: string) => invoke<void>("clear_name", { addr }),
+  clearNote: (addr: string) => invoke<void>("clear_note", { addr }),
+  lineActions: (func: string) => invoke<LineActions[]>("line_actions", { func }),
+  setPrototype: (func: string, returns: string, params: string[]) =>
+    invoke<void>("set_prototype", { func, returns, params }),
+  clearPrototype: (func: string) => invoke<void>("clear_prototype", { func }),
+  bindType: (func: string, base: string, typeName: string) =>
+    invoke<void>("bind_type", { func, base, typeName }),
+  clearBinding: (func: string, base: string) => invoke<void>("clear_binding", { func, base }),
+  setField: (typeName: string, offset: number, name: string, dataType?: string) =>
+    invoke<void>("set_field", { typeName, offset, name, dataType }),
+  clearField: (typeName: string, offset: number) =>
+    invoke<void>("clear_field", { typeName, offset }),
+  setVariable: (func: string, base: string, name: string) =>
+    invoke<void>("set_variable", { func, base, name }),
+  clearVariable: (func: string, base: string) => invoke<void>("clear_variable", { func, base }),
+  stagePatch: (addr: string, bytes: string) => invoke<number>("stage_patch", { addr, bytes }),
+  clearPatch: (offset: string) => invoke<void>("clear_patch", { offset }),
+  patchRuns: () => invoke<PatchRun[]>("patch_runs"),
+  exportPatched: (path: string) => invoke<string>("export_patched", { path }),
+  analystFacts: (filter?: string) => invoke<FactRow[]>("analyst_facts", { filter }),
+  importTypelib: (path: string, replace: boolean) =>
+    invoke<string>("import_typelib", { path, replace }),
+  exportTypelib: (path: string) => invoke<string>("export_typelib", { path }),
 };
