@@ -59,9 +59,16 @@ pub fn apply(hwnd: isize) {
     if hwnd == 0 {
         return;
     }
-    // 32 covers the taskbar from 100% through 125% scaling without stretching;
-    // 256 gives the task switcher room at any size it asks for.
-    let (small, big) = (frame(32), frame(256));
+    // 32 covers the taskbar and title bar without stretching. For the large
+    // icon, ask for the sizes Alt+Tab actually uses and take the first that
+    // loads: a 256px request returns nothing here, so reaching for the biggest
+    // frame available would leave the window with no large icon at all.
+    let small = frame(32);
+    let big = [48, 64, 128, 96, 32]
+        .into_iter()
+        .map(frame)
+        .find(|h| *h != 0)
+        .unwrap_or(0);
     unsafe {
         let hwnd = hwnd as HWND;
         if small != 0 {

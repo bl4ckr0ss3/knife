@@ -33,6 +33,10 @@ except ImportError:
 HERE = pathlib.Path(__file__).resolve().parent
 GUI = HERE.parent
 SOURCE = GUI / "icons" / "source.png"
+# A hand-built multi-frame icon beats anything generated: its small frames are
+# redrawn, not downscaled, which is the only way detail survives at 16 or 24
+# pixels. When one is present it is used verbatim.
+SOURCE_ICO = GUI / "icons" / "source.ico"
 OUT = GUI / "src-tauri" / "icons"
 
 # Where to look for each mark, and how far a pixel must differ from the ground
@@ -141,6 +145,34 @@ def render(art: Image.Image, size: int) -> Image.Image:
     return out
 
 
+def use_prebuilt_ico(path: pathlib.Path) -> None:
+    """Ship a hand-made .ico unchanged, and cut the PNGs from its own frames.
+
+    Regenerating any of this from a single large image would throw away the
+    per-size work that makes the small frames readable.
+    """
+    import shutil
+
+    ico = Image.open(path)
+    have = sorted(s[0] for s in ico.ico.sizes())
+    print(f"prebuilt icon: {path.name}  frames {have}")
+
+    OUT.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(path, OUT / "icon.ico")
+    print(f"  {'icon.ico':<16} copied verbatim")
+
+    for name, size in PNG_SIZES.items():
+        # Prefer the frame drawn for this size; fall back to the next one up so
+        # the result is always a downscale, never a stretch.
+        pick = size if size in have else min((h for h in have if h >= size), default=max(have))
+        ico.size = (pick, pick)
+        frame = ico.convert("RGBA")
+        if pick != size:
+            frame = frame.resize((size, size), Image.LANCZOS)
+        frame.save(OUT / name)
+        print(f"  {name:<16} {size:>3}px  from the {pick}px frame")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", default=str(SOURCE))
@@ -149,6 +181,11 @@ def main() -> None:
     parser.add_argument("--whole", action="store_true", help="use the source as-is")
     parser.add_argument("--sheet", action="store_true", help="treat the source as a brand sheet")
     args = parser.parse_args()
+
+    # A prebuilt .ico wins over generating from art.
+    if SOURCE_ICO.exists() and args.source == str(SOURCE):
+        use_prebuilt_ico(SOURCE_ICO)
+        return
 
     source = pathlib.Path(args.source)
     if not source.exists():
