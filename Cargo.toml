@@ -14,7 +14,19 @@ documentation = "https://docs.rs/reknife"
 readme = "README.md"
 keywords = ["reverse-engineering", "disassembler", "malware", "security", "pe"]
 categories = ["command-line-utilities", "development-tools::debugging"]
-exclude = ["assets/", ".github/", "scripts/", "*.png"]
+exclude = ["assets/", ".github/", "scripts/", "*.png", "knife-gui/"]
+
+# ── workspace ───────────────────────────────────────────────────────────────
+# The desktop GUI (`knife-gui`) is a separate workspace member so its Tauri/web
+# dependency graph never enters the `knife` binary or the published `reknife`
+# crate — the exact concern that got the previous in-crate GUI reverted.
+# `default-members = ["."]` keeps `cargo build`/`test`/`clippy` at the repo root
+# scoped to reknife alone; the GUI is built explicitly with `-p knife-gui` or the
+# Tauri CLI. reknife's own dependencies below are unchanged.
+[workspace]
+members = ["knife-gui/src-tauri"]
+default-members = ["."]
+resolver = "2"
 
 [[bin]]
 name = "knife"

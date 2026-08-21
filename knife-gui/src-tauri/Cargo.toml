@@ -1,0 +1,25 @@
+[package]
+name = "knife-gui"
+version = "0.1.0"
+edition = "2021"
+description = "Desktop reverse-engineering / vulnerability-research workbench built on the reknife engine"
+license = "MIT"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+# The analysis engine. Path dependency on the sibling crate at the repo root;
+# reknife is unmodified and unaware of the GUI.
+reknife = { path = "../.." }
+
+[[bin]]
+name = "knife-gui"
+path = "src/main.rs"
