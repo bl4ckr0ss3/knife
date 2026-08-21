@@ -66,6 +66,25 @@ fn pane(title: &str, focused: bool) -> Block<'_> {
         ))
 }
 
+/// The parts of a function row that never change size: the address and the
+/// incoming-call count. The name takes the rest.
+const FIXED_FUNCTION_COLUMNS: usize = 15;
+
+/// The parts of a sink row that never change size: the severity mark and the
+/// address. Whatever the pane has left over is split between the two names.
+const FIXED_SINK_COLUMNS: usize = 14;
+
+/// How many columns the left pane gets.
+///
+/// A fixed 38 is the right answer at 80 columns and a waste at 160: the sink
+/// rows are the widest thing that pane draws, and at 38 the containing function
+/// is always cut short. Grow with the terminal, but never far enough to crowd
+/// the listing, which is what the extra width is for in the first place.
+fn left_width(total: u16) -> u16 {
+    let want = (total * 2 / 5).clamp(38, 52);
+    want.min(total.saturating_sub(24)).max(20)
+}
+
 pub fn draw(f: &mut Frame, app: &App) {
     if app.splash {
         super::splash::draw(f, f.area(), app.frame, false);
@@ -89,7 +108,10 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(38), Constraint::Min(20)])
+        .constraints([
+            Constraint::Length(left_width(rows[1].width)),
+            Constraint::Min(20),
+        ])
         .split(rows[1]);
 
     functions(f, cols[0], app);
@@ -188,6 +210,11 @@ fn functions(f: &mut Frame, area: Rect, app: &App) {
     // The function containing whatever the listing shows is marked, so moving
     // through code keeps the left pane in step even after following calls.
     let current = app.cur;
+    // Demangled C++ names are long; give them whatever the pane has spare once
+    // the address and the caller count have taken their fixed columns.
+    let name_w = usize::from(area.width.saturating_sub(3))
+        .saturating_sub(FIXED_FUNCTION_COLUMNS)
+        .clamp(8, 40);
     let items: Vec<ListItem> = app
         .order
         .iter()
@@ -203,7 +230,7 @@ fn functions(f: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(faint()),
             ));
             spans.push(Span::styled(
-                truncate(&fun.name, 16),
+                truncate(&fun.name, name_w),
                 Style::default().fg(if fun.named { mint() } else { muted() }),
             ));
             spans.push(Span::styled(
@@ -237,6 +264,15 @@ fn functions(f: &mut Frame, area: Rect, app: &App) {
 /// The attack surface: ranked sink call sites, most severe first.
 fn sinks(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus == Focus::Functions;
+    // Split the row across the pane it is actually being drawn into: two
+    // borders and the selection marker are gone before any text, and what is
+    // left is shared between the bug class and the function it sits in. Both
+    // are names, and a name cut in half tells you nothing.
+    let inner = usize::from(area.width.saturating_sub(3));
+    let rest = inner.saturating_sub(FIXED_SINK_COLUMNS);
+    let pattern_w = rest.saturating_sub(8).clamp(6, 14);
+    let name_w = rest.saturating_sub(pattern_w + 1).max(4);
+
     let items: Vec<ListItem> = if app.sinks.is_empty() {
         vec![ListItem::new(TLine::from(Span::styled(
             " no sinks found",
@@ -259,14 +295,14 @@ fn sinks(f: &mut Frame, area: Rect, app: &App) {
                         Style::default().fg(color).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        format!("{:<11} ", truncate(&s.pattern.replace('-', " "), 11)),
+                        format!("{} ", truncate(&s.pattern.replace('-', " "), pattern_w)),
                         Style::default().fg(color),
                     ),
                     Span::styled(
                         format!("{:>9x} ", s.addr + app.an.display_base),
                         Style::default().fg(faint()),
                     ),
-                    Span::styled(truncate(where_, 10), Style::default().fg(muted())),
+                    Span::styled(truncate(where_, name_w), Style::default().fg(muted())),
                 ]))
             })
             .collect()
@@ -1193,6 +1229,10 @@ fn position(cursor: usize, total: usize) -> String {
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         format!("{s:<max$}")
+    } else if max == 0 {
+        // Column widths are computed from the terminal size, so a pane squeezed
+        // to nothing must return empty rather than underflow the take below.
+        String::new()
     } else {
         let t: String = s.chars().take(max - 1).collect();
         format!("{t}…")

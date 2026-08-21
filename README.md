@@ -12,6 +12,8 @@ binary. Static only: it reads the bytes on disk and never runs the target.
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![platforms](https://img.shields.io/badge/platform-linux%20%C2%B7%20macos%20%C2%B7%20windows-informational)
 
+<img src="assets/demo.gif" width="990" alt="knife tui: functions, disassembly, pseudocode, CFG, and driver analysis">
+
 </div>
 
 Most tools tell you a binary imports `memcpy`. `knife` reads the call sites and

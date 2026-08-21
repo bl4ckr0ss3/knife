@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+- Bulk output is buffered. `println!` flushes on every newline, which is one
+  write syscall per line; `strings`, `funcs`, and `dis` now share one buffer.
+  `knife strings` on a 327 MB DLL (2.3 million literals) goes from 26.1s to
+  3.9s, and a closed pipe (`knife strings big.dll | head`) exits cleanly
+  instead of panicking.
+- Function recovery is about 30% faster. Cross-references were recorded into a
+  `BTreeMap<u64, Vec<_>>` as they were found, which costs a tree descent per
+  reference and a heap allocation for every address seen for the first time.
+  They are now collected flat and grouped once: on a 25 MB DLL with 1.1 million
+  references, recovery drops from 3.39s to 2.39s.
+- Instructions cost less memory. The raw bytes are held inline rather than in a
+  `Vec` per instruction, and the resolved target name is boxed: 88 bytes plus an
+  allocation each becomes 64 bytes and none. Peak memory analysing a 25 MB DLL
+  falls from 1084 MB to 827 MB. Two whole-image copies are gone as well: one
+  made even when a target had no staged patches, and one the interactive view
+  made to hand the binary to its analysis thread.
+- `pseudo`: an indirect call whose target cannot be resolved reads as
+  `(*rax)(...)` or `(*(rcx + 0x18))(...)`. It used to render as `sub()`, which
+  looks like a call to a function named `sub` — the prefix Knife gives every
+  function it recovers without a symbol.
+- `tui`: the left pane grows with the terminal instead of staying at 38
+  columns, and the attack-surface and function rows take their column widths
+  from the pane they are drawn into, so the containing function is no longer
+  cut short on every row.
+- The analysis cache is schema 2, for the instruction layout above. An older
+  cache is recomputed rather than read.
+- Dropped the unused `memmap2` dependency.
+- The README animation is rendered, not captured: `--features record` builds a
+  recorder that drives the real interface off-screen through a scripted session
+  (`scripts/demo.knife`) and writes frames an off-line rasterizer paints, so it
+  rebuilds deterministically and carries no console artifacts.
+- Tests: the mutation walks are one test per fixture, so the harness runs them
+  in parallel, and the full pipeline runs behind every mutation in a file's
+  structured prefix and every sixteenth offset after it. Every offset is still
+  parsed, which is where an unbounded structure read shows up. The suite's
+  slowest group goes from 623s to 136s.
+
 ## v1.6.0
 
 - `drv`: kernel-driver and BYOVD analysis (`knife drv FILE`). Reads identity

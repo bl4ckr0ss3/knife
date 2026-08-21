@@ -1,5 +1,5 @@
 //! A Model Context Protocol server (`knife mcp`): a JSON-RPC 2.0 stream over
-//! stdio that exposes the analysis as tools, so an agent (ARGUS, Claude, any MCP
+//! stdio that exposes the analysis as tools, so an agent (ARGUS, or any MCP
 //! client) can drive knife directly. It reuses the same engine, listing,
 //! decompiler, and audit the command line does; only the wire format is new.
 //!

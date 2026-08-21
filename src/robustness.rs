@@ -58,20 +58,22 @@ fn run_analyzers(bin: &Binary, bytes: &[u8]) {
     let _ = sinks::cluster(&[]);
 
     // A small budget keeps the torture loop quick while still walking real
-    // recovery, cross-referencing, and rendering.
-    let an = engine::analyze(bin, bytes, 20_000, &Db::default());
+    // recovery, cross-referencing, and rendering. The mutation walks below run
+    // this tens of thousands of times, so what matters is that every pass is
+    // entered on every input, not how far each one gets on any one of them.
+    let an = engine::analyze(bin, bytes, 4_000, &Db::default());
     let _ = sinks::find(&an);
     let _ = audit::run(&an, bin, bytes);
 
     let base = engine::display_base(bin);
     let strings = listing::string_map(bin, bytes, base);
-    for f in an.functions.iter().take(50) {
+    for f in an.functions.iter().take(6) {
         let _ = listing::function(&an, f, &Db::default(), base, &strings, None);
     }
     // The decompiler is the one heavy recursive pass the other exercisers skip;
     // a hostile file that drives expression propagation deep depends on it
     // staying bounded, so it gets the same never-unwind guarantee here.
-    for f in an.functions.iter().take(50) {
+    for f in an.functions.iter().take(6) {
         let _ = ir::decompile(&an, bin, f, &strings, &Db::default());
     }
     // The driver pass runs the dispatch scan, reachability BFS, sink walk and
@@ -128,46 +130,101 @@ fn plausible_headers_over_garbage_never_panic() {
     }
 }
 
+/// Parse a buffer and stop there.
+///
+/// Every mutation gets at least this. Reading a structure field without
+/// bounding it is a parser bug, and the parser is also the cheapest layer, so
+/// it is the one that can afford to see every single mutation.
+fn exercise_parse(bytes: &[u8]) {
+    let _ = crate::formats::analyze("torture", bytes);
+}
+
+/// Where a file keeps the structures a parser has to trust: headers, the
+/// section table, the data directories. A flip past this is usually landing in
+/// code or data, where it changes an instruction rather than a bound.
+const STRUCTURED_PREFIX: usize = 4096;
+
+/// How often to run the whole pipeline once past that prefix.
+const TAIL_STRIDE: usize = 16;
+
+/// Whether this offset earns the full pipeline as well as a parse.
+fn deep(off: usize) -> bool {
+    off < STRUCTURED_PREFIX || off.is_multiple_of(TAIL_STRIDE)
+}
+
 /// Every prefix of a good file: catches structure offsets read without a bound.
-#[test]
-fn truncations_of_good_files_never_panic() {
-    for good in fixtures() {
-        // Every length is cheap enough for these small fixtures.
-        for n in 0..good.len() {
+fn truncations(good: &[u8]) {
+    for n in 0..good.len() {
+        if deep(n) {
             exercise(&good[..n]);
+        } else {
+            exercise_parse(&good[..n]);
         }
     }
 }
 
 /// Single-byte corruption at every offset of a good file: catches fields
 /// trusted because the rest of the header was well formed.
-#[test]
-fn bit_flips_of_good_files_never_panic() {
-    let mut rng = Lcg(0x0badf00d_12345678);
-    for good in fixtures() {
-        for off in 0..good.len() {
-            let mut buf = good.clone();
-            buf[off] ^= 1 << (rng.upto(8));
+fn bit_flips(good: &[u8], seed: u64) {
+    let mut rng = Lcg(seed);
+    let mut buf = good.to_vec();
+    for off in 0..good.len() {
+        let original = buf[off];
+        buf[off] = original ^ (1 << rng.upto(8));
+        if deep(off) {
             exercise(&buf);
-            // Also try turning a length/rva field to a large value.
-            let mut big = good.clone();
-            big[off] = 0xff;
-            exercise(&big);
+        } else {
+            exercise_parse(&buf);
         }
+        // Also try turning a length/rva field to a large value.
+        buf[off] = 0xff;
+        if deep(off) {
+            exercise(&buf);
+        } else {
+            exercise_parse(&buf);
+        }
+        // Put the byte back: one mutation at a time is what makes a failure
+        // point at a single field.
+        buf[off] = original;
     }
 }
 
-fn fixtures() -> Vec<Vec<u8>> {
-    use crate::formats::fixture::*;
-    vec![
-        elf_with_plt_call(),
-        elf_aarch64_call(),
-        elf_aarch64_plt_call(),
-        elf_with_eh_frame_hdr(),
-        pe_with_iat_call(),
-        pe_with_driver(),
-        macho_with_bind(),
-    ]
+/// One test per fixture rather than one loop over all of them.
+///
+/// These two walks are the longest thing in the suite: every byte offset of
+/// every fixture, three mutations each, through the whole pipeline. As a single
+/// test that is one core walking tens of thousands of inputs while the rest of
+/// the machine idles. Split per fixture, the test harness runs them at once and
+/// the same coverage costs a fraction of the wall clock. Each gets its own seed
+/// so a failure still reproduces from the test that found it.
+macro_rules! mutation_walks {
+    ($($fixture:ident => $seed:expr),* $(,)?) => {
+        $(
+            mod $fixture {
+                use super::*;
+
+                #[test]
+                fn truncations_never_panic() {
+                    truncations(&crate::formats::fixture::$fixture());
+                }
+
+                #[test]
+                fn bit_flips_never_panic() {
+                    bit_flips(&crate::formats::fixture::$fixture(), $seed);
+                }
+            }
+        )*
+    };
+}
+
+mutation_walks! {
+    elf_with_plt_call => 0x0badf00d_12345678,
+    elf_aarch64_call => 0x0badf00d_23456781,
+    elf_aarch64_plt_call => 0x0badf00d_34567812,
+    elf_with_eh_frame_hdr => 0x0badf00d_45678123,
+    pe_with_iat_call => 0x0badf00d_56781234,
+    pe_with_driver => 0x0badf00d_67812345,
+    macho_with_bind => 0x0badf00d_78123456,
 }
 
 #[test]

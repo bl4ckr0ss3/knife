@@ -1,0 +1,50 @@
+# The README animation, as a script.
+#
+#   scripts/record-demo.sh "C:/Program Files/7-Zip/7z.dll"
+#
+# One frame per key press, plus explicit holds, so the pacing lives here
+# instead of in a capture. See src/tui/record.rs for the command reference.
+
+size 110 30
+
+# ── the intro, while the engine recovers functions ──
+splash 24
+hold 8
+
+# ── the function list ──
+# 6472 of them in a stripped C++ parser, seeded from the exception directory
+key down 12
+hold 12
+
+# ── the ranked attack surface ──
+# the sink call sites the audit thinks are worst, with the evidence for each
+key s
+hold 22
+key down 2
+hold 18
+key down 1
+hold 20
+
+# ── follow one into the code ──
+key enter
+hold 20
+
+# ── and read it as pseudocode ──
+key d
+hold 30
+key down 10
+hold 20
+
+# ── the control-flow graph ──
+key f
+hold 16
+key down 2
+hold 8
+key right
+hold 10
+key down 1
+hold 18
+
+# back to the listing it came from
+key f
+hold 14

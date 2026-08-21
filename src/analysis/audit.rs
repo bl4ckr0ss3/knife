@@ -489,7 +489,7 @@ fn provenance_32(
     let mut seen = 0u8;
     for j in (0..call_idx).rev() {
         let ins = &block.insns[j];
-        let Some(d) = decode_one(&ins.bytes, ins.addr, an.bits) else {
+        let Some(d) = decode_one(ins.bytes(), ins.addr, an.bits) else {
             continue;
         };
         // Arguments are pushed after any earlier call returns, so an
@@ -560,7 +560,7 @@ fn resolve_reg(
 
     for j in (0..upto).rev() {
         let ins = &block.insns[j];
-        let Some(d) = decode_one(&ins.bytes, ins.addr, an.bits) else {
+        let Some(d) = decode_one(ins.bytes(), ins.addr, an.bits) else {
             continue;
         };
         // Argument registers do not survive an intervening call, so a value set

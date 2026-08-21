@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
-const SCHEMA: u32 = 1;
+// 2: instruction bytes moved inline, so the on-disk layout changed. A cache
+// written by an older build is simply recomputed.
+const SCHEMA: u32 = 2;
 const MAGIC: &[u8; 8] = b"KNFANLYS";
 
 #[derive(Deserialize)]
@@ -201,7 +203,7 @@ mod tests {
         let replacement = original[offset] ^ 1;
         db.stage_patch(&original, offset as u64, &[replacement])
             .unwrap();
-        let patched = db.apply_patches(&original).unwrap();
+        let patched = db.apply_patches(original.clone()).unwrap();
         let patched_sha = hashes::sha256_hex(&patched);
         assert_ne!(patched_sha, original_sha);
         let patched_bin = crate::formats::analyze("fixture", &patched).unwrap();

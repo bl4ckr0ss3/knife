@@ -10,12 +10,13 @@ use reknife::analysis::{
     triage, yara,
 };
 use reknife::model::Binary;
-use reknife::output::*;
+use reknife::output::{self, *};
 use reknife::{
     analysis, db, formats, listing, mcp, model, tui, workspace::Session, ANALYSIS_BUDGET,
 };
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 
 #[derive(Parser)]
 #[command(
@@ -315,6 +316,11 @@ enum Command {
 
 fn main() {
     if let Err(e) = real_main() {
+        // `knife strings big.dll | head` closes the pipe under us. That is the
+        // reader getting what it asked for, so leave without complaining.
+        if output::is_broken_pipe(&e) {
+            return;
+        }
         eprintln!("{} {:#}", "error:".style(red()).bold(), e);
         std::process::exit(1);
     }
@@ -561,7 +567,6 @@ fn real_main() -> Result<()> {
         Command::Ls { file } => cmd_ls(&file),
         Command::Completions { shell } => {
             use clap::CommandFactory;
-            use std::io::Write;
             let mut stdout = std::io::stdout();
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "knife", &mut stdout);
@@ -863,7 +868,7 @@ fn cmd_patch(file: &str, args: PatchArgs<'_>, as_json: bool, db_path: Option<&st
         if output_path.exists() && !args.force {
             anyhow::bail!("{} already exists (use --force)", output_path.display())
         }
-        let patched = store.apply_patches(&original)?;
+        let patched = store.apply_patches(original)?;
         if let Some(parent) = output_path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -1171,7 +1176,7 @@ fn cmd_tui(file: &str, db_path: Option<&str>) -> Result<()> {
     let original = load(file)?;
     let original_bin = parse(file, &original)?;
     let db = open_db(file, &original, db_path)?;
-    let bytes = db.apply_patches(&original)?;
+    let bytes = db.apply_patches(original)?;
     let bin = if db.patches.is_empty() {
         original_bin
     } else {
@@ -1604,7 +1609,7 @@ fn cmd_info(file: &str, rules: Option<&str>, as_json: bool) -> Result<()> {
         if let Some((off, va)) = disasm::entry_location(&bin, &bytes) {
             section_header("entry point");
             let insns = disasm::disassemble(&bytes, off, va, bin.bits, bin.arch, 8);
-            print_disasm(&insns);
+            print_disasm(&insns)?;
             println!("  {}", "run `knife dis` for more".style(faint()));
         }
     }
@@ -2001,15 +2006,19 @@ fn cmd_audit(file: &str, reachable_only: bool, as_json: bool, db_path: Option<&s
 
 fn cmd_strings(file: &str, min: usize, as_json: bool) -> Result<()> {
     let bytes = load(file)?;
-    let out = strs::extract(&bytes, min);
+    let strings = strs::extract(&bytes, min);
+    // Millions of lines are normal here, so both forms stream through one
+    // buffer rather than a syscall (or a whole serialized document) per string.
+    let mut out = output::bulk();
     if as_json {
-        println!("{}", serde_json::to_string_pretty(&out)?);
+        serde_json::to_writer_pretty(&mut out, &strings)?;
+        writeln!(out)?;
     } else {
-        for s in &out {
-            println!("{s}");
+        for s in &strings {
+            writeln!(out, "{s}")?;
         }
     }
-    Ok(())
+    output::finish(out)
 }
 
 fn cmd_iocs(file: &str, as_json: bool) -> Result<()> {
@@ -2055,7 +2064,8 @@ fn cmd_hashes(file: &str, as_json: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_disasm(insns: &[disasm::Insn]) {
+fn print_disasm(insns: &[disasm::Insn]) -> Result<()> {
+    let mut out = output::bulk();
     for i in insns {
         let raw: String = i
             .bytes
@@ -2064,14 +2074,16 @@ fn print_disasm(insns: &[disasm::Insn]) {
             .collect::<Vec<_>>()
             .join(" ");
         let (mn, rest) = i.text.split_once(' ').unwrap_or((i.text.as_str(), ""));
-        println!(
+        writeln!(
+            out,
             "  {}  {:<20} {} {}",
             format!("{:012x}", i.addr).style(faint()),
             raw.style(faint()),
             mn.style(accent()),
             rest.style(muted()),
-        );
+        )?;
     }
+    output::finish(out)
 }
 
 /// Recover what a driver exposes: devices, IRP dispatch, IOCTLs, primitives.
@@ -2300,8 +2312,7 @@ fn cmd_dis(
     };
     section_header(&format!("disassembly @ 0x{va:x}"));
     let insns = disasm::disassemble(&bytes, foff, va, bin.bits, bin.arch, count);
-    print_disasm(&insns);
-    Ok(())
+    print_disasm(&insns)
 }
 
 /// One reference, rendered the same way whatever it points at.
@@ -2702,39 +2713,47 @@ fn cmd_funcs(file: &str, by_refs: bool, as_json: bool, db_path: Option<&str>) ->
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&rows)?);
-        return Ok(());
+        let mut out = output::bulk();
+        serde_json::to_writer_pretty(&mut out, &rows)?;
+        writeln!(out)?;
+        return output::finish(out);
     }
 
     let named = funcs.iter().filter(|f| f.named).count();
     section_header(&format!("functions ({}, {} named)", funcs.len(), named));
-    println!(
+    // A large image recovers tens of thousands of functions, so the table goes
+    // through one buffer instead of a write per row.
+    let mut out = output::bulk();
+    writeln!(
+        out,
         "  {:<18} {:>6} {:>5} {:>5}  {}",
         "addr".style(faint()),
         "size".style(faint()),
         "blks".style(faint()),
         "refs".style(faint()),
         "name".style(faint()),
-    );
+    )?;
     for f in &funcs {
         let a = f.addr + an.display_base;
         let name_style = if f.named { mint() } else { muted() };
-        println!(
+        writeln!(
+            out,
             "  {:<18} {:>6} {:>5} {:>5}  {}",
             format!("0x{a:x}").style(faint()),
             f.size,
             f.blocks.len(),
             f.incoming,
             f.name.style(name_style),
-        );
+        )?;
     }
     if an.truncated {
-        println!(
+        writeln!(
+            out,
             "  {}",
             "analysis budget reached, listing is partial".style(amber())
-        );
+        )?;
     }
-    Ok(())
+    output::finish(out)
 }
 
 fn dis_function(sess: &Session, sel: &str) -> Result<()> {
@@ -3719,7 +3738,7 @@ mod tests {
         let sha = hashes::sha256_hex(&original);
         let restored = db::Db::load(&sha, &input_text, Some(&db_text)).unwrap();
         assert!(restored.patches.is_empty());
-        assert_eq!(restored.apply_patches(&original).unwrap(), original);
+        assert_eq!(restored.apply_patches(original.clone()).unwrap(), original);
         let _ = std::fs::remove_dir_all(root);
     }
 }

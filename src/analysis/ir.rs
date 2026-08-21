@@ -26,7 +26,7 @@ use crate::db::Db;
 use crate::model::{Binary, Format};
 use iced_x86::{
     Decoder, DecoderOptions, Formatter, Instruction, InstructionInfoFactory, IntelFormatter,
-    Mnemonic, OpAccess, OpKind, Register,
+    MemorySizeOptions, Mnemonic, OpAccess, OpKind, Register,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -491,7 +491,7 @@ fn lift_block(
     };
     let mut out = Vec::new();
     for ins in &b.insns {
-        let Some(d) = decode(&ins.bytes, ins.addr, an.bits) else {
+        let Some(d) = decode(ins.bytes(), ins.addr, an.bits) else {
             continue;
         };
         lift_insn(
@@ -520,7 +520,7 @@ fn has_frame_pointer(an: &Analysis, f: &Function) -> bool {
         return false;
     };
     entry.insns.iter().any(|ins| {
-        decode(&ins.bytes, ins.addr, an.bits).is_some_and(|d| {
+        decode(ins.bytes(), ins.addr, an.bits).is_some_and(|d| {
             d.mnemonic() == Mnemonic::Mov
                 && matches!(d.op0_register(), Register::EBP | Register::RBP)
                 && matches!(d.op1_register(), Register::ESP | Register::RSP)
@@ -999,7 +999,7 @@ fn lift_call(
     let name = target_name
         .map(strip_module)
         .or_else(|| target.map(|t| an.label(t)))
-        .unwrap_or_else(|| "sub".to_string());
+        .unwrap_or_else(|| indirect_callee(d));
 
     let args = if an.bits == 32 {
         // Right-to-left pushes: reverse to C order; whatever was pushed since the
@@ -1061,7 +1061,7 @@ fn internal_arity(an: &Analysis, target: u64, win64: bool) -> Option<usize> {
             let mut incoming_survives = true;
             let mut info = InstructionInfoFactory::new();
             for raw in &block.insns {
-                let Some(instruction) = decode(&raw.bytes, raw.addr, an.bits) else {
+                let Some(instruction) = decode(raw.bytes(), raw.addr, an.bits) else {
                     continue;
                 };
                 let accesses: Vec<OpAccess> = info
@@ -1476,7 +1476,7 @@ fn return_type_summary(
 
     for (block_index, block) in function.blocks.iter().enumerate() {
         let is_return = block.insns.last().is_some_and(|raw| {
-            decode(&raw.bytes, raw.addr, an.bits)
+            decode(raw.bytes(), raw.addr, an.bits)
                 .is_some_and(|instruction| instruction.mnemonic() == Mnemonic::Ret)
         });
         if !is_return {
@@ -1530,7 +1530,7 @@ fn return_def_type(
     let block = &function.blocks[block_index];
     let mut info = InstructionInfoFactory::new();
     for raw in block.insns[..upto.min(block.insns.len())].iter().rev() {
-        let Some(instruction) = decode(&raw.bytes, raw.addr, an.bits) else {
+        let Some(instruction) = decode(raw.bytes(), raw.addr, an.bits) else {
             continue;
         };
         // A call defines RAX/EAX by ABI convention, not by an architectural
@@ -1658,7 +1658,7 @@ fn parameter_type_summary(
             let mut state = incoming;
             let mut info = InstructionInfoFactory::new();
             for raw in &block.insns {
-                let Some(instruction) = decode(&raw.bytes, raw.addr, an.bits) else {
+                let Some(instruction) = decode(raw.bytes(), raw.addr, an.bits) else {
                     continue;
                 };
                 if instruction.mnemonic() == Mnemonic::Call {
@@ -3201,6 +3201,39 @@ fn raw(d: &Instruction) -> String {
     let mut s = String::new();
     fmt.format(d, &mut s);
     s
+}
+
+/// How to write a call whose target is not a fixed address.
+///
+/// `call rax` and `call [rbx+0x18]` have a real callee; what is missing is its
+/// name, not the call. Naming the operand keeps that visible. The placeholder
+/// this replaces read as a call to a function actually named `sub`, which is
+/// also the prefix every function Knife recovers without a symbol carries.
+fn indirect_callee(d: &Instruction) -> String {
+    if d.op_count() == 0 {
+        return "sub".to_string();
+    }
+    match d.op_kind(0) {
+        OpKind::Register => format!("(*{})", operand_text(d, 0)),
+        OpKind::Memory => {
+            // `qword ptr [rbx+0x18]` is assembly's way of writing a
+            // dereference. Drop the size, which pseudocode has no use for, and
+            // the brackets, which it spells differently.
+            let mut fmt = IntelFormatter::new();
+            fmt.options_mut().set_hex_prefix("0x");
+            fmt.options_mut().set_hex_suffix("");
+            fmt.options_mut()
+                .set_memory_size_options(MemorySizeOptions::Never);
+            let mut text = String::new();
+            let _ = fmt.format_operand(d, &mut text, 0);
+            let inner = text
+                .strip_prefix('[')
+                .and_then(|t| t.strip_suffix(']'))
+                .unwrap_or(&text);
+            format!("(*({inner}))")
+        }
+        _ => "sub".to_string(),
+    }
 }
 
 fn operand_text(d: &Instruction, i: u32) -> String {

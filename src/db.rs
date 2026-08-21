@@ -545,8 +545,14 @@ impl Db {
         self.clear_patch_range(run.offset, run.bytes.len())
     }
 
-    pub fn apply_patches(&self, original: &[u8]) -> Result<Vec<u8>> {
-        let mut patched = original.to_vec();
+    /// Apply the staged edits to a copy of the file.
+    ///
+    /// Takes the bytes by value and edits them in place. Copying first would
+    /// double the resident cost of every analysed image, and the callers all
+    /// hand over an image they are done with; a target with no staged patches
+    /// then costs nothing at all.
+    pub fn apply_patches(&self, original: Vec<u8>) -> Result<Vec<u8>> {
+        let mut patched = original;
         for (&offset, patch) in &self.patches {
             let index = usize::try_from(offset).context("patch offset is too large")?;
             let Some(byte) = patched.get_mut(index) else {
@@ -1297,7 +1303,7 @@ mod tests {
         db.stage_patch(&source, 3, &[0xcc]).unwrap();
         assert_eq!(db.patch_runs().len(), 1, "adjacent edits coalesce");
         assert_eq!(
-            db.apply_patches(&source).unwrap(),
+            db.apply_patches(source.to_vec()).unwrap(),
             [0x10, 0xaa, 0xbb, 0xcc, 0x50]
         );
 
@@ -1311,7 +1317,7 @@ mod tests {
 
         let mut back = Db::load("abc123", "t.exe", Some(&ps)).unwrap();
         assert_eq!(
-            back.apply_patches(&source).unwrap(),
+            back.apply_patches(source.to_vec()).unwrap(),
             [0x10, 0xaa, 0x30, 0xdd, 0x50]
         );
         let restored = back.clear_patch_run_at(1);
@@ -1330,7 +1336,7 @@ mod tests {
         let before = db.patches.clone();
         assert!(db.stage_patch(&source, u64::MAX, &[1, 2]).is_err());
         assert_eq!(db.patches, before, "failed staging is atomic");
-        assert!(db.apply_patches(&[0x10, 0x21, 0x30]).is_err());
+        assert!(db.apply_patches(vec![0x10, 0x21, 0x30]).is_err());
 
         assert_eq!(
             parse_patch_bytes("90 0xcc,\\x41").unwrap(),

@@ -2,6 +2,38 @@
 
 use crate::analysis::triage::{TriageResult, Verdict};
 use owo_colors::{OwoColorize, Style};
+use std::io::{self, BufWriter, StdoutLock, Write};
+
+/// Block-buffered stdout, for the commands that print in bulk.
+///
+/// `println!` flushes at every newline, which is one write syscall per line.
+/// A 300 MB image yields over two million strings, and at that size the
+/// flushing costs several times what finding them did. Bulk printers write
+/// here and let the buffer decide when to talk to the operating system.
+pub fn bulk() -> BufWriter<StdoutLock<'static>> {
+    BufWriter::with_capacity(256 * 1024, io::stdout().lock())
+}
+
+/// Flush a bulk writer and hand back any real failure.
+///
+/// A closed pipe is not one: `knife strings big.dll | head` is the reader
+/// getting exactly what it asked for, and reporting that as an error would be
+/// wrong. Buffering makes this reachable where line-at-a-time printing simply
+/// panicked, so it is handled rather than propagated.
+pub fn finish(mut out: impl Write) -> anyhow::Result<()> {
+    match out.flush() {
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        other => Ok(other?),
+    }
+}
+
+/// Whether a failure is just a reader that stopped listening.
+pub fn is_broken_pipe(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<io::Error>())
+        .any(|io| io.kind() == io::ErrorKind::BrokenPipe)
+}
 
 pub fn human(bytes: u64) -> String {
     if bytes >= 1 << 20 {

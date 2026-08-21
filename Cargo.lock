@@ -2587,7 +2587,6 @@ dependencies = [
  "goblin",
  "iced-x86",
  "md-5",
- "memmap2",
  "msvc-demangler",
  "owo-colors",
  "ratatui",

@@ -14,11 +14,21 @@ documentation = "https://docs.rs/reknife"
 readme = "README.md"
 keywords = ["reverse-engineering", "disassembler", "malware", "security", "pe"]
 categories = ["command-line-utilities", "development-tools::debugging"]
-exclude = ["assets/", ".github/", "*.png"]
+exclude = ["assets/", ".github/", "scripts/", "*.png"]
 
 [[bin]]
 name = "knife"
 path = "src/main.rs"
+
+# Dev-only demo recorder for the README animation. Gated behind `record` so a
+# plain `cargo build` (and the published crate) never compiles it.
+[[bin]]
+name = "knife-record"
+path = "src/bin/knife-record.rs"
+required-features = ["record"]
+
+[features]
+record = []
 
 # cargo-binstall: fetch prebuilt binaries from GitHub Releases instead of
 # compiling. The release workflow produces archives matching this template.
@@ -42,7 +52,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bincode = { version = "2", features = ["serde"] }
 regex = "1"
-memmap2 = "0.9"
 owo-colors = "4"
 anyhow = "1"
 yara-x = "=1.5.0"

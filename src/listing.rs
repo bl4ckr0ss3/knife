@@ -91,7 +91,7 @@ pub fn function(
             let mut annot = if let Some(n) = db.notes.get(&a.wrapping_sub(base)) {
                 Some(Annot::Note(n.clone()))
             } else if let Some(name) = &ins.target_name {
-                Some(Annot::Symbol(name.clone()))
+                Some(Annot::Symbol(name.to_string()))
             } else if let Some(t) = ins.target {
                 let ta = t + an.display_base;
                 if an.find_function(t).is_some() {

@@ -16,25 +16,62 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 // Several fields here (instruction length/flow, block end/successors, xref
 // kind) are part of the CFG model for the upcoming interactive/graph views and
 // are not all read by the current text output yet.
+/// The longest instruction x86 permits. AArch64 is always 4, so one inline
+/// buffer covers both architectures.
+pub const MAX_INSN_BYTES: usize = 15;
+
 #[allow(dead_code)]
 #[derive(Serialize, Deserialize)]
 pub struct EngineInsn {
     pub addr: u64,
-    pub len: usize,
-    /// The instruction's raw bytes. Formatting is deferred to `text`, because
-    /// most commands (function lists, sinks, xrefs) never print an operand,
-    /// and formatting every instruction of a kernel image only to count it
-    /// twice is the kind of waste that shows up as seconds.
-    pub bytes: Vec<u8>,
-    /// A resolved symbolic target (function name / import), if any.
-    pub target_name: Option<String>,
     /// A branch/call target address, if this instruction has one.
     pub target: Option<u64>,
+    /// A resolved symbolic target (function name / import), if any. Boxed
+    /// rather than a `String`: it is `None` for almost every instruction, and
+    /// at millions of instructions the two words a `String` spends on capacity
+    /// it never uses are megabytes.
+    pub target_name: Option<Box<str>>,
+    /// The instruction's raw bytes, held inline. A `Vec` here costs a heap
+    /// allocation per instruction, and a large image has millions of them.
+    /// Formatting is deferred to `text`, because most commands (function
+    /// lists, sinks, xrefs) never print an operand, and formatting every
+    /// instruction of a kernel image only to count it twice is the kind of
+    /// waste that shows up as seconds.
+    raw: [u8; MAX_INSN_BYTES],
+    len: u8,
     #[serde(with = "flow_control_serde")]
     pub flow: FlowControl,
 }
 
 impl EngineInsn {
+    /// Record one decoded instruction. `bytes` longer than the architecture
+    /// allows is a decoder bug rather than a possible input, so the excess is
+    /// dropped instead of failing the whole analysis.
+    pub fn new(
+        addr: u64,
+        bytes: &[u8],
+        flow: FlowControl,
+        target: Option<u64>,
+        target_name: Option<Box<str>>,
+    ) -> EngineInsn {
+        let len = bytes.len().min(MAX_INSN_BYTES);
+        let mut raw = [0u8; MAX_INSN_BYTES];
+        raw[..len].copy_from_slice(&bytes[..len]);
+        EngineInsn {
+            addr,
+            target,
+            target_name,
+            raw,
+            len: len as u8,
+            flow,
+        }
+    }
+
+    /// The instruction's raw bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.raw[..self.len as usize]
+    }
+
     /// Render the instruction, formatted on demand from the stored bytes.
     pub fn text(&self, bits: u32, arch: crate::model::Arch) -> String {
         if arch.is_x86() {
@@ -44,7 +81,7 @@ impl EngineInsn {
             fmt.options_mut().set_hex_suffix("");
             fmt.options_mut().set_space_after_operand_separator(true);
 
-            let mut decoder = Decoder::with_ip(bits, &self.bytes, self.addr, DecoderOptions::NONE);
+            let mut decoder = Decoder::with_ip(bits, self.bytes(), self.addr, DecoderOptions::NONE);
             if !decoder.can_decode() {
                 return String::new();
             }
@@ -53,7 +90,7 @@ impl EngineInsn {
             fmt.format(&insn, &mut s);
             s
         } else {
-            crate::analysis::aarch64::text(&self.bytes, self.addr)
+            crate::analysis::aarch64::text(self.bytes(), self.addr)
         }
     }
 }
@@ -92,7 +129,7 @@ impl Function {
             h = h.rotate_left(5) ^ b.start.wrapping_mul(0x8000_0000_0000_0000);
             h ^= b.end;
             for i in &b.insns {
-                for byte in &i.bytes {
+                for byte in i.bytes() {
                     h = h.rotate_left(1) ^ u64::from(*byte);
                 }
                 h ^= i.addr;
@@ -487,6 +524,34 @@ fn jump_table_base(
     None
 }
 
+/// Turn the flat list of references collected during recovery into the map the
+/// rest of the tool reads.
+///
+/// Sorting once over one vector replaces a tree descent per reference, and the
+/// per-address vectors come out at exactly the length they need instead of the
+/// four slots a single `push` would have reserved. `order` supplies the
+/// secondary key, which is also what de-duplicates the same reference found
+/// twice through overlapping code.
+fn group_refs<V: Copy, K: Ord + Eq>(
+    mut flat: Vec<(u64, V)>,
+    order: impl Fn(&V) -> K,
+) -> BTreeMap<u64, Vec<V>> {
+    flat.sort_unstable_by(|(a_key, a), (b_key, b)| {
+        a_key.cmp(b_key).then_with(|| order(a).cmp(&order(b)))
+    });
+    flat.dedup_by(|(a_key, a), (b_key, b)| a_key == b_key && order(a) == order(b));
+
+    let mut groups: Vec<(u64, Vec<V>)> = Vec::new();
+    for (key, value) in flat {
+        match groups.last_mut() {
+            Some((at, run)) if *at == key => run.push(value),
+            _ => groups.push((key, vec![value])),
+        }
+    }
+    // Already sorted by address, which `BTreeMap` builds from in bulk.
+    groups.into_iter().collect()
+}
+
 pub fn analyze(bin: &Binary, bytes: &[u8], max_insns: usize, db: &crate::db::Db) -> Analysis {
     let base = display_base(bin);
 
@@ -571,8 +636,14 @@ pub fn analyze(bin: &Binary, bytes: &[u8], max_insns: usize, db: &crate::db::Db)
     let boundaries: BTreeSet<u64> = is_seed.iter().copied().collect();
 
     let mut functions: Vec<Function> = Vec::new();
-    let mut xrefs_to: BTreeMap<u64, Vec<Xref>> = BTreeMap::new();
-    let mut xrefs_from: BTreeMap<u64, Vec<Ref>> = BTreeMap::new();
+    // Collected flat and grouped once at the end. Recording a reference into
+    // a `BTreeMap<_, Vec<_>>` as it is found costs a tree descent and, for
+    // every address seen for the first time, a heap allocation for a vector
+    // that usually holds a single element. A large image has millions of
+    // references, and pushing onto one vector instead is the difference
+    // between millions of allocations and none.
+    let mut xrefs_to_flat: Vec<(u64, Xref)> = Vec::new();
+    let mut xrefs_from_flat: Vec<(u64, Ref)> = Vec::new();
     let mut done: BTreeSet<u64> = BTreeSet::new();
     let mut budget = max_insns;
     let mut truncated = false;
@@ -595,8 +666,8 @@ pub fn analyze(bin: &Binary, bytes: &[u8], max_insns: usize, db: &crate::db::Db)
             &names,
             &import_slots,
             &boundaries,
-            &mut xrefs_to,
-            &mut xrefs_from,
+            &mut xrefs_to_flat,
+            &mut xrefs_from_flat,
             budget,
         );
         budget = budget.saturating_sub(spent);
@@ -613,14 +684,8 @@ pub fn analyze(bin: &Binary, bytes: &[u8], max_insns: usize, db: &crate::db::Db)
 
     // Overlapping code can be decoded under more than one function, which would
     // otherwise report the same instruction as several distinct references.
-    for refs in xrefs_to.values_mut() {
-        refs.sort_by_key(|x| (x.from, x.kind as u8));
-        refs.dedup_by_key(|x| (x.from, x.kind as u8));
-    }
-    for refs in xrefs_from.values_mut() {
-        refs.sort_by_key(|x| (x.to, x.kind as u8));
-        refs.dedup_by_key(|x| (x.to, x.kind as u8));
-    }
+    let xrefs_to = group_refs(xrefs_to_flat, |x| (x.from, x.kind as u8));
+    let xrefs_from = group_refs(xrefs_from_flat, |x| (x.to, x.kind as u8));
 
     let mut incoming: BTreeMap<u64, usize> = BTreeMap::new();
     for (target, refs) in &xrefs_to {
@@ -645,6 +710,7 @@ pub fn analyze(bin: &Binary, bytes: &[u8], max_insns: usize, db: &crate::db::Db)
         }
     }
     functions.sort_by_key(|f| f.addr);
+
     let mut function_names = BTreeMap::new();
     for (index, function) in functions.iter().enumerate() {
         // Preserve the previous linear-search behavior for duplicate names:
@@ -675,8 +741,8 @@ fn build_function(
     names: &BTreeMap<u64, String>,
     import_slots: &BTreeMap<u64, String>,
     boundaries: &BTreeSet<u64>,
-    xrefs_to: &mut BTreeMap<u64, Vec<Xref>>,
-    xrefs_from: &mut BTreeMap<u64, Vec<Ref>>,
+    xrefs_to: &mut Vec<(u64, Xref)>,
+    xrefs_from: &mut Vec<(u64, Ref)>,
     budget: usize,
 ) -> (Function, Vec<u64>, usize) {
     let mut blocks: BTreeMap<u64, BasicBlock> = BTreeMap::new();
@@ -751,7 +817,7 @@ fn build_function(
                     break;
                 };
                 spent += 1;
-                let raw = chunk[..w.len].to_vec();
+                let raw = &chunk[..w.len];
                 apos += w.len;
                 (w.addr, w.len, raw, w.flow, w.target)
             } else {
@@ -782,7 +848,10 @@ fn build_function(
                 };
                 let addr = insn.ip();
                 let len = insn.len();
-                let raw = bytes[off + pos..off + pos + len].to_vec();
+                // Borrowed straight out of the image: `EngineInsn` copies
+                // what it needs inline, so nothing is allocated per
+                // instruction.
+                let raw = &bytes[off + pos..off + pos + len];
                 ice = Some(insn);
                 (addr, len, raw, flow, dtarget)
             };
@@ -819,30 +888,30 @@ fn build_function(
             match flow {
                 FlowControl::Call => {
                     if let Some(t) = target {
-                        target_name = names.get(&t).cloned();
+                        target_name = names.get(&t).map(|n| n.as_str().into());
                         calls.push(t);
-                        xrefs_to.entry(t).or_default().push(Xref {
-                            from: addr,
-                            kind: XrefKind::Call,
-                        });
-                        xrefs_from.entry(addr).or_default().push(Ref {
-                            to: t,
-                            kind: XrefKind::Call,
-                        });
+                        xrefs_to.push((
+                            t,
+                            Xref {
+                                from: addr,
+                                kind: XrefKind::Call,
+                            },
+                        ));
+                        xrefs_from.push((
+                            addr,
+                            Ref {
+                                to: t,
+                                kind: XrefKind::Call,
+                            },
+                        ));
                     }
                 }
                 FlowControl::UnconditionalBranch => {
                     if let Some(t) = target {
-                        target_name = names.get(&t).cloned();
+                        target_name = names.get(&t).map(|n| n.as_str().into());
                         let kind = XrefKind::Jump;
-                        xrefs_to
-                            .entry(t)
-                            .or_default()
-                            .push(Xref { from: addr, kind });
-                        xrefs_from
-                            .entry(addr)
-                            .or_default()
-                            .push(Ref { to: t, kind });
+                        xrefs_to.push((t, Xref { from: addr, kind }));
+                        xrefs_from.push((addr, Ref { to: t, kind }));
                         // tail-call to another function, or an intra-function
                         // jump?
                         if boundaries.contains(&t) && t != entry {
@@ -854,15 +923,21 @@ fn build_function(
                 }
                 FlowControl::ConditionalBranch => {
                     if let Some(t) = target {
-                        target_name = names.get(&t).cloned();
-                        xrefs_to.entry(t).or_default().push(Xref {
-                            from: addr,
-                            kind: XrefKind::Branch,
-                        });
-                        xrefs_from.entry(addr).or_default().push(Ref {
-                            to: t,
-                            kind: XrefKind::Branch,
-                        });
+                        target_name = names.get(&t).map(|n| n.as_str().into());
+                        xrefs_to.push((
+                            t,
+                            Xref {
+                                from: addr,
+                                kind: XrefKind::Branch,
+                            },
+                        ));
+                        xrefs_from.push((
+                            addr,
+                            Ref {
+                                to: t,
+                                kind: XrefKind::Branch,
+                            },
+                        ));
                         if queue_block(t, &mut seen, &mut worklist) {
                             succ.push(t);
                         }
@@ -892,7 +967,7 @@ fn build_function(
                         if let Some(slot) = slot {
                             if let Some(n) = import_slots.get(&slot) {
                                 target = Some(slot);
-                                target_name = Some(n.clone());
+                                target_name = Some(n.as_str().into());
                                 // The slot is a call-graph edge like any other,
                                 // and without it every path that runs through
                                 // an import is invisible. It is never seeded
@@ -904,14 +979,8 @@ fn build_function(
                                 } else {
                                     XrefKind::Jump
                                 };
-                                xrefs_to
-                                    .entry(slot)
-                                    .or_default()
-                                    .push(Xref { from: addr, kind });
-                                xrefs_from
-                                    .entry(addr)
-                                    .or_default()
-                                    .push(Ref { to: slot, kind });
+                                xrefs_to.push((slot, Xref { from: addr, kind }));
+                                xrefs_from.push((addr, Ref { to: slot, kind }));
                             }
                         }
                         // An indexed branch that no import slot explains is a
@@ -940,14 +1009,20 @@ fn build_function(
                                     if read == 0 {
                                         tables.push(table);
                                     }
-                                    xrefs_to.entry(t).or_default().push(Xref {
-                                        from: addr,
-                                        kind: XrefKind::Jump,
-                                    });
-                                    xrefs_from.entry(addr).or_default().push(Ref {
-                                        to: t,
-                                        kind: XrefKind::Jump,
-                                    });
+                                    xrefs_to.push((
+                                        t,
+                                        Xref {
+                                            from: addr,
+                                            kind: XrefKind::Jump,
+                                        },
+                                    ));
+                                    xrefs_from.push((
+                                        addr,
+                                        Ref {
+                                            to: t,
+                                            kind: XrefKind::Jump,
+                                        },
+                                    ));
                                     if queue_block(t, &mut seen, &mut worklist) {
                                         succ.push(t);
                                     }
@@ -966,26 +1041,25 @@ fn build_function(
             if target.is_none() {
                 if let Some(insn) = &ice {
                     if let Some(t) = data_ref(bin, base, insn) {
-                        xrefs_to.entry(t).or_default().push(Xref {
-                            from: addr,
-                            kind: XrefKind::Data,
-                        });
-                        xrefs_from.entry(addr).or_default().push(Ref {
-                            to: t,
-                            kind: XrefKind::Data,
-                        });
+                        xrefs_to.push((
+                            t,
+                            Xref {
+                                from: addr,
+                                kind: XrefKind::Data,
+                            },
+                        ));
+                        xrefs_from.push((
+                            addr,
+                            Ref {
+                                to: t,
+                                kind: XrefKind::Data,
+                            },
+                        ));
                     }
                 }
             }
 
-            insns.push(EngineInsn {
-                addr,
-                len,
-                bytes: raw,
-                target_name,
-                target,
-                flow,
-            });
+            insns.push(EngineInsn::new(addr, raw, flow, target, target_name));
 
             // A conditional branch also falls through to the next instruction.
             if flow == FlowControl::ConditionalBranch {

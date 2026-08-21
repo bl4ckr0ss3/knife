@@ -6,6 +6,10 @@
 //! parts (navigation, filtering, the follow-and-return stack) can be tested
 //! without a terminal; `render` only ever reads.
 
+/// Deterministic demo recorder for the README animation. Dev-only, so it
+/// is compiled out of the published crate unless the feature is asked for.
+#[cfg(feature = "record")]
+pub mod record;
 mod render;
 mod splash;
 
@@ -281,11 +285,19 @@ pub struct Prompt {
 /// What the analysis worker computes: the engine's view, the ranked sink
 /// findings, and the literal map. All of it is ready by the time the main
 /// view opens, so `App::new` stays cheap.
-type WorkResult = (
-    crate::analysis::engine::Analysis,
-    Vec<crate::analysis::audit::Finding>,
-    BTreeMap<u64, Located>,
-);
+///
+/// The target travels with the result rather than being cloned into the
+/// worker. The main thread only animates the splash while the analysis runs,
+/// so it has no use for the image in the meantime, and a copy of it costs as
+/// much resident memory as the file is large.
+struct WorkResult {
+    bin: Binary,
+    bytes: Vec<u8>,
+    db: Db,
+    an: crate::analysis::engine::Analysis,
+    sinks: Vec<crate::analysis::audit::Finding>,
+    strings: BTreeMap<u64, Located>,
+}
 
 pub struct App {
     // ── the target ──
@@ -1975,7 +1987,7 @@ impl App {
                 .unwrap_or_default(),
             Ask::Patch => self
                 .current_instruction(at)
-                .map(|instruction| format_bytes(&instruction.bytes))
+                .map(|instruction| format_bytes(instruction.bytes()))
                 .unwrap_or_default(),
             Ask::ImportLibrary | Ask::ReplaceLibrary | Ask::ExportLibrary => String::new(),
         };
@@ -2313,18 +2325,24 @@ pub fn run(bin: Binary, bytes: Vec<u8>, db: Db, title: String) -> Result<()> {
     // exactly as long as the analysis takes, then the app takes over with the
     // ready result.
     let (tx, rx) = std::sync::mpsc::channel::<WorkResult>();
-    let (b, by, d) = (bin.clone(), bytes.clone(), db.clone());
     std::thread::spawn(move || {
-        let an = engine::analyze(&b, &by, crate::ANALYSIS_BUDGET, &d);
-        let mut sinks = crate::analysis::audit::run(&an, &b, &by);
+        let an = engine::analyze(&bin, &bytes, crate::ANALYSIS_BUDGET, &db);
+        let mut sinks = crate::analysis::audit::run(&an, &bin, &bytes);
         sinks.sort_by(|a, b| {
             b.severity
                 .cmp(&a.severity)
                 .then(b.reachable.cmp(&a.reachable))
                 .then(a.addr.cmp(&b.addr))
         });
-        let strings = listing::string_map(&b, &by, engine::display_base(&b));
-        let _ = tx.send((an, sinks, strings));
+        let strings = listing::string_map(&bin, &bytes, engine::display_base(&bin));
+        let _ = tx.send(WorkResult {
+            bin,
+            bytes,
+            db,
+            an,
+            sinks,
+            strings,
+        });
     });
 
     // `try_init` rather than `init`, so running this with output piped fails
@@ -2367,7 +2385,14 @@ pub fn run(bin: Binary, bytes: Vec<u8>, db: Db, title: String) -> Result<()> {
         }
     };
 
-    let (an, sinks, strings) = match ready {
+    let WorkResult {
+        bin,
+        bytes,
+        db,
+        an,
+        sinks,
+        strings,
+    } = match ready {
         Ok(Some(ready)) => ready,
         Ok(None) => {
             let _ = ratatui::crossterm::execute!(&mut stdout(), event::DisableMouseCapture);

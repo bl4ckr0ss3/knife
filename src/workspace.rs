@@ -21,7 +21,7 @@ impl Session {
         let original_bin = formats::analyze(file, &original)?;
         let sha256 = hashes::sha256_hex(&original);
         let store = db::Db::load(&sha256, file, db_path)?;
-        let bytes = store.apply_patches(&original)?;
+        let bytes = store.apply_patches(original)?;
         let bin = if store.patches.is_empty() {
             original_bin
         } else {

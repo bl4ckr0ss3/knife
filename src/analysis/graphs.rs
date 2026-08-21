@@ -341,14 +341,13 @@ mod tests {
             BasicBlock {
                 start: 0x1000,
                 end: 0x1002,
-                insns: vec![EngineInsn {
-                    addr: 0x1000,
-                    len: 2,
-                    bytes: vec![0x74, 0x0e],
-                    target_name: None,
-                    target: Some(0x1010),
-                    flow: FlowControl::ConditionalBranch,
-                }],
+                insns: vec![EngineInsn::new(
+                    0x1000,
+                    &[0x74, 0x0e],
+                    FlowControl::ConditionalBranch,
+                    Some(0x1010),
+                    None,
+                )],
                 succ: vec![0x1002, 0x1010],
             },
             BasicBlock {
