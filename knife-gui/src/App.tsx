@@ -233,6 +233,7 @@ export default function App() {
     setLeftOpen(true);
   }, []);
 
+
   // Lines matching the find query, in the view that is actually showing.
   const hits = useMemo(() => {
     const q = (find ?? "").trim().toLowerCase();
@@ -306,6 +307,27 @@ export default function App() {
       .catch(() => setDriverFull(null));
     return fns;
   }, []);
+  // Cycle through the ranked weaknesses in place — IDA's mark navigation. Each
+  // step opens the containing function, selects the flagged instruction, and
+  // shows its evidence, so you walk the attack surface without hunting the list.
+  const jumpFinding = useCallback(
+    (dir: 1 | -1) => {
+      if (!findings.length) return;
+      const at = pickedFinding
+        ? findings.findIndex(
+            (f) => f.addr === pickedFinding.addr && f.pattern === pickedFinding.pattern,
+          )
+        : -1;
+      const n = findings.length;
+      const f = findings[(((at + dir) % n) + n) % n];
+      setPickedFinding(f);
+      setLeftView("attack");
+      setLeftOpen(true);
+      void openFunction(f.addr);
+      setSelected(f.addr);
+    },
+    [findings, pickedFinding, openFunction],
+  );
 
   const reloadAnalysis = useCallback(async () => {
     try {
@@ -594,6 +616,14 @@ export default function App() {
       if (typing || !opened || prompt || menu || find !== null) return;
 
       switch (e.key) {
+        case ".":
+          e.preventDefault();
+          jumpFinding(1);
+          break;
+        case ",":
+          e.preventDefault();
+          jumpFinding(-1);
+          break;
         case "[":
           e.preventDefault();
           setLeftOpen((v) => !v);
@@ -1504,7 +1534,7 @@ export default function App() {
           })()}
           <div className="spacer" />
           <span className="sb-keys">
-            ctrl+p open   ctrl+` console   g goto   / filter   d pseudo   f graph   s pane   x xrefs   n name   c note   t type   e field   l var   p proto   P patch
+            ctrl+p open   ctrl+` console   g goto   / filter   . / , findings   d pseudo   f graph   s pane   x xrefs   n name   c note   t type   e field   l var   p proto   P patch
           </span>
         </div>
       )}
