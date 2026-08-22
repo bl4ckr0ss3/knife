@@ -16,7 +16,8 @@
         "height": 900,
         "minWidth": 960,
         "minHeight": 600,
-        "theme": "Dark"
+        "theme": "Dark",
+        "additionalBrowserArgs": "--js-flags=--max-old-space-size=256 --renderer-process-limit=1"
       }
     ],
     "security": {

@@ -2275,3 +2275,24 @@ body {
   color: var(--faint);
   font-style: italic;
 }
+
+/* ── kernel-primitive markers (driver LPE) ────────────────────────────── */
+.code .ln.kprim {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.kprim-flag {
+  margin-left: 12px;
+  font-size: 10px;
+  letter-spacing: 0.2px;
+  padding: 0 6px;
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  white-space: nowrap;
+}
+
+.kprim-flag:hover {
+  background: #2a1e20;
+}

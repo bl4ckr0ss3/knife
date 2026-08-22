@@ -155,6 +155,8 @@ export default function App() {
   const [facts, setFacts] = useState<FactRow[]>([]);
   const [patches, setPatches] = useState<PatchRun[]>([]);
   const [driver, setDriver] = useState<DriverReport | null>(null);
+  // The unfiltered report, fetched at open on a driver, for the inline primitive markers.
+  const [driverFull, setDriverFull] = useState<DriverReport | null>(null);
   const [drvReach, setDrvReach] = useState(false);
   const [drvCrit, setDrvCrit] = useState(false);
   const [findings, setFindings] = useState<Finding[]>([]);
@@ -215,6 +217,14 @@ export default function App() {
     }
     return m;
   }, [findings, curName]);
+
+  const primAt = useMemo(() => {
+    const m = new Map<string, { api: string; severity: number }>();
+    for (const p of driverFull?.primitives ?? []) {
+      for (const site of p.sites) m.set(site.from, { api: p.api, severity: p.severity });
+    }
+    return m;
+  }, [driverFull]);
 
   // Show a finding's evidence: pick it and switch to the attack-surface view.
   const showFinding = useCallback((f: Finding) => {
@@ -290,6 +300,10 @@ export default function App() {
     setFindings(fnd);
     setDetail(det);
     api.strings(undefined, true, 5000).then(setStrings).catch(() => setStrings([]));
+    api
+      .driverReport(1, false)
+      .then(setDriverFull)
+      .catch(() => setDriverFull(null));
     return fns;
   }, []);
 
@@ -1370,10 +1384,15 @@ export default function App() {
                   hits={hits}
                   currentHit={hits.length ? hits[hit % hits.length] : null}
                   findingAt={findingAt}
+                  primAt={primAt}
                   onSelect={setSelected}
                   onSelectIr={setIrSel}
                   onFollow={(sel) => openFunction(sel)}
                   onFinding={showFinding}
+                  onPrimitive={() => {
+                    setLeftView("driver");
+                    setLeftOpen(true);
+                  }}
                   onLineMenu={(i, at) =>
                     setMenu({ at, items: pseudoMenu(acts[i], editHandlers) })
                   }

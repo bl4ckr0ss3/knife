@@ -12,11 +12,13 @@ export function CodeView({
   hits,
   currentHit,
   findingAt,
+  primAt,
   onSelect,
   onSelectIr,
   onFollow,
   onLineMenu,
   onFinding,
+  onPrimitive,
 }: {
   tab: "disasm" | "pseudo";
   lines: Line[];
@@ -29,11 +31,16 @@ export function CodeView({
   /// Instruction address -> the audit finding at that call site, so a dangerous
   /// call is visible while reading, not only in the attack-surface list.
   findingAt: Map<string, Finding>;
+  /// Instruction address -> kernel primitive at that call site (driver targets).
+  /// A finding takes precedence, so this only marks primitives the audit did not
+  /// already flag: MmMapIoSpace, __readmsr, token swaps and friends.
+  primAt: Map<string, { api: string; severity: number }>;
   onSelect: (addr: string) => void;
   onSelectIr: (index: number) => void;
   onFollow: (selector: string) => void;
   onLineMenu: (index: number, at: { x: number; y: number }) => void;
   onFinding: (f: Finding) => void;
+  onPrimitive: () => void;
 }) {
   // A set, not a scan: a large function is thousands of lines and this runs for
   // every one of them on every render.
@@ -88,6 +95,7 @@ export function CodeView({
           );
         }
         const finding = findingAt.get(l.addr);
+        const prim = finding ? undefined : primAt.get(l.addr);
         return (
           <div
             key={i}
@@ -96,7 +104,8 @@ export function CodeView({
               "ln selectable" +
               (l.addr === selected ? " sel" : "") +
               hitClass(i) +
-              (finding ? " danger s" + Math.min(finding.severity, 3) : "")
+              (finding ? " danger s" + Math.min(finding.severity, 3) : "") +
+              (prim ? " kprim" : "")
             }
             onClick={() => onSelect(l.addr)}
             onDoubleClick={() => l.target && onFollow(l.target)}
@@ -129,6 +138,18 @@ export function CodeView({
                 }}
               >
                 {finding.severity >= 3 ? "⚑ high" : finding.severity >= 2 ? "⚑ med" : "⚑"}
+              </span>
+            )}
+            {prim && (
+              <span
+                className="kprim-flag"
+                title={`kernel primitive: ${prim.api}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onPrimitive();
+                }}
+              >
+                ⎈ {prim.api}
               </span>
             )}
           </div>
