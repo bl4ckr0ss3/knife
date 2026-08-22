@@ -17,10 +17,14 @@ import {
   type LineActions,
   type FactRow,
   type PatchRun,
+  type DriverReport,
+  type PathRow,
+  type YaraHit,
+  type Suggestion,
 } from "./api";
 import { FunctionList } from "./components/FunctionList";
 import { CodeView } from "./components/CodeView";
-import { XrefPane } from "./components/XrefPane";
+import { XrefPane, type RefMode } from "./components/XrefPane";
 import { DetailPanel } from "./components/DetailPanel";
 import { AttackSurface } from "./components/AttackSurface";
 import { GraphView } from "./components/GraphView";
@@ -29,12 +33,36 @@ import { Palette } from "./components/Palette";
 import { LineMenu, pseudoMenu, type MenuItem } from "./components/LineMenu";
 import { FactsList } from "./components/FactsList";
 import { PatchList } from "./components/PatchList";
+import { DriverView } from "./components/DriverView";
+import { Evidence } from "./components/Evidence";
+import { AgentPane, type AgentDock } from "./components/AgentPane";
+import {
+  IconAttack,
+  IconBack,
+  IconAgent,
+  IconConsole,
+  IconDriver,
+  IconExports,
+  IconFacts,
+  IconFunctions,
+  IconImports,
+  IconPatches,
+  IconStrings,
+} from "./components/Icons";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { Console } from "./components/Console";
 import { SymbolList } from "./components/SymbolList";
 
 type Tab = "disasm" | "pseudo" | "graph";
-type LeftView = "functions" | "attack" | "strings" | "imports" | "exports" | "facts" | "patches";
+type LeftView =
+  | "functions"
+  | "attack"
+  | "strings"
+  | "imports"
+  | "exports"
+  | "facts"
+  | "patches"
+  | "driver";
 
 const FN_LIMIT = 20000;
 
@@ -89,6 +117,13 @@ export default function App() {
   // room, and a demangled C++ name needs a wider list than `sub_1400a2c0` does.
   const [leftW, setLeftW] = useState(() => loadNum("knife.leftW", 340));
   const [rightW, setRightW] = useState(() => loadNum("knife.rightW", 350));
+  // Panels collapse, and the agent docks left / bottom / right. All persisted.
+  const [leftOpen, setLeftOpen] = useState(() => loadNum("knife.leftOpen", 1) === 1);
+  const [rightOpen, setRightOpen] = useState(() => loadNum("knife.rightOpen", 1) === 1);
+  const [agentDock, setAgentDock] = useState<AgentDock>(
+    () => (localStorage.getItem("knife.agentDock") as AgentDock) || "bottom",
+  );
+  const [agentW, setAgentW] = useState(() => loadNum("knife.agentW", 380));
   const [toasts, setToasts] = useState<Array<{ id: number; text: string }>>([]);
   const setError = useCallback((text: string | null) => {
     if (!text) return;
@@ -110,7 +145,8 @@ export default function App() {
   const [lines, setLines] = useState<Line[]>([]);
   const [ir, setIr] = useState<IrLine[]>([]);
   const [xrefs, setXrefs] = useState<XrefRow[]>([]);
-  const [xrefDir, setXrefDir] = useState<"to" | "from">("to");
+  const [xrefDir, setXrefDir] = useState<RefMode>("to");
+  const [paths, setPaths] = useState<PathRow[]>([]);
   const [history, setHistory] = useState<string[]>([]);
 
   const [cfg, setCfg] = useState<Cfg | null>(null);
@@ -118,12 +154,21 @@ export default function App() {
   const [symbols, setSymbols] = useState<SymbolRow[]>([]);
   const [facts, setFacts] = useState<FactRow[]>([]);
   const [patches, setPatches] = useState<PatchRun[]>([]);
+  const [driver, setDriver] = useState<DriverReport | null>(null);
+  const [drvReach, setDrvReach] = useState(false);
+  const [drvCrit, setDrvCrit] = useState(false);
   const [findings, setFindings] = useState<Finding[]>([]);
+  const [pickedFinding, setPickedFinding] = useState<Finding | null>(null);
+  const [yara, setYara] = useState<YaraHit[]>([]);
+  const [yaraRules, setYaraRules] = useState<string | null>(null);
   const [detail, setDetail] = useState<BinaryDetail | null>(null);
 
   const [palette, setPalette] = useState(false);
+  const [find, setFind] = useState<string | null>(null);
+  const [hit, setHit] = useState(0);
   const [acts, setActs] = useState<LineActions[]>([]);
   const [irSel, setIrSel] = useState<number | null>(null);
+  const [pseudoLoading, setPseudoLoading] = useState(false);
   const [menu, setMenu] = useState<{ at: { x: number; y: number }; items: MenuItem[] } | null>(null);
   // One prompt serves every analyst edit: title, prefilled value, and what to
   // do with the answer.
@@ -134,6 +179,17 @@ export default function App() {
     run: (value: string) => void;
   } | null>(null);
   const [console_, setConsole] = useState(() => loadNum("knife.console", 0) === 1);
+  // The agent is off until switched on, and then still asks per binary before
+  // anything leaves the machine.
+  const [agentOpen, setAgentOpen] = useState(false);
+  const [agentEnabled, setAgentEnabled] = useState(() => loadNum("knife.agent", 0) === 1);
+  const [agentKey, setAgentKey] = useState(false);
+  const [agentModel, setAgentModel] = useState(
+    () => localStorage.getItem("knife.agent.model") ?? "stealth/ox-alpha",
+  );
+  const [consented, setConsented] = useState<Set<string>>(new Set());
+  // Where the last session left off, restored once the window is up.
+  const [restored, setRestored] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [renameText, setRenameText] = useState("");
   const [noting, setNoting] = useState(false);
@@ -141,31 +197,86 @@ export default function App() {
 
   const curName = functions.find((f) => f.addr === current)?.name ?? current ?? "";
 
+  // The audit findings, indexed for the views: highest severity per function for
+  // the list's risk dots, and per-address for the inline markers in the code.
+  const riskByFunc = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const f of findings) {
+      if (!f.func) continue;
+      m.set(f.func, Math.max(m.get(f.func) ?? 0, f.severity));
+    }
+    return m;
+  }, [findings]);
+
+  const findingAt = useMemo(() => {
+    const m = new Map<string, Finding>();
+    for (const f of findings) {
+      if (f.func === curName) m.set(f.addr, f);
+    }
+    return m;
+  }, [findings, curName]);
+
+  // Show a finding's evidence: pick it and switch to the attack-surface view.
+  const showFinding = useCallback((f: Finding) => {
+    setPickedFinding(f);
+    setLeftView("attack");
+    setLeftOpen(true);
+  }, []);
+
+  // Lines matching the find query, in the view that is actually showing.
+  const hits = useMemo(() => {
+    const q = (find ?? "").trim().toLowerCase();
+    if (!q) return [] as number[];
+    const out: number[] = [];
+    if (tab === "pseudo") {
+      ir.forEach((l, i) => l.text.toLowerCase().includes(q) && out.push(i));
+    } else {
+      lines.forEach((l, i) => {
+        const text =
+          l.kind === "insn" ? `${l.addr} ${l.mnemonic} ${l.operands} ${l.annot?.text ?? ""}` : l.text;
+        if (text.toLowerCase().includes(q)) out.push(i);
+      });
+    }
+    return out;
+  }, [find, tab, ir, lines]);
+
+  /// Remember the target and function so the next launch resumes here.
+  const remember = useCallback((path: string, at: string | null) => {
+    try {
+      localStorage.setItem("knife.last", JSON.stringify({ path, at }));
+    } catch {
+      // resuming is a convenience, not a requirement
+    }
+  }, []);
+
   const openFunction = useCallback(
     async (selector: string, push = true) => {
       try {
-        const [ls, irs, graph, la] = await Promise.all([
+        // Only disassembly and the CFG are fetched up front. Pseudocode and its
+        // identifier spans each cost a full decompile — seconds on a large
+        // stripped image — and the view opens on disassembly, so they are
+        // fetched lazily the first time the pseudocode tab is shown.
+        const [ls, graph] = await Promise.all([
           api.disassemble(selector),
-          api.decompile(selector),
           api.cfg(selector).catch(() => null),
-          api.lineActions(selector).catch(() => [] as LineActions[]),
         ]);
         setCfg(graph);
-        setActs(la);
+        setActs([]);
+        setIr([]);
         setIrSel(null);
         const entry = ls.length ? ls[0].addr : selector;
         setHistory((h) => (push && current && current !== entry ? [...h, current] : h));
         setLines(ls);
-        setIr(irs);
         setSelected(null);
         setNoting(false);
         setRenaming(false);
         setCurrent(entry);
+        if (opened?.path) remember(opened.path, entry);
       } catch (e) {
         setError(String(e));
       }
     },
-    [current],
+    [current, opened, remember],
   );
 
   /// Load every view for whichever target is currently active.
@@ -212,8 +323,11 @@ export default function App() {
         setXrefs([]);
         setHistory([]);
         setFilter("");
+        setYara([]);
+        setYaraRules(null);
         const fns = await loadViews();
         api.listTargets().then(setTargets).catch(() => {});
+        remember(path, null);
         if (fns.length) void openFunction(fns[0].addr, false);
       } catch (e) {
         setError(String(e));
@@ -222,7 +336,7 @@ export default function App() {
         setPhase("");
       }
     },
-    [openFunction, loadViews],
+    [openFunction, loadViews, remember],
   );
 
   const switchTo = useCallback(
@@ -283,7 +397,70 @@ export default function App() {
 
   useEffect(() => saveNum("knife.leftW", leftW), [leftW]);
   useEffect(() => saveNum("knife.rightW", rightW), [rightW]);
+  useEffect(() => saveNum("knife.leftOpen", leftOpen ? 1 : 0), [leftOpen]);
+  useEffect(() => saveNum("knife.rightOpen", rightOpen ? 1 : 0), [rightOpen]);
+  useEffect(() => saveNum("knife.agentW", agentW), [agentW]);
+  useEffect(() => {
+    try {
+      localStorage.setItem("knife.agentDock", agentDock);
+    } catch {
+      /* ignore */
+    }
+  }, [agentDock]);
   useEffect(() => saveNum("knife.console", console_ ? 1 : 0), [console_]);
+  useEffect(() => saveNum("knife.agent", agentEnabled ? 1 : 0), [agentEnabled]);
+  useEffect(() => {
+    try {
+      localStorage.setItem("knife.agent.model", agentModel);
+    } catch {
+      // not worth failing over
+    }
+  }, [agentModel]);
+  useEffect(() => {
+    api.agentHasKey().then(setAgentKey).catch(() => setAgentKey(false));
+    try {
+      const raw = localStorage.getItem("knife.agent.consent");
+      if (raw) setConsented(new Set(JSON.parse(raw) as string[]));
+    } catch {
+      // a cleared store just means consent is asked again
+    }
+  }, []);
+
+  useEffect(() => {
+    if (restored) return;
+    setRestored(true);
+    let last: { path: string; at: string | null } | null = null;
+    try {
+      const raw = localStorage.getItem("knife.last");
+      last = raw ? JSON.parse(raw) : null;
+    } catch {
+      last = null;
+    }
+    if (!last?.path) return;
+    (async () => {
+      setBusy(true);
+      setPhase("reopening the last target");
+      try {
+        const res = await api.openTarget(last.path);
+        setOpened(res);
+        const fns = await loadViews();
+        setTargets(await api.listTargets());
+        const at = last.at ?? fns[0]?.addr;
+        if (at) void openFunction(at, false);
+      } catch {
+        // The file may have moved or been deleted since; starting at the
+        // welcome screen is the right answer, not an error.
+        try {
+          localStorage.removeItem("knife.last");
+        } catch {
+          /* ignore */
+        }
+      } finally {
+        setBusy(false);
+        setPhase("");
+      }
+    })();
+  }, [restored, loadViews, openFunction]);
 
   // The backend names each stage of the load as it starts.
   useEffect(() => {
@@ -297,7 +474,12 @@ export default function App() {
   // when the target changes.
   useEffect(() => {
     if (!opened) return;
-    if (leftView === "facts") {
+    if (leftView === "driver") {
+      api
+        .driverReport(drvCrit ? 3 : 1, drvReach)
+        .then(setDriver)
+        .catch(() => setDriver(null));
+    } else if (leftView === "facts") {
       api.analystFacts().then(setFacts).catch(() => setFacts([]));
     } else if (leftView === "patches") {
       api.patchRuns().then(setPatches).catch(() => setPatches([]));
@@ -306,7 +488,7 @@ export default function App() {
     } else if (leftView === "exports") {
       api.exports().then(setSymbols).catch(() => setSymbols([]));
     }
-  }, [leftView, opened]);
+  }, [leftView, opened, drvReach, drvCrit]);
 
   // Re-filter the function list as the query changes.
   useEffect(() => {
@@ -317,17 +499,45 @@ export default function App() {
       .catch((e) => setError(String(e)));
   }, [filter, opened]);
 
+  // Decompile lazily: the first time the pseudocode tab is shown for a function.
+  useEffect(() => {
+    if (tab !== "pseudo" || !current || ir.length > 0 || pseudoLoading) return;
+    setPseudoLoading(true);
+    const sel = current;
+    Promise.all([api.decompile(sel), api.lineActions(sel).catch(() => [] as LineActions[])])
+      .then(([irs, la]) => {
+        // Ignore a stale result if the user navigated away meanwhile.
+        setCurrent((c) => {
+          if (c === sel) {
+            setIr(irs);
+            setActs(la);
+          }
+          return c;
+        });
+      })
+      .catch((e) => setError(String(e)))
+      .finally(() => setPseudoLoading(false));
+  }, [tab, current, ir.length, pseudoLoading]);
+
   // Load cross-references for the open function whenever it or the direction
   // changes.
   useEffect(() => {
     if (!current) {
       setXrefs([]);
+      setPaths([]);
       return;
     }
-    api
-      .xrefs(current, xrefDir)
-      .then(setXrefs)
-      .catch(() => setXrefs([]));
+    if (xrefDir === "paths") {
+      api
+        .pathsTo(current, 12)
+        .then(setPaths)
+        .catch(() => setPaths([]));
+    } else {
+      api
+        .xrefs(current, xrefDir)
+        .then(setXrefs)
+        .catch(() => setXrefs([]));
+    }
   }, [current, xrefDir]);
 
   // Keyboard map, deliberately the same letters the TUI uses so muscle memory
@@ -339,6 +549,12 @@ export default function App() {
       const typing =
         el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement;
 
+      if ((e.ctrlKey || e.metaKey) && e.key === "f") {
+        e.preventDefault();
+        setFind((f) => (f === null ? "" : f));
+        setTimeout(() => document.querySelector<HTMLInputElement>(".findbar input")?.focus(), 0);
+        return;
+      }
       if ((e.ctrlKey || e.metaKey) && (e.key === "p" || e.key === "k")) {
         e.preventDefault();
         setPalette(true);
@@ -350,6 +566,7 @@ export default function App() {
         return;
       }
       if (e.key === "Escape") {
+        setFind(null);
         setPalette(false);
         setRenaming(false);
         setNoting(false);
@@ -360,9 +577,17 @@ export default function App() {
         back();
         return;
       }
-      if (typing || !opened || prompt || menu) return;
+      if (typing || !opened || prompt || menu || find !== null) return;
 
       switch (e.key) {
+        case "[":
+          e.preventDefault();
+          setLeftOpen((v) => !v);
+          break;
+        case "]":
+          e.preventDefault();
+          setRightOpen((v) => !v);
+          break;
         case "g":
           e.preventDefault();
           setPalette(true);
@@ -391,12 +616,13 @@ export default function App() {
               "exports",
               "facts",
               "patches",
+              "driver",
             ];
             return order[(order.indexOf(v) + 1) % order.length];
           });
           break;
         case "x":
-          setXrefDir((d) => (d === "to" ? "from" : "to"));
+          setXrefDir((d) => (d === "to" ? "from" : d === "from" ? "paths" : "to"));
           break;
         case "t":
           if (tab === "pseudo" && irSel !== null && acts[irSel]?.field) {
@@ -477,6 +703,68 @@ export default function App() {
     api.patchRuns().then(setPatches).catch(() => {});
   }, [reloadAnalysis, current, openFunction]);
 
+  const loadYara = useCallback(async () => {
+    const file = await openDialog({
+      multiple: false,
+      title: "YARA rules (a .yar file or a directory of them)",
+    });
+    if (typeof file !== "string") return;
+    try {
+      const n = await api.setYaraRules(file);
+      const [rules, hits] = await api.yaraMatches();
+      setYara(hits);
+      setYaraRules(rules);
+      setDetail(await api.binaryDetail());
+      setToasts((t) => [
+        ...t,
+        { id: Date.now(), text: `${n} rule${n === 1 ? "" : "s"} matched; verdict recomputed` },
+      ]);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [setError]);
+
+  const clearYara = useCallback(async () => {
+    try {
+      await api.setYaraRules(undefined);
+      setYara([]);
+      setYaraRules(null);
+      setDetail(await api.binaryDetail());
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [setError]);
+
+  // Consent is remembered per binary, keyed by the path the window opened.
+  const consentKey = opened?.path ?? "";
+  const grantConsent = useCallback(() => {
+    setConsented((prev) => {
+      const next = new Set(prev).add(consentKey);
+      try {
+        localStorage.setItem("knife.agent.consent", JSON.stringify([...next]));
+      } catch {
+        // remembering is a convenience, not a requirement
+      }
+      return next;
+    });
+  }, [consentKey]);
+
+  const askForKey = useCallback(() => {
+    setPrompt({
+      title: "OpenRouter API key",
+      value: "",
+      hint: "stored in Windows Credential Manager, never in a file",
+      run: async (v) => {
+        try {
+          await api.agentSetKey(v);
+          setAgentKey(await api.agentHasKey());
+        } catch (e) {
+          setError(String(e));
+        }
+      },
+    });
+  }, [setError]);
+
   const ask = useCallback(
     (title: string, value: string, hint: string, run: (v: string) => void) =>
       setPrompt({ title, value, hint, run }),
@@ -550,6 +838,45 @@ export default function App() {
     [ask, current, afterEdit, setError],
   );
 
+  useEffect(() => {
+    if (!hits.length) return;
+    const idx = hits[Math.min(hit, hits.length - 1)];
+    document
+      .querySelector(`.code [data-line="${idx}"]`)
+      ?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, [hit, hits]);
+
+  const pickLeft = useCallback(
+    (v: LeftView) => {
+      if (leftView === v && leftOpen) setLeftOpen(false);
+      else {
+        setLeftView(v);
+        setLeftOpen(true);
+      }
+    },
+    [leftView, leftOpen],
+  );
+
+  // Apply a suggestion the agent proposed. Read stays read; this is the write
+  // the analyst chose, through the ordinary validated command.
+  const applySuggestion = useCallback(
+    async (sug: Suggestion) => {
+      const addr = /^0x[0-9a-f]+$/i.test(sug.selector)
+        ? sug.selector
+        : functions.find((f) => f.name === sug.selector)?.addr;
+      if (!addr) throw new Error(`no function named ${sug.selector}`);
+      if (sug.kind === "rename" && sug.new_name) {
+        await api.setName(addr, sug.new_name);
+      } else if (sug.kind === "prototype" && sug.returns) {
+        await api.setPrototype(addr, sug.returns, sug.params ?? []);
+      } else {
+        throw new Error("incomplete suggestion");
+      }
+      await afterEdit();
+    },
+    [functions, afterEdit],
+  );
+
   const back = useCallback(() => {
     setHistory((h) => {
       if (!h.length) return h;
@@ -585,6 +912,27 @@ export default function App() {
     }
   }, [selected, current, noteText, openFunction]);
 
+  const agentEl =
+    opened && agentOpen ? (
+      <AgentPane
+        enabled={agentEnabled}
+        consented={consented.has(consentKey)}
+        targetName={opened.title}
+        targetKey={opened.path}
+        isDriver={!!opened.is_driver}
+        hasKey={agentKey}
+        model={agentModel}
+        dock={agentDock}
+        onModel={setAgentModel}
+        onDock={setAgentDock}
+        onConsent={grantConsent}
+        onNeedKey={askForKey}
+        onClose={() => setAgentOpen(false)}
+        onJump={(a) => openFunction(a)}
+        onApply={applySuggestion}
+      />
+    ) : null;
+
   return (
     <div className="app">
       <div className="topbar">
@@ -598,6 +946,26 @@ export default function App() {
           </span>
         )}
         <div className="spacer" />
+        {opened && (
+          <span
+            className={"panel-toggle" + (rightOpen ? " on" : "")}
+            title="Show/hide the detail panel ( ] )"
+            onClick={() => setRightOpen((v) => !v)}
+          >
+            detail
+          </span>
+        )}
+        <span
+          className={"agent-toggle" + (agentEnabled ? " on" : "")}
+          title={
+            agentEnabled
+              ? "AI agent enabled; click to switch it off entirely"
+              : "AI agent switched off; click to enable"
+          }
+          onClick={() => setAgentEnabled((v) => !v)}
+        >
+          agent {agentEnabled ? "on" : "off"}
+        </span>
         <button className="btn" onClick={pickAndOpen} disabled={busy}>
           {busy ? "analyzing…" : "Open binary"}
         </button>
@@ -633,62 +1001,78 @@ export default function App() {
           <button
             className={leftView === "functions" ? "active" : ""}
             title="Functions"
-            onClick={() => setLeftView("functions")}
+            onClick={() => pickLeft("functions")}
           >
-            ƒ
+            <IconFunctions />
           </button>
           <button
             className={leftView === "attack" ? "active" : ""}
             title="Attack surface"
-            onClick={() => setLeftView("attack")}
+            onClick={() => pickLeft("attack")}
           >
-            ⚠
+            <IconAttack />
           </button>
           <button
             className={leftView === "strings" ? "active" : ""}
             title="Strings"
-            onClick={() => setLeftView("strings")}
+            onClick={() => pickLeft("strings")}
           >
-            T
+            <IconStrings />
           </button>
           <button
             className={leftView === "imports" ? "active" : ""}
             title="Imports"
-            onClick={() => setLeftView("imports")}
+            onClick={() => pickLeft("imports")}
           >
-            ↓
+            <IconImports />
           </button>
           <button
             className={leftView === "exports" ? "active" : ""}
             title="Exports"
-            onClick={() => setLeftView("exports")}
+            onClick={() => pickLeft("exports")}
           >
-            ↑
+            <IconExports />
+          </button>
+          <button
+            className={
+              (leftView === "driver" ? "active" : "") + (opened?.is_driver ? " flag" : "")
+            }
+            title={opened?.is_driver ? "Driver analysis" : "Driver analysis (not a driver)"}
+            onClick={() => pickLeft("driver")}
+          >
+            <IconDriver />
           </button>
           <button
             className={leftView === "facts" ? "active" : ""}
             title="Types and analyst facts"
-            onClick={() => setLeftView("facts")}
+            onClick={() => pickLeft("facts")}
           >
-            {"{}"}
+            <IconFacts />
           </button>
           <button
             className={leftView === "patches" ? "active" : ""}
             title="Staged patches"
-            onClick={() => setLeftView("patches")}
+            onClick={() => pickLeft("patches")}
           >
-            ±
+            <IconPatches />
+          </button>
+          <button
+            className={agentOpen ? "active" : ""}
+            title="Agent"
+            onClick={() => setAgentOpen((v) => !v)}
+          >
+            <IconAgent />
           </button>
           <button
             className={console_ ? "active" : ""}
             title="Console (ctrl+`)"
             onClick={() => setConsole((c) => !c)}
           >
-            &gt;_
+            <IconConsole />
           </button>
           <div className="spacer" />
           <button title="Back" onClick={back} disabled={!history.length}>
-            ‹
+            <IconBack />
           </button>
         </div>
 
@@ -706,6 +1090,15 @@ export default function App() {
           </div>
         ) : (
           <>
+            {agentOpen && agentDock === "left" && (
+              <>
+                <div className="agent-col" style={{ width: agentW, flex: `0 0 ${agentW}px` }}>
+                  {agentEl}
+                </div>
+                <Divider onDrag={(dx) => setAgentW((w) => Math.min(760, Math.max(280, w + dx)))} />
+              </>
+            )}
+            {leftOpen && (
             <div className="panel left" style={{ width: leftW, flex: `0 0 ${leftW}px` }}>
               {leftView === "functions" ? (
                 <>
@@ -720,7 +1113,29 @@ export default function App() {
                       onChange={(e) => setFilter(e.target.value)}
                     />
                   </div>
-                  <FunctionList rows={functions} current={current} onPick={(a) => openFunction(a)} />
+                  <FunctionList
+                    rows={functions}
+                    current={current}
+                    risk={riskByFunc}
+                    onPick={(a) => openFunction(a)}
+                  />
+                </>
+              ) : leftView === "driver" ? (
+                <>
+                  <div className="panel-head">
+                    <span>driver</span>
+                    <span className="count">
+                      {driver ? `(${driver.primitives.length} primitives)` : "(none)"}
+                    </span>
+                  </div>
+                  <DriverView
+                    report={driver}
+                    reachableOnly={drvReach}
+                    criticalOnly={drvCrit}
+                    onToggleReachable={() => setDrvReach((v) => !v)}
+                    onToggleCritical={() => setDrvCrit((v) => !v)}
+                    onJump={(a) => openFunction(a)}
+                  />
                 </>
               ) : leftView === "facts" ? (
                 <>
@@ -820,8 +1235,9 @@ export default function App() {
                   </div>
                   <AttackSurface
                     findings={findings}
-                    selected={selected}
+                    selected={pickedFinding?.addr ?? selected}
                     onPick={(f) => {
+                      setPickedFinding(f);
                       setSelected(f.addr);
                       void openFunction(f.addr);
                     }}
@@ -829,8 +1245,10 @@ export default function App() {
                 </>
               )}
             </div>
-
-            <Divider onDrag={(dx) => setLeftW((w) => Math.min(700, Math.max(220, w + dx)))} />
+            )}
+            {leftOpen && (
+              <Divider onDrag={(dx) => setLeftW((w) => Math.min(700, Math.max(220, w + dx)))} />
+            )}
             <div className="center">
               <div className="tabs">
                 <div
@@ -909,8 +1327,39 @@ export default function App() {
                 </div>
               )}
 
+              {find !== null && (
+                <div className="findbar">
+                  <input
+                    autoFocus
+                    placeholder={`find in ${tab === "pseudo" ? "pseudocode" : "disassembly"}…`}
+                    value={find}
+                    onChange={(e) => {
+                      setFind(e.target.value);
+                      setHit(0);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === "Escape") setFind(null);
+                      else if (e.key === "Enter") {
+                        e.preventDefault();
+                        if (hits.length) {
+                          setHit((h) => (e.shiftKey ? (h - 1 + hits.length) : h + 1) % hits.length);
+                        }
+                      }
+                    }}
+                  />
+                  <span className="fcount">
+                    {hits.length ? `${(hit % hits.length) + 1}/${hits.length}` : "none"}
+                  </span>
+                  <span className="fclose" onClick={() => setFind(null)}>
+                    ✕
+                  </span>
+                </div>
+              )}
+
               {tab === "graph" ? (
                 <GraphView cfg={cfg} onOpenBlock={(a) => { setTab("disasm"); setSelected(a); }} />
+              ) : tab === "pseudo" && ir.length === 0 && pseudoLoading ? (
+                <div className="code decompiling">decompiling…</div>
               ) : (
                 <CodeView
                   tab={tab}
@@ -918,25 +1367,106 @@ export default function App() {
                   ir={ir}
                   selected={selected}
                   irSelected={irSel}
+                  hits={hits}
+                  currentHit={hits.length ? hits[hit % hits.length] : null}
+                  findingAt={findingAt}
                   onSelect={setSelected}
                   onSelectIr={setIrSel}
                   onFollow={(sel) => openFunction(sel)}
+                  onFinding={showFinding}
                   onLineMenu={(i, at) =>
                     setMenu({ at, items: pseudoMenu(acts[i], editHandlers) })
                   }
                 />
               )}
 
-              <XrefPane rows={xrefs} dir={xrefDir} onDir={setXrefDir} onJump={(a) => openFunction(a)} />
+              {leftView === "attack" && pickedFinding && (
+                <Evidence
+                  finding={pickedFinding}
+                  onJump={(a) => openFunction(a)}
+                  onPaths={() => setXrefDir("paths")}
+                />
+              )}
+
+              <XrefPane
+                rows={xrefs}
+                paths={paths}
+                dir={xrefDir}
+                onDir={setXrefDir}
+                onJump={(a) => openFunction(a)}
+              />
             </div>
 
-            <Divider onDrag={(dx) => setRightW((w) => Math.min(720, Math.max(240, w - dx)))} />
+            {rightOpen && (
+              <Divider onDrag={(dx) => setRightW((w) => Math.min(720, Math.max(240, w - dx)))} />
+            )}
+            {rightOpen && (
             <div className="right" style={{ width: rightW, flex: `0 0 ${rightW}px` }}>
+              <div className="detail-sec yara-sec">
+                <h4 className="static">
+                  <span className="stitle">YARA</span>
+                  <span className="sright">
+                    {yaraRules ? (
+                      <>
+                        <span className={yara.length ? "sr-bad" : "sr-dim"}>
+                          {yara.length} matched
+                        </span>
+                        <span className="elink" onClick={clearYara}>
+                          clear
+                        </span>
+                      </>
+                    ) : (
+                      <span className="elink" onClick={loadYara}>
+                        load rules
+                      </span>
+                    )}
+                  </span>
+                </h4>
+                {yaraRules && (
+                  <div className="sbody">
+                    {yara.length === 0 && (
+                      <div className="kv">
+                        <span className="v dim">no rule matched this image</span>
+                      </div>
+                    )}
+                    {yara.map((m, i) => (
+                      <div
+                        className="yhit"
+                        key={i}
+                        title={m.meta.map(([k, v]) => `${k}: ${v}`).join(", ")}
+                      >
+                        <span className="yrule">{m.rule}</span>
+                        {m.tags.length > 0 && (
+                          <span className="ytags">{m.tags.join(" ")}</span>
+                        )}
+                        <span className="ypat">
+                          {m.patterns.reduce((n, [, c]) => n + c, 0)} hits
+                        </span>
+                      </div>
+                    ))}
+                    <div className="signote">
+                      matches are folded into the triage verdict above, as
+                      <code> knife info --rules</code> does
+                    </div>
+                  </div>
+                )}
+              </div>
               {detail && <DetailPanel d={detail} />}
             </div>
+            )}
+            {agentOpen && agentDock === "right" && (
+              <>
+                <Divider onDrag={(dx) => setAgentW((w) => Math.min(760, Math.max(280, w - dx)))} />
+                <div className="agent-col" style={{ width: agentW, flex: `0 0 ${agentW}px` }}>
+                  {agentEl}
+                </div>
+              </>
+            )}
           </>
         )}
       </div>
+
+      {opened && agentOpen && agentDock === "bottom" && agentEl}
 
       {opened && console_ && (
         <Console onClose={() => setConsole(false)} onJump={(a) => openFunction(a)} />

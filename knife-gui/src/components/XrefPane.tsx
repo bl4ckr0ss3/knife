@@ -1,21 +1,25 @@
-import type { XrefRow } from "../api";
+import type { PathRow, XrefRow } from "../api";
+
+export type RefMode = "to" | "from" | "paths";
 
 export function XrefPane({
   rows,
+  paths,
   dir,
   onDir,
   onJump,
 }: {
   rows: XrefRow[];
-  dir: "to" | "from";
-  onDir: (d: "to" | "from") => void;
+  paths: PathRow[];
+  dir: RefMode;
+  onDir: (d: RefMode) => void;
   onJump: (addr: string) => void;
 }) {
   return (
     <div className="xref">
       <div className="panel-head">
-        <span>xrefs</span>
-        <span className="count">({rows.length})</span>
+        <span>{dir === "paths" ? "reachability" : "xrefs"}</span>
+        <span className="count">({dir === "paths" ? paths.length : rows.length})</span>
         <div className="spacer" />
         <div className="seg">
           <button className={dir === "to" ? "active" : ""} onClick={() => onDir("to")}>
@@ -24,9 +28,37 @@ export function XrefPane({
           <button className={dir === "from" ? "active" : ""} onClick={() => onDir("from")}>
             callees
           </button>
+          <button
+            className={dir === "paths" ? "active" : ""}
+            title="how control reaches this function from an entry point or export"
+            onClick={() => onDir("paths")}
+          >
+            paths
+          </button>
         </div>
       </div>
       <div className="rows">
+        {dir === "paths" ? (
+          paths.length === 0 ? (
+            <div className="xref-row" style={{ color: "var(--faint)" }}>
+              nothing reaches this from an entry point or export
+            </div>
+          ) : (
+            paths.map((p, i) => (
+              <div key={i} className="pathrow">
+                {p.hops.map((h, j) => (
+                  <span key={j}>
+                    {j > 0 && <span className="phop">{"›"}</span>}
+                    <span className="pname" onClick={() => onJump(h.addr)} title={h.addr}>
+                      {h.name}
+                    </span>
+                  </span>
+                ))}
+              </div>
+            ))
+          )
+        ) : (
+          <>
         {rows.length === 0 && (
           <div className="xref-row" style={{ color: "var(--faint)" }}>
             no {dir === "to" ? "references" : "calls"}
@@ -39,6 +71,8 @@ export function XrefPane({
             <span className="nm">{r.site}</span>
           </div>
         ))}
+          </>
+        )}
       </div>
     </div>
   );

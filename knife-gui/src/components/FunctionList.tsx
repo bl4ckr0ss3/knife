@@ -7,10 +7,13 @@ import type { FnRow } from "../api";
 export function FunctionList({
   rows,
   current,
+  risk,
   onPick,
 }: {
   rows: FnRow[];
   current: string | null;
+  /// Function name -> highest finding severity it contains (3/2/1).
+  risk: Map<string, number>;
   onPick: (addr: string) => void;
 }) {
   const parentRef = useRef<HTMLDivElement>(null);
@@ -42,6 +45,19 @@ export function FunctionList({
               title={`${f.name}  ${f.blocks} blocks  ${f.size} bytes`}
             >
               <span className="addr">{f.addr.replace("0x", "")}</span>
+              {(() => {
+                const sev = risk.get(f.name);
+                return sev ? (
+                  <span
+                    className={"risk-dot s" + Math.min(sev, 3)}
+                    title={
+                      sev >= 3 ? "contains a high-risk finding" : "contains a finding"
+                    }
+                  />
+                ) : (
+                  <span className="risk-dot none" />
+                );
+              })()}
               <span className={"nm" + (f.named ? " named" : "")}>{f.name}</span>
               <span className="refs">{f.incoming}</span>
             </div>

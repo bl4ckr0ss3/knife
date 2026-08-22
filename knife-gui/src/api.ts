@@ -59,6 +59,7 @@ export interface Finding {
   severity: number;
   detail: string;
   reachable: boolean;
+  source: string;
 }
 
 export interface Section {
@@ -109,6 +110,9 @@ export interface Signing {
   entries: number;
   subjects: string[];
   thumbprints: string[];
+  region_off: string | null;
+  region_size: number | null;
+  header_claims_signed: boolean;
 }
 
 export interface BinaryDetail {
@@ -129,6 +133,7 @@ export interface BinaryDetail {
   mitigations: Mitigations;
   triage: Triage;
   signing: Signing;
+  capabilities: Capability[];
 }
 
 export interface CfgNode {
@@ -207,6 +212,94 @@ export interface PatchRun {
   len: number;
 }
 
+export interface Capability {
+  category: string;
+  apis: string[];
+}
+
+export interface DriverReport {
+  is_driver: boolean;
+  why: string[];
+  module: string;
+  entry: string;
+  entry_name: string;
+  subsystem: string | null;
+  kernel_imports: Array<[string, number]>;
+  app_imports: string[];
+  devices: Array<{ name: string; addr: string; wide: boolean; xrefs: number; created: boolean }>;
+  irp: Array<{ major: number; name: string; derived: string; addr: string }>;
+  ioctls: Array<{
+    code: string;
+    device_type: string;
+    function: string;
+    method: string;
+    access: number;
+    addr: string;
+  }>;
+  primitives: Array<{
+    api: string;
+    class: string;
+    severity: number;
+    reachable: boolean;
+    sites: Array<{ from: string; in_func: string | null; at_off: string }>;
+  }>;
+  known_bad: Array<{
+    file: string;
+    vendor: string;
+    product: string;
+    category: string;
+    signer: string;
+    malicious: boolean;
+  }>;
+}
+
+export interface PathHop {
+  addr: string;
+  name: string;
+}
+
+export interface PathRow {
+  hops: PathHop[];
+}
+
+export interface YaraHit {
+  rule: string;
+  namespace: string;
+  tags: string[];
+  meta: Array<[string, string]>;
+  patterns: Array<[string, number]>;
+}
+
+export interface AgentStep {
+  tool: string;
+  args: string;
+  preview: string;
+}
+
+export interface ChatMessage {
+  role: string;
+  content?: string | null;
+  tool_calls?: unknown;
+  tool_call_id?: string | null;
+  name?: string | null;
+}
+
+export interface Suggestion {
+  kind: "rename" | "prototype";
+  selector: string;
+  new_name?: string;
+  returns?: string;
+  params?: string[];
+  reason: string;
+}
+
+export interface AgentTurn {
+  reply: string;
+  steps: AgentStep[];
+  history: ChatMessage[];
+  suggestions: Suggestion[];
+}
+
 export const api = {
   openTarget: (path: string) => invoke<OpenResult>("open_target", { path }),
   listFunctions: (filter?: string, namedOnly?: boolean, limit?: number) =>
@@ -215,6 +308,7 @@ export const api = {
   decompile: (selector: string) => invoke<IrLine[]>("decompile", { selector }),
   xrefs: (addr: string, direction: "to" | "from") =>
     invoke<XrefRow[]>("xrefs", { addr, direction }),
+  pathsTo: (selector: string, max?: number) => invoke<PathRow[]>("paths_to", { selector, max }),
   attackSurface: () => invoke<Finding[]>("attack_surface"),
   binaryDetail: () => invoke<BinaryDetail>("binary_detail"),
   cfg: (selector: string) => invoke<Cfg>("cfg", { selector }),
@@ -250,6 +344,15 @@ export const api = {
   clearPatch: (offset: string) => invoke<void>("clear_patch", { offset }),
   patchRuns: () => invoke<PatchRun[]>("patch_runs"),
   exportPatched: (path: string) => invoke<string>("export_patched", { path }),
+  agentSetKey: (key: string) => invoke<void>("agent_set_key", { key }),
+  agentHasKey: () => invoke<boolean>("agent_has_key"),
+  agentAsk: (model: string, question: string, history: ChatMessage[]) =>
+    invoke<AgentTurn>("agent_ask", { model, question, history }),
+  agentCancel: () => invoke<void>("agent_cancel"),
+  setYaraRules: (path?: string) => invoke<number>("set_yara_rules", { path }),
+  yaraMatches: () => invoke<[string | null, YaraHit[]]>("yara_matches"),
+  driverReport: (minSeverity?: number, reachableOnly?: boolean) =>
+    invoke<DriverReport | null>("driver_report", { minSeverity, reachableOnly }),
   analystFacts: (filter?: string) => invoke<FactRow[]>("analyst_facts", { filter }),
   importTypelib: (path: string, replace: boolean) =>
     invoke<string>("import_typelib", { path, replace }),

@@ -65,6 +65,21 @@ export function DetailPanel({ d }: { d: BinaryDetail }) {
         ))}
       </Section>
 
+      {d.capabilities.length > 0 && (
+        <Section
+          title="Capabilities"
+          storageKey="caps"
+          right={<span className="sr-dim">{d.capabilities.length}</span>}
+        >
+          {d.capabilities.map((c, i) => (
+            <div className="kv" key={i} title={c.apis.join(", ")}>
+              <span className="k">{c.category}</span>
+              <span className="v">{c.apis.length}</span>
+            </div>
+          ))}
+        </Section>
+      )}
+
       <Section title="Hashes" storageKey="hashes" defaultOpen={false}>
         <KV k="sha256" v={d.hashes.sha256} />
         <KV k="sha1" v={d.hashes.sha1} />
@@ -72,13 +87,48 @@ export function DetailPanel({ d }: { d: BinaryDetail }) {
         {d.hashes.imphash && <KV k="imphash" v={d.hashes.imphash} />}
       </Section>
 
-      <Section title="Signing" storageKey="signing">
+      <Section
+        title="Signing"
+        storageKey="signing"
+        right={
+          <span className={d.signing.signed ? "sr-ok" : "sr-bad"}>
+            {d.signing.signed ? "signed" : "unsigned"}
+          </span>
+        }
+      >
         {d.signing.signed ? (
           <>
-            <KV k="status" v={`signed · ${d.signing.entries} cert(s)`} />
-            {d.signing.subjects.slice(0, 4).map((s, i) => (
-              <KV key={i} k={i === 0 ? "subject" : ""} v={s} />
+            <KV
+              k="certificates"
+              v={`${d.signing.entries} entr${d.signing.entries === 1 ? "y" : "ies"}`}
+            />
+            {d.signing.subjects.length > 0 ? (
+              d.signing.subjects.map((s, i) => (
+                <KV key={i} k={i === 0 ? "signer" : i === 1 ? "chain" : ""} v={s} />
+              ))
+            ) : (
+              <KV k="signer" v={<span className="dim">no subject parsed</span>} />
+            )}
+            {d.signing.thumbprints.map((t, i) => (
+              <KV key={t} k={i === 0 ? "sha1" : ""} v={<span className="thumb">{t}</span>} />
             ))}
+            {d.signing.region_off && (
+              <KV
+                k="table"
+                v={`${d.signing.region_off} · ${human(d.signing.region_size ?? 0)}`}
+              />
+            )}
+            <div className="signote">
+              presence is not validity: knife reads the table, it does not check the chain
+            </div>
+          </>
+        ) : d.signing.header_claims_signed ? (
+          <>
+            <KV k="status" v={<span className="warn">claimed but unparsable</span>} />
+            <div className="signote">
+              the header points at a certificate table that could not be read, which is
+              what a stripped or malformed signature looks like
+            </div>
           </>
         ) : (
           <KV k="status" v="unsigned" />

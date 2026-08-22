@@ -72,6 +72,16 @@ cpp_demangle = "0.5.1"
 msvc-demangler = "0.11.0"
 rustc-demangle = "0.1.28"
 
+# Debug builds carry full symbols for every dependency, and with the GUI in the
+# workspace that is several hundred crates. Line tables are enough to get a
+# useful backtrace out of our own code; the dependencies need none at all. This
+# is the difference between a 40 GB target directory and a manageable one.
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"

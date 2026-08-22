@@ -21,6 +21,30 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+/// Run analysis on a thread with a large stack, and return its result the way
+/// `catch_unwind` would.
+///
+/// This does double duty. Tauri runs commands on worker threads whose default
+/// stack (~2 MB) is far smaller than the main thread's, and the decompiler is
+/// deeply recursive — on a large stripped image it can want more than 2 MB and
+/// overflow, which aborts the process (a stack overflow is not catchable). A
+/// 256 MB stack removes that ceiling, and `join()` still turns a panic into an
+/// `Err` rather than taking the window down.
+fn on_big_stack<T, F>(f: F) -> Result<T>
+where
+    T: Send,
+    F: FnOnce() -> Result<T> + Send,
+{
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn_scoped(scope, move || AssertUnwindSafe(f).0())
+            .expect("spawn analysis thread")
+            .join()
+            .map_err(|_| anyhow!("the analysis panicked while handling this file"))?
+    })
+}
+
 /// One open target: the analysis session plus everything the views read that is
 /// too expensive to rebuild per request.
 pub struct Loaded {
@@ -36,6 +60,11 @@ pub struct Loaded {
     pub findings: Vec<audit::Finding>,
     /// The detail panel, pre-serialized (hashing a large image is not free).
     pub detail: serde_json::Value,
+    /// YARA matches for this target, and the rules that produced them. The
+    /// triage verdict is computed *with* these, so loading rules changes the
+    /// score exactly as `knife info --rules` does.
+    pub yara: Vec<reknife::analysis::yara::RuleMatch>,
+    pub yara_rules: Option<String>,
 }
 
 /// Every target the window has open, and which one the views are showing.
@@ -92,6 +121,8 @@ impl AppState {
                 hints: None,
                 findings: Vec::new(),
                 detail: serde_json::Value::Null,
+                yara: Vec::new(),
+                yara_rules: None,
             };
             recompute_derived_with(&mut loaded, phase);
             Ok(loaded)
@@ -100,6 +131,39 @@ impl AppState {
         guard.open.push(loaded);
         guard.active = guard.open.len() - 1;
         Ok(())
+    }
+
+    /// Load YARA rules and rescan, then rebuild the verdict with the matches.
+    ///
+    /// Passing `None` clears them, which puts the score back to the rule-free
+    /// one rather than leaving a stale verdict behind.
+    pub fn set_yara(&self, rules: Option<&str>) -> Result<usize> {
+        let mut guard = self.inner.lock().unwrap();
+        let active = guard.active;
+        let loaded = guard
+            .open
+            .get_mut(active)
+            .ok_or_else(|| anyhow!("no target is open"))?;
+        let matched = catch_unwind(AssertUnwindSafe(|| -> Result<usize> {
+            match rules {
+                Some(path) => {
+                    let (compiled, _) = reknife::analysis::yara::compile(path)?;
+                    let hits = reknife::analysis::yara::scan(&compiled, &loaded.session.bytes)?;
+                    let n = hits.len();
+                    loaded.yara = hits;
+                    loaded.yara_rules = Some(path.to_string());
+                    Ok(n)
+                }
+                None => {
+                    loaded.yara.clear();
+                    loaded.yara_rules = None;
+                    Ok(0)
+                }
+            }
+        }))
+        .map_err(|_| anyhow!("the rule scan panicked"))??;
+        recompute_derived(loaded);
+        Ok(matched)
     }
 
     /// Show an already-open target.
@@ -154,14 +218,13 @@ impl AppState {
     }
 
     /// Read the loaded workspace, panic-contained. Errors if nothing is open.
-    pub fn read<T>(&self, f: impl FnOnce(&Loaded) -> Result<T>) -> Result<T> {
+    pub fn read<T: Send>(&self, f: impl FnOnce(&Loaded) -> Result<T> + Send) -> Result<T> {
         let guard = self.inner.lock().unwrap();
         let loaded = guard
             .open
             .get(guard.active)
             .ok_or_else(|| anyhow!("no target is open"))?;
-        catch_unwind(AssertUnwindSafe(|| f(loaded)))
-            .map_err(|_| anyhow!("the analysis panicked"))?
+        on_big_stack(move || f(loaded))
     }
 
     /// Persist an analyst fact that does not change recovery (a note). Saves the
@@ -228,7 +291,8 @@ fn recompute_derived_with(loaded: &mut Loaded, phase: &dyn Fn(&str)) {
             .then(a.addr.cmp(&b.addr))
     });
     phase("hashing and reading mitigations");
-    let detail = build_detail(session);
+    let yara_names: Vec<String> = loaded.yara.iter().map(|m| m.rule.clone()).collect();
+    let detail = build_detail(&loaded.session, &yara_names);
     loaded.hints = hints;
     loaded.findings = findings;
     loaded.detail = detail;
@@ -236,7 +300,7 @@ fn recompute_derived_with(loaded: &mut Loaded, phase: &dyn Fn(&str)) {
 
 /// Assemble the right-hand detail panel: identity, sections, hashes, exploit
 /// mitigations, the triage verdict, and signing.
-fn build_detail(s: &Session) -> serde_json::Value {
+fn build_detail(s: &Session, yara_names: &[String]) -> serde_json::Value {
     let file_hashes = hashes::file_hashes(&s.bytes);
     let imphash = hashes::imphash(&s.bin);
     let hardening = hardening::run(&s.bin);
@@ -245,8 +309,31 @@ fn build_detail(s: &Session) -> serde_json::Value {
             .all_imported_functions()
             .chain(s.bin.exports.iter().map(String::as_str)),
     );
-    let no_yara: Vec<String> = Vec::new();
-    let verdict = triage::run(&s.bin, &caps, &no_yara);
+    let verdict = triage::run(&s.bin, &caps, yara_names);
+
+    // Group the capability matches by category, most-populated first: the
+    // categories are the summary, the APIs are the evidence.
+    let mut by_category: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+    for m in &caps {
+        by_category
+            .entry(m.category)
+            .or_default()
+            .push(m.api.clone());
+    }
+    let mut capabilities: Vec<dto::CapabilityDto> = by_category
+        .into_iter()
+        .map(|(category, mut apis)| {
+            apis.sort();
+            apis.dedup();
+            dto::CapabilityDto { category, apis }
+        })
+        .collect();
+    capabilities.sort_by(|a, b| {
+        b.apis
+            .len()
+            .cmp(&a.apis.len())
+            .then(a.category.cmp(b.category))
+    });
     let signing = signing::summarize(&s.bin, &s.bytes);
     let named = s.an.functions.iter().filter(|f| f.named).count();
 
@@ -272,11 +359,15 @@ fn build_detail(s: &Session) -> serde_json::Value {
         },
         mitigations: dto::mitigations(&hardening),
         triage: dto::triage(&verdict),
+        capabilities,
         signing: dto::SigningDto {
             signed: signing.signed,
             entries: signing.entries,
             subjects: signing.subjects,
             thumbprints: signing.thumbprints,
+            region_off: s.bin.sig_region.map(|(off, _)| dto::hex(off)),
+            region_size: s.bin.sig_region.map(|(_, size)| size),
+            header_claims_signed: s.bin.has_signature,
         },
     };
     serde_json::to_value(detail).unwrap_or(serde_json::Value::Null)

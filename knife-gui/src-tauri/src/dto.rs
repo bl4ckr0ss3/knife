@@ -163,6 +163,32 @@ pub struct FindingDto {
     pub severity: u8,
     pub detail: String,
     pub reachable: bool,
+    /// Where the dangerous value came from, named from the audit's own
+    /// explanation: `SUBTRACTION`, `EXTERNAL INPUT`, `ARGUMENT`, and so on.
+    pub source: &'static str,
+}
+
+/// Name the provenance the audit found, from the sentence it wrote about it.
+///
+/// The audit already decided this when it built the explanation; recovering the
+/// label from the text keeps the two from disagreeing, which is what a second
+/// independent classification here would eventually do.
+fn evidence_source(detail: &str) -> &'static str {
+    if detail.contains("external-input API") {
+        "EXTERNAL INPUT"
+    } else if detail.contains("function argument") {
+        "ARGUMENT"
+    } else if detail.contains("some incoming paths") {
+        "CFG MERGE"
+    } else if detail.contains("subtraction") {
+        "SUBTRACTION"
+    } else if detail.contains("multiplication") {
+        "MULTIPLICATION"
+    } else if detail.contains("stack buffer") {
+        "STACK BUFFER"
+    } else {
+        "RUNTIME VALUE"
+    }
 }
 
 impl From<&audit::Finding> for FindingDto {
@@ -175,6 +201,7 @@ impl From<&audit::Finding> for FindingDto {
             severity: f.severity,
             detail: f.detail.clone(),
             reachable: f.reachable,
+            source: evidence_source(&f.detail),
         }
     }
 }
@@ -237,9 +264,25 @@ pub struct TriageDto {
 #[derive(Serialize)]
 pub struct SigningDto {
     pub signed: bool,
+    /// WIN_CERTIFICATE entries in the table.
     pub entries: usize,
+    /// Certificate subjects (Common Names), deduped, signer first.
     pub subjects: Vec<String>,
+    /// SHA-1 thumbprints of the certificate blobs, which is what a revocation
+    /// list or a threat-intel lookup is keyed by.
     pub thumbprints: Vec<String>,
+    /// Where the certificate table lives, so it can be inspected as bytes.
+    pub region_off: Option<String>,
+    pub region_size: Option<u64>,
+    /// The header claims a signature. A claim without a parsable table is worth
+    /// seeing: it is what a stripped or malformed signature looks like.
+    pub header_claims_signed: bool,
+}
+
+#[derive(Serialize)]
+pub struct CapabilityDto {
+    pub category: &'static str,
+    pub apis: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -261,6 +304,8 @@ pub struct BinaryDetail {
     pub mitigations: MitigationsDto,
     pub triage: TriageDto,
     pub signing: SigningDto,
+    /// What the imports say the binary can do, grouped by category.
+    pub capabilities: Vec<CapabilityDto>,
 }
 
 /// Build the mitigations block from a hardening report.

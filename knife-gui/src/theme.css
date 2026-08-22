@@ -147,6 +147,8 @@ body {
   align-items: center;
   gap: 8px;
   padding: 0 10px;
+  flex-wrap: nowrap;
+  white-space: nowrap;
   color: var(--accent);
   font-size: 12px;
   border-bottom: 1px solid var(--border);
@@ -255,11 +257,14 @@ body {
   align-items: stretch;
   gap: 2px;
   padding: 0 8px;
+  min-width: 0;
   border-bottom: 1px solid var(--border);
   background: #141313;
 }
 
 .tabs .tab {
+  flex: 0 0 auto;
+  white-space: nowrap;
   padding: 0 14px;
   display: grid;
   place-items: center;
@@ -279,11 +284,22 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
   color: var(--muted);
+}
+
+.tabs button.act {
+  flex: 0 0 auto;
 }
 
 .tabs .title .fname {
   color: var(--mint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .tabs button.act {
@@ -1374,4 +1390,888 @@ body {
 
 .btn.wide {
   width: 100%;
+}
+
+/* ── driver view ──────────────────────────────────────────────────────── */
+.drow {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+  font-size: 12px;
+}
+
+.drow:hover {
+  background: #201c1d;
+}
+
+.drow .dname {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.drow .dname.created {
+  color: var(--mint);
+}
+
+.drow .dname.unreachable {
+  color: var(--faint);
+}
+
+.drow .dname.bad {
+  color: var(--critical);
+  font-weight: 700;
+}
+
+.drow .ddetail {
+  color: var(--faint);
+  font-size: 11px;
+  margin-left: auto;
+}
+
+.drow .ddetail.wide {
+  margin-left: 0;
+  white-space: normal;
+}
+
+.sym-module.bad {
+  color: var(--critical);
+}
+
+.dfilters {
+  margin-left: auto;
+  display: flex;
+  gap: 6px;
+}
+
+.dfilter {
+  color: var(--faint);
+  font-size: 10px;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.dfilter.on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.rail button.flag {
+  position: relative;
+}
+
+.rail button.flag::after {
+  content: "";
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--amber);
+}
+
+/* ── signing detail ───────────────────────────────────────────────────── */
+.thumb {
+  font-size: 11px;
+  letter-spacing: 0.3px;
+  word-break: break-all;
+}
+
+.signote {
+  color: var(--faint);
+  font-size: 11px;
+  line-height: 1.5;
+  margin-top: 6px;
+  padding-left: 2px;
+  border-left: 2px solid var(--border);
+  padding-inline-start: 8px;
+}
+
+.kv .v .dim {
+  color: var(--faint);
+}
+
+.kv .v .warn {
+  color: var(--amber);
+}
+
+/* rail icons sit on a shared grid now */
+.rail button svg {
+  display: block;
+}
+
+.findbar .fclose {
+  color: var(--faint);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 0 2px;
+}
+
+.findbar .fclose:hover {
+  color: var(--critical);
+}
+
+/* ── reachability paths ───────────────────────────────────────────────── */
+.pathrow {
+  padding: 3px 12px;
+  font-size: 12px;
+  white-space: normal;
+  line-height: 1.7;
+  border-bottom: 1px solid #191717;
+}
+
+.pathrow .phop {
+  color: var(--faint);
+  padding: 0 6px;
+}
+
+.pathrow .pname {
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.pathrow .pname:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.pathrow span:last-child .pname {
+  color: var(--amber);
+}
+
+/* ── evidence rail ────────────────────────────────────────────────────── */
+.evidence {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--border);
+  border-left: 3px solid var(--faint);
+  background: #141212;
+  padding: 6px 12px 8px;
+  font-size: 12px;
+}
+
+.evidence.s3 {
+  border-left-color: var(--critical);
+}
+.evidence.s2 {
+  border-left-color: var(--amber);
+}
+.evidence.s1 {
+  border-left-color: var(--muted);
+}
+
+.ehead {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.elevel {
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  font-size: 11px;
+}
+
+.evidence.s3 .elevel {
+  color: var(--critical);
+}
+.evidence.s2 .elevel {
+  color: var(--amber);
+}
+.evidence.s1 .elevel {
+  color: var(--muted);
+}
+
+.ereach {
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  padding: 1px 6px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+}
+
+.ereach.yes {
+  color: var(--critical);
+  border-color: var(--critical);
+}
+
+.ereach.no {
+  color: var(--faint);
+}
+
+.elink {
+  color: var(--accent);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.elink:hover {
+  text-decoration: underline;
+}
+
+.erow {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  line-height: 1.7;
+}
+
+.erow.why {
+  align-items: flex-start;
+}
+
+.ekey {
+  color: var(--faint);
+  min-width: 52px;
+  font-size: 11px;
+}
+
+.epattern {
+  color: var(--text);
+  font-weight: 700;
+}
+
+.esink {
+  color: var(--mint);
+  cursor: pointer;
+}
+
+.esink:hover {
+  text-decoration: underline;
+}
+
+.echain {
+  color: var(--amber);
+  letter-spacing: 0.3px;
+}
+
+.echain b {
+  font-weight: 700;
+}
+
+.echain i {
+  color: var(--faint);
+  font-style: normal;
+  padding: 0 6px;
+}
+
+.efunc {
+  color: var(--muted);
+}
+
+.ewhy {
+  color: var(--muted);
+  white-space: normal;
+  line-height: 1.5;
+}
+
+/* ── yara ─────────────────────────────────────────────────────────────── */
+.yara-sec h4.static {
+  cursor: default;
+}
+
+.yara-sec h4 .sright {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.yhit {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 12px;
+}
+
+.yrule {
+  color: var(--critical);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ytags {
+  color: var(--amber);
+  font-size: 10px;
+}
+
+.ypat {
+  color: var(--faint);
+  font-size: 11px;
+  margin-left: auto;
+}
+
+.signote code {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* ── agent pane ───────────────────────────────────────────────────────── */
+.agent {
+  height: 340px;
+  flex: 0 0 340px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-top: 1px solid var(--border);
+  background: var(--panel-2);
+}
+
+.agent .panel-head .act {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--faint);
+  border-radius: 5px;
+  padding: 1px 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  cursor: pointer;
+  margin-left: 4px;
+}
+
+.agent .panel-head .act:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.agent-gate {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 20px;
+  text-align: center;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.agent-gate .sub {
+  color: var(--faint);
+  font-size: 12px;
+  max-width: 60ch;
+  line-height: 1.6;
+  margin: 0;
+}
+
+.agent-gate p {
+  margin: 0;
+}
+
+.agent-gate.warn {
+  border-left: 3px solid var(--amber);
+}
+
+.agent-gate.warn b {
+  color: var(--amber);
+}
+
+.agent-log {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  padding: 8px 12px;
+  user-select: text;
+}
+
+.agent-hint {
+  color: var(--faint);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.agent-eg {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.agent-eg span {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 2px 10px;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.agent-eg span:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.turn {
+  margin-bottom: 14px;
+}
+
+.turn .q {
+  color: var(--accent);
+  font-weight: 700;
+  margin-bottom: 4px;
+}
+
+.turn .a {
+  color: var(--text);
+  white-space: pre-wrap;
+  line-height: 1.55;
+  font-size: 12px;
+}
+
+.steps {
+  margin: 3px 0 6px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.step {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 10.5px;
+  line-height: 1.4;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #131111;
+  max-width: 100%;
+}
+
+.stool {
+  color: var(--mint);
+}
+
+.sargs {
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-busy {
+  color: var(--faint);
+  font-size: 12px;
+  font-style: italic;
+}
+
+.agent-err {
+  color: var(--critical);
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+.agent .cin .prompt {
+  color: var(--accent);
+}
+
+.agent-model {
+  width: 190px;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--faint);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 2px 6px;
+  outline: none;
+}
+
+.agent-model:focus {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.agent-toggle {
+  font-size: 11px;
+  color: var(--faint);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 2px 9px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.agent-toggle:hover {
+  border-color: var(--muted);
+  color: var(--muted);
+}
+
+.agent-toggle.on {
+  color: var(--mint);
+  border-color: var(--mint);
+}
+
+/* ── agent: streaming + LPE mode ──────────────────────────────────────── */
+.agent-mode {
+  color: var(--critical);
+  font-size: 9px;
+  letter-spacing: 0.4px;
+  border: 1px solid var(--critical);
+  border-radius: 8px;
+  padding: 0 6px;
+  flex: 0 0 auto;
+}
+
+.agent-busy .dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  margin-right: 7px;
+  animation: pulse 1s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+/* ── agent docking ────────────────────────────────────────────────────── */
+.agent-col {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+}
+
+.agent.dock-bottom {
+  height: 340px;
+  flex: 0 0 340px;
+  border-top: 1px solid var(--border);
+}
+
+.agent.dock-left,
+.agent.dock-right {
+  height: 100%;
+  width: 100%;
+  flex: 1;
+  border-top: 0;
+}
+
+.agent.dock-left {
+  border-right: 1px solid var(--border);
+}
+
+.agent.dock-right {
+  border-left: 1px solid var(--border);
+}
+
+.dock-controls {
+  display: inline-flex;
+  gap: 1px;
+  margin-right: 6px;
+}
+
+.dockbtn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--faint);
+  width: 20px;
+  height: 18px;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+}
+
+.dockbtn:first-child {
+  border-radius: 4px 0 0 4px;
+}
+.dockbtn:last-child {
+  border-radius: 0 4px 4px 0;
+}
+.dockbtn:not(:first-child) {
+  border-left: 0;
+}
+
+.dockbtn:hover {
+  color: var(--muted);
+}
+
+.dockbtn.on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ── top-bar panel toggle ─────────────────────────────────────────────── */
+.panel-toggle {
+  font-size: 11px;
+  color: var(--faint);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 2px 9px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.panel-toggle:hover {
+  border-color: var(--muted);
+  color: var(--muted);
+}
+
+.panel-toggle.on {
+  color: var(--muted);
+  border-color: var(--muted);
+}
+
+/* ── stop button ──────────────────────────────────────────────────────── */
+.stopbtn {
+  margin-left: 10px;
+  background: transparent;
+  border: 1px solid var(--critical);
+  color: var(--critical);
+  border-radius: 5px;
+  padding: 1px 9px;
+  font-family: var(--mono);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.stopbtn:hover {
+  background: #241417;
+}
+
+/* ── agent suggestions ────────────────────────────────────────────────── */
+.suggestions {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.suggestion {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--amber);
+  border-radius: 6px;
+  background: #17130d;
+  font-size: 12px;
+}
+
+.sug-kind {
+  color: var(--amber);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.sug-text {
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sug-apply {
+  margin-left: auto;
+  background: var(--accent);
+  color: #0b0a0a;
+  border: 0;
+  border-radius: 5px;
+  padding: 2px 12px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.sug-apply:hover {
+  background: var(--accent-hi);
+}
+
+.sug-done {
+  margin-left: auto;
+  color: var(--mint);
+  font-size: 11px;
+}
+
+/* ── markdown in agent replies ────────────────────────────────────────── */
+.md {
+  line-height: 1.55;
+}
+
+.md-p {
+  margin: 2px 0;
+}
+
+.md-gap {
+  height: 6px;
+}
+
+.md-h {
+  font-weight: 700;
+  color: var(--text);
+  margin: 8px 0 3px;
+}
+
+.md-h1 {
+  font-size: 15px;
+  color: var(--accent);
+}
+.md-h2 {
+  font-size: 13px;
+  color: var(--accent);
+}
+.md-h3,
+.md-h4 {
+  font-size: 12px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.md-li {
+  display: flex;
+  gap: 8px;
+  margin: 1px 0;
+}
+
+.md-bullet {
+  color: var(--faint);
+}
+
+.md-code {
+  background: #0d0c0c;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 4px;
+  color: var(--mint);
+  font-size: 11.5px;
+}
+
+.md-pre {
+  background: #0d0c0c;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  color: var(--text);
+  font-size: 11.5px;
+  margin: 6px 0;
+  white-space: pre;
+}
+
+.md-table {
+  border-collapse: collapse;
+  margin: 6px 0;
+  font-size: 11.5px;
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.md-table th,
+.md-table td {
+  border: 1px solid var(--border);
+  padding: 3px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.md-table th {
+  background: var(--panel-2);
+  color: var(--accent);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.md-table tr:nth-child(even) td {
+  background: #131111;
+}
+
+/* Live reply streams as plain text (fast); it becomes rendered markdown once
+   the turn completes. */
+.turn .a.streaming {
+  white-space: pre-wrap;
+  color: var(--text);
+  line-height: 1.55;
+}
+
+/* ── inline finding markers (vuln review) ─────────────────────────────── */
+.risk-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: 0 0 6px;
+  align-self: center;
+}
+
+.risk-dot.none {
+  background: transparent;
+}
+
+.risk-dot.s3 {
+  background: var(--critical);
+  box-shadow: 0 0 4px var(--critical);
+}
+
+.risk-dot.s2 {
+  background: var(--amber);
+}
+
+.risk-dot.s1 {
+  background: var(--faint);
+}
+
+/* a dangerous call site, marked in the disassembly */
+.code .ln.danger {
+  box-shadow: inset 2px 0 0 var(--faint);
+}
+
+.code .ln.danger.s3 {
+  box-shadow: inset 2px 0 0 var(--critical);
+  background: #1a1012;
+}
+
+.code .ln.danger.s2 {
+  box-shadow: inset 2px 0 0 var(--amber);
+}
+
+.danger-flag {
+  margin-left: 12px;
+  font-size: 10px;
+  letter-spacing: 0.3px;
+  padding: 0 6px;
+  border-radius: 8px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  color: var(--faint);
+}
+
+.ln.danger.s3 .danger-flag {
+  color: var(--critical);
+  border-color: var(--critical);
+}
+
+.ln.danger.s2 .danger-flag {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+
+.danger-flag:hover {
+  background: #241417;
+}
+
+.code.decompiling {
+  display: grid;
+  place-items: center;
+  color: var(--faint);
+  font-style: italic;
 }

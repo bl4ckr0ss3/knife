@@ -8,7 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "icons": "py scripts/make-icons.py"
+    "icons": "py scripts/make-icons.py --source icons/brand-sheet.png --mark logo"
   },
   "dependencies": {
     "@tanstack/react-virtual": "^3.10.8",

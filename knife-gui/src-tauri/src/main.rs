@@ -8,8 +8,10 @@
 //! window and the command surface that connects the web frontend to it. See
 //! `commands.rs` for the IPC handlers and `state.rs` for the cached session.
 
+mod agent;
 mod commands;
 mod console;
+mod driver_cmds;
 mod dto;
 mod idents;
 mod state;
@@ -48,6 +50,13 @@ fn main() {
             commands::disassemble,
             commands::decompile,
             commands::xrefs,
+            commands::paths_to,
+            commands::set_yara_rules,
+            commands::yara_matches,
+            agent::agent_set_key,
+            agent::agent_has_key,
+            agent::agent_ask,
+            agent::agent_cancel,
             commands::cfg,
             commands::strings_list,
             console::console_exec,
@@ -73,6 +82,7 @@ fn main() {
             workspace_cmds::export_patched,
             workspace_cmds::analyst_facts,
             workspace_cmds::line_actions,
+            driver_cmds::driver_report,
             workspace_cmds::import_typelib,
             workspace_cmds::export_typelib,
         ])

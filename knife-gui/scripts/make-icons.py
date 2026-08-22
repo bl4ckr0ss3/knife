@@ -179,6 +179,13 @@ def main() -> None:
     parser.add_argument("--portrait", nargs=4, type=int, metavar=("L", "T", "R", "B"))
     parser.add_argument("--logo", nargs=4, type=int, metavar=("L", "T", "R", "B"))
     parser.add_argument("--whole", action="store_true", help="use the source as-is")
+    parser.add_argument(
+        "--mark",
+        choices=("auto", "logo", "portrait"),
+        default="auto",
+        help="which mark from a brand sheet: auto uses the logo small and the "
+        "portrait large, logo or portrait force one everywhere",
+    )
     parser.add_argument("--sheet", action="store_true", help="treat the source as a brand sheet")
     args = parser.parse_args()
 
@@ -192,7 +199,10 @@ def main() -> None:
         sys.exit(f"no source art at {source}")
     sheet = Image.open(source).convert("RGBA")
 
-    whole = args.whole or (looks_like_an_icon(sheet) and not args.sheet)
+    # Asking for a particular mark only means something when the source is a
+    # sheet to take it from, so it implies sheet mode.
+    forced_sheet = args.sheet or args.mark != "auto"
+    whole = args.whole or (looks_like_an_icon(sheet) and not forced_sheet)
     OUT.mkdir(parents=True, exist_ok=True)
 
     if whole:
@@ -207,11 +217,19 @@ def main() -> None:
         portrait, logo = sheet.crop(pbox), sheet.crop(lbox)
         print(f"portrait {pbox}  ({portrait.width}x{portrait.height})")
         print(f"logo     {lbox}  ({logo.width}x{logo.height})")
+        def pick(size: int) -> Image.Image:
+            if args.mark == "logo":
+                return logo
+            if args.mark == "portrait":
+                return portrait
+            # Auto: a face needs room, a logo does not.
+            return logo if size < DETAIL_FLOOR else portrait
+
         for name, size in PNG_SIZES.items():
-            art = logo if size < DETAIL_FLOOR else portrait
+            art = pick(size)
             render(art, size).save(OUT / name)
             print(f"  {name:<16} {size:>3}px  {'logo' if art is logo else 'portrait'}")
-        frames = [render(logo if s < DETAIL_FLOOR else portrait, s) for s in ICO_SIZES]
+        frames = [render(pick(s), s) for s in ICO_SIZES]
 
     frames[-1].save(OUT / "icon.ico", sizes=[(s, s) for s in ICO_SIZES], append_images=frames[:-1])
     print(f"  {'icon.ico':<16} {ICO_SIZES}")

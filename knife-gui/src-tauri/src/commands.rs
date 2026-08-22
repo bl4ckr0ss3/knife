@@ -13,6 +13,7 @@ use reknife::analysis::engine::{self, Analysis, Function};
 use reknife::analysis::{graphs, ir};
 use reknife::db;
 use reknife::listing;
+use reknife::model::SymKind;
 use tauri::{Emitter, State};
 
 /// Resolve a selector — a symbol name, or a hex address — to a function.
@@ -369,4 +370,113 @@ pub fn select_target(state: State<AppState>, path: String) -> Result<(), String>
 #[tauri::command]
 pub fn close_target(state: State<AppState>, path: String) -> Result<(), String> {
     state.close(&path).map_err(|e| e.to_string())
+}
+
+/// One call chain that reaches a target.
+#[derive(serde::Serialize)]
+pub struct PathRow {
+    /// Each hop, entry-most first.
+    pub hops: Vec<PathHop>,
+}
+
+#[derive(serde::Serialize)]
+pub struct PathHop {
+    pub addr: String,
+    pub name: String,
+}
+
+/// How control can reach a function from outside.
+///
+/// The roots are the places control enters the image: the entry point and every
+/// export. This is the question a vulnerability is judged by — a dangerous call
+/// nothing can reach is a curiosity, and one three hops from an export is a
+/// finding — and it is why `reachable` appears on every audit finding.
+#[tauri::command]
+pub fn paths_to(
+    state: State<AppState>,
+    selector: String,
+    max: Option<usize>,
+) -> Result<Vec<PathRow>, String> {
+    let max = max.unwrap_or(12).clamp(1, 64);
+    state
+        .read(|l| {
+            let an = &l.session.an;
+            let bin = &l.session.bin;
+            let target = resolve(an, &selector)
+                .map(|f| f.addr)
+                .or_else(|| parse_addr(&selector).ok())
+                .ok_or_else(|| anyhow!("nothing matches {selector:?}"))?;
+
+            let base = engine::display_base(bin);
+            let mut roots: Vec<u64> = bin
+                .symbols
+                .iter()
+                .filter(|s| s.kind == SymKind::Export)
+                .map(|s| s.addr + base)
+                .collect();
+            roots.push(bin.entry + base);
+
+            let mut chains = an.paths_to(target, &roots, max, false);
+            chains.sort_by_key(|c| c.len());
+            chains.truncate(max);
+
+            Ok(chains
+                .into_iter()
+                .map(|c| PathRow {
+                    hops: c
+                        .into_iter()
+                        .map(|a| PathHop {
+                            addr: hex(a),
+                            name: an.label(a),
+                        })
+                        .collect(),
+                })
+                .collect())
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// One YARA rule that matched.
+#[derive(serde::Serialize)]
+pub struct YaraHit {
+    pub rule: String,
+    pub namespace: String,
+    pub tags: Vec<String>,
+    pub meta: Vec<(String, String)>,
+    /// Pattern identifier and how many times it hit.
+    pub patterns: Vec<(String, usize)>,
+}
+
+/// Load rules (a file or a directory) and rescan the open target.
+///
+/// The verdict is recomputed with the matches folded in, which is what
+/// `knife info --rules` does; passing no path clears them and puts the score
+/// back to the rule-free one.
+#[tauri::command]
+pub fn set_yara_rules(state: State<AppState>, path: Option<String>) -> Result<usize, String> {
+    state
+        .set_yara(path.as_deref())
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// The rules that matched, and what is currently loaded.
+#[tauri::command]
+pub fn yara_matches(state: State<AppState>) -> Result<(Option<String>, Vec<YaraHit>), String> {
+    state
+        .read(|l| {
+            Ok((
+                l.yara_rules.clone(),
+                l.yara
+                    .iter()
+                    .map(|m| YaraHit {
+                        rule: m.rule.clone(),
+                        namespace: m.namespace.clone(),
+                        tags: m.tags.clone(),
+                        meta: m.meta.clone(),
+                        patterns: m.patterns.clone(),
+                    })
+                    .collect(),
+            ))
+        })
+        .map_err(|e| e.to_string())
 }

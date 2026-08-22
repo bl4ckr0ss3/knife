@@ -16,6 +16,18 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 
+# The agent pane talks to OpenRouter. rustls rather than native-tls so there is
+# no OpenSSL to find at build time, and the key lives in the OS keyring rather
+# than anywhere this repo can see.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "stream",
+] }
+tokio = { version = "1", features = ["macros"] }
+futures-util = "0.3"
+keyring = { version = "3", features = ["windows-native"] }
+
 # Windows hands the taskbar whatever icon the window reports, and by default
 # that is a 16x16 bitmap stretched to whatever the display scaling asks for.
 # Setting the real ones needs the Win32 calls directly.

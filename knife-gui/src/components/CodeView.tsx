@@ -1,4 +1,4 @@
-import type { IrLine, Line } from "../api";
+import type { Finding, IrLine, Line } from "../api";
 
 // The centre pane: disassembly or decompiled pseudocode. A single click selects
 // a line (so a note, or a type binding, can be attached to it); clicking an
@@ -9,21 +9,38 @@ export function CodeView({
   ir,
   selected,
   irSelected,
+  hits,
+  currentHit,
+  findingAt,
   onSelect,
   onSelectIr,
   onFollow,
   onLineMenu,
+  onFinding,
 }: {
   tab: "disasm" | "pseudo";
   lines: Line[];
   ir: IrLine[];
   selected: string | null;
   irSelected: number | null;
+  /// Line indices matching the find query, and which one is current.
+  hits: number[];
+  currentHit: number | null;
+  /// Instruction address -> the audit finding at that call site, so a dangerous
+  /// call is visible while reading, not only in the attack-surface list.
+  findingAt: Map<string, Finding>;
   onSelect: (addr: string) => void;
   onSelectIr: (index: number) => void;
   onFollow: (selector: string) => void;
   onLineMenu: (index: number, at: { x: number; y: number }) => void;
+  onFinding: (f: Finding) => void;
 }) {
+  // A set, not a scan: a large function is thousands of lines and this runs for
+  // every one of them on every render.
+  const hitSet = new Set(hits);
+  const hitClass = (i: number) =>
+    hitSet.has(i) ? (currentHit === i ? " hit cur" : " hit") : "";
+
   if (tab === "pseudo") {
     // Right-click is where the workbench lives: bind a type, name a field,
     // rename a variable, set the prototype. Selecting the line first is what
@@ -33,7 +50,10 @@ export function CodeView({
         {ir.map((l, i) => (
           <div
             key={i}
-            className={"ir" + (l.label ? " label" : "") + (irSelected === i ? " sel" : "")}
+            data-line={i}
+            className={
+              "ir" + (l.label ? " label" : "") + (irSelected === i ? " sel" : "") + hitClass(i)
+            }
             onClick={() => onSelectIr(i)}
             onContextMenu={(e) => {
               e.preventDefault();
@@ -53,7 +73,7 @@ export function CodeView({
       {lines.map((l, i) => {
         if (l.kind === "label") {
           return (
-            <div key={i} className="ln">
+            <div key={i} data-line={i} className={"ln" + hitClass(i)}>
               <span className="gutter" />
               <span className="label">{l.text}</span>
             </div>
@@ -61,16 +81,23 @@ export function CodeView({
         }
         if (l.kind === "data") {
           return (
-            <div key={i} className="ln">
+            <div key={i} data-line={i} className={"ln" + hitClass(i)}>
               <span className="gutter">{l.addr.replace("0x", "")}</span>
               <span className="ops">{l.text}</span>
             </div>
           );
         }
+        const finding = findingAt.get(l.addr);
         return (
           <div
             key={i}
-            className={"ln selectable" + (l.addr === selected ? " sel" : "")}
+            data-line={i}
+            className={
+              "ln selectable" +
+              (l.addr === selected ? " sel" : "") +
+              hitClass(i) +
+              (finding ? " danger s" + Math.min(finding.severity, 3) : "")
+            }
             onClick={() => onSelect(l.addr)}
             onDoubleClick={() => l.target && onFollow(l.target)}
           >
@@ -92,6 +119,18 @@ export function CodeView({
               <span className="ops">{l.operands}</span>
             )}
             {l.annot && <span className={"annot " + l.annot.kind}>; {l.annot.text}</span>}
+            {finding && (
+              <span
+                className="danger-flag"
+                title={`${finding.pattern}: ${finding.detail}`}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onFinding(finding);
+                }}
+              >
+                {finding.severity >= 3 ? "⚑ high" : finding.severity >= 2 ? "⚑ med" : "⚑"}
+              </span>
+            )}
           </div>
         );
       })}
