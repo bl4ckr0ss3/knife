@@ -11,6 +11,10 @@ pub struct ViewPositions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NavigationLocation {
     pub address: u64,
+    /// When true, address is an on-disk file offset. Otherwise it is a
+    /// static virtual address. The flag prevents history from conflating the
+    /// two spaces while keeping the stored location compact.
+    pub file_offset: bool,
     pub cursor: usize,
     pub positions: ViewPositions,
     pub pseudo: bool,

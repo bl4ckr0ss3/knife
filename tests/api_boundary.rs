@@ -5,7 +5,8 @@ use reknife::api::edits::{apply_analyst_edit, AnalystEdit, AnalystEditKind};
 use reknife::api::facts::{self, FactKind, FactQuery, TypeLibraryOperation};
 use reknife::api::graphs::{self as graph_api, GraphKind, GraphQuery};
 use reknife::api::listing::{
-    HexQuery, LinearLocation, LinearQuery, LinearRow, ListingIndex, StringQuery,
+    file_hex_window, FileHexQuery, HexQuery, LinearLocation, LinearQuery, LinearRow, ListingIndex,
+    StringQuery,
 };
 use reknife::api::navigation::{self, DirectPathQuery, FunctionQuery, XrefDirection};
 use reknife::api::patches;
@@ -13,6 +14,49 @@ use reknife::api::risk_signals;
 use reknife::api::symbols::{self as symbol_api, SymbolQuery};
 use reknife::api::TargetIdentity;
 use reknife::workspace::Session;
+
+#[test]
+fn raw_file_windows_preserve_overlapping_image_mappings() {
+    let mut binary =
+        reknife::model::Binary::stub(reknife::model::Format::Elf, reknife::model::Arch::X86_64);
+    binary.sections = vec![
+        reknife::model::Section {
+            name: "first".into(),
+            vaddr: 0x1000,
+            vsize: 0x20,
+            file_off: 0,
+            file_size: 0x20,
+            entropy: 0.0,
+            read: true,
+            write: false,
+            exec: false,
+        },
+        reknife::model::Section {
+            name: "alias".into(),
+            vaddr: 0x2000,
+            vsize: 0x20,
+            file_off: 0,
+            file_size: 0x20,
+            entropy: 0.0,
+            read: true,
+            write: false,
+            exec: false,
+        },
+    ];
+    let window = file_hex_window(
+        &binary,
+        &[0u8; 32],
+        0,
+        FileHexQuery {
+            file_offset: reknife::address::FileOffset(0),
+            length: 16,
+        },
+    )
+    .unwrap();
+    assert_eq!(window.rows[0].mappings.len(), 2);
+    assert_eq!(window.rows[0].mappings[0].address, StaticVa(0x1000));
+    assert_eq!(window.rows[0].mappings[1].address, StaticVa(0x2000));
+}
 
 #[test]
 fn target_identity_matches_the_existing_session_contract() {
@@ -421,6 +465,39 @@ fn linear_navigation_and_overview_keep_file_offsets_distinct_from_static_address
     )
     .unwrap();
     let listing = ListingIndex::from_session(&session);
+
+    let raw_header = file_hex_window(
+        &session.bin,
+        &session.bytes,
+        reknife::analysis::engine::display_base(&session.bin),
+        FileHexQuery {
+            file_offset: reknife::address::FileOffset(0),
+            length: 32,
+        },
+    )
+    .unwrap();
+    assert_eq!(raw_header.start, reknife::address::FileOffset(0));
+    assert_eq!(raw_header.rows.len(), 2);
+    assert_eq!(
+        raw_header.rows[0].file_offset,
+        reknife::address::FileOffset(0)
+    );
+    assert!(
+        raw_header.rows[0].mappings.is_empty(),
+        "PE headers are raw file bytes, not an invented section mapping"
+    );
+    assert_eq!(raw_header.next, Some(reknife::address::FileOffset(32)));
+    assert_eq!(raw_header.previous, None);
+    assert!(file_hex_window(
+        &session.bin,
+        &session.bytes,
+        reknife::analysis::engine::display_base(&session.bin),
+        FileHexQuery {
+            file_offset: reknife::address::FileOffset(u64::MAX),
+            length: 16,
+        },
+    )
+    .is_err());
 
     let first_function = StaticVa(session.an.functions.first().unwrap().addr);
     let hex_rows = listing

@@ -80,6 +80,9 @@ explorer (`knife tui` without a file and `knife <dir>` do the same).
 |---|---|
 | `↵` | open a function, follow the call under the cursor, or jump to a xref |
 | `⌫` | back |
+| `Tab` / `Shift+Tab` | focus the next / previous pane |
+| `+` / `-` | grow / shrink the focused pane |
+| `z` | maximize the focused pane; press again to restore |
 | `g` | goto a symbol; `va:0x..` static VA, `off:0x..` file offset |
 | `/` | filter the function list, or search the listing |
 | `d` / `f` | pseudocode / spatial CFG view |
@@ -93,7 +96,11 @@ each keeps its own cursor, view mode and history; `:only` collapses back.
 `:reload` re-reads the target from disk on a background worker; pane layout
 and annotations survive, a failed reload keeps the old session.
 `:xrefs`, `:callers`, `:callees`, `:imports`, `:exports`, `:strings`,
-`:sections`, `:bookmarks`, `:history` open filterable catalogs.
+`:sections`, `:bookmarks`, `:history` open filterable catalogs. On ELF targets,
+`:headers`, `:segments`, and `:section-headers` expose the actual on-disk
+records. Enter opens file-backed bytes, `O` opens the table record, and `D`
+follows a mapped static address into disassembly. File offsets are always
+labelled `OFF`; Knife does not pretend header bytes are virtual addresses.
 Tab completes commands, Up/Down recalls them.
 
 Your names, notes, bookmarks, patches, types and prototypes save immediately
@@ -226,7 +233,7 @@ knife funcs ./target | grep parse_record       # and in every other command
 [Model Context Protocol](https://modelcontextprotocol.io), so an agent drives
 the same engine the command line does: recover functions, read pseudocode,
 rank the dangerous call sites, and write names, notes and prototypes into the
-database. Thirty tools; bind a binary once (`knife mcp --file PATH` or the
+database. Bind a binary once (`knife mcp --file PATH` or the
 `open` tool) and nothing after it needs a path. Being static, the server
 cannot run the sample it is reading — which is what makes it safe to hand an
 agent a piece of malware.

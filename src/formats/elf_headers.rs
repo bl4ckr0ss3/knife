@@ -1,7 +1,48 @@
 //! Lossless ELF header inspection, independent of function recovery.
 use anyhow::{bail, Context, Result};
 use goblin::elf::{header, program_header, section_header, Elf};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+/// An on-disk range. This is deliberately a file offset, not an image
+/// address: ELF metadata commonly lives outside every mapped section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRange {
+    pub offset: u64,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeaderField {
+    pub name: String,
+    pub range: FileRange,
+    /// Bytes exactly as stored in the file, in file order.
+    pub raw: String,
+    /// Deterministic interpretation. Unknown values remain numeric.
+    pub decoded: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramLayout {
+    pub index: usize,
+    pub record: FileRange,
+    pub content: Option<FileRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SectionLayout {
+    pub index: usize,
+    pub record: FileRange,
+    /// None for SHT_NOBITS and empty sections: those bytes do not exist in
+    /// the file even when the section occupies memory in the loaded image.
+    pub content: Option<FileRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ElfLayout {
+    pub header_fields: Vec<HeaderField>,
+    pub programs: Vec<ProgramLayout>,
+    pub sections: Vec<SectionLayout>,
+}
 
 #[derive(Debug, Serialize)]
 pub struct FileHeader {
@@ -79,6 +120,221 @@ pub fn inspect(bytes: &[u8]) -> Result<ElfHeaders> {
     }
     std::panic::catch_unwind(|| inspect_inner(bytes))
         .map_err(|_| anyhow::anyhow!("malformed ELF: parser rejected input"))?
+}
+
+/// Describe where decoded ELF structures came from in the original file.
+///
+/// The value-oriented inspection API remains stable; this companion query
+/// adds byte provenance without changing the existing CLI JSON shape.
+pub fn layout(bytes: &[u8]) -> Result<ElfLayout> {
+    inspect_with_layout(bytes).map(|(_, layout)| layout)
+}
+
+/// Decode values and their byte provenance in one parser pass.
+pub fn inspect_with_layout(bytes: &[u8]) -> Result<(ElfHeaders, ElfLayout)> {
+    let report = inspect(bytes)?;
+    let layout = layout_from_report(bytes, &report)?;
+    Ok((report, layout))
+}
+
+fn layout_from_report(bytes: &[u8], report: &ElfHeaders) -> Result<ElfLayout> {
+    let is_64 = report.header.e_ident[4] == 2;
+    let mut fields = Vec::new();
+    let ident_names = [
+        "EI_MAG0",
+        "EI_MAG1",
+        "EI_MAG2",
+        "EI_MAG3",
+        "EI_CLASS",
+        "EI_DATA",
+        "EI_VERSION",
+        "EI_OSABI",
+        "EI_ABIVERSION",
+        "EI_PAD0",
+        "EI_PAD1",
+        "EI_PAD2",
+        "EI_PAD3",
+        "EI_PAD4",
+        "EI_PAD5",
+        "EI_PAD6",
+    ];
+    for (offset, name) in ident_names.into_iter().enumerate() {
+        let value = report.header.e_ident[offset];
+        let decoded = match offset {
+            4 => report.header.class.to_string(),
+            5 => report.header.byte_order.to_string(),
+            6 => format!("version {value}"),
+            7 => format!("OS ABI {value}"),
+            8 => format!("ABI version {value}"),
+            _ if offset < 4 => format!("magic byte 0x{value:02x}"),
+            _ => format!("0x{value:02x}"),
+        };
+        fields.push(header_field(bytes, name, offset as u64, 1, decoded)?);
+    }
+
+    let h = &report.header;
+    let specs: Vec<(&str, u64, u64, String)> = if is_64 {
+        vec![
+            (
+                "e_type",
+                16,
+                2,
+                format!("{} (0x{:x})", h.type_name, h.e_type),
+            ),
+            (
+                "e_machine",
+                18,
+                2,
+                format!("{} (0x{:x})", h.machine_name, h.e_machine),
+            ),
+            ("e_version", 20, 4, h.e_version.to_string()),
+            ("e_entry", 24, 8, format!("0x{:x}", h.e_entry)),
+            ("e_phoff", 32, 8, format!("file offset 0x{:x}", h.e_phoff)),
+            ("e_shoff", 40, 8, format!("file offset 0x{:x}", h.e_shoff)),
+            ("e_flags", 48, 4, format!("0x{:x}", h.e_flags)),
+            ("e_ehsize", 52, 2, format!("{} bytes", h.e_ehsize)),
+            ("e_phentsize", 54, 2, format!("{} bytes", h.e_phentsize)),
+            (
+                "e_phnum",
+                56,
+                2,
+                format!("{} (resolved {})", h.e_phnum, h.resolved_program_count),
+            ),
+            ("e_shentsize", 58, 2, format!("{} bytes", h.e_shentsize)),
+            (
+                "e_shnum",
+                60,
+                2,
+                format!("{} (resolved {})", h.e_shnum, h.resolved_section_count),
+            ),
+            (
+                "e_shstrndx",
+                62,
+                2,
+                format!(
+                    "{} (resolved {})",
+                    h.e_shstrndx, h.resolved_string_table_index
+                ),
+            ),
+        ]
+    } else {
+        vec![
+            (
+                "e_type",
+                16,
+                2,
+                format!("{} (0x{:x})", h.type_name, h.e_type),
+            ),
+            (
+                "e_machine",
+                18,
+                2,
+                format!("{} (0x{:x})", h.machine_name, h.e_machine),
+            ),
+            ("e_version", 20, 4, h.e_version.to_string()),
+            ("e_entry", 24, 4, format!("0x{:x}", h.e_entry)),
+            ("e_phoff", 28, 4, format!("file offset 0x{:x}", h.e_phoff)),
+            ("e_shoff", 32, 4, format!("file offset 0x{:x}", h.e_shoff)),
+            ("e_flags", 36, 4, format!("0x{:x}", h.e_flags)),
+            ("e_ehsize", 40, 2, format!("{} bytes", h.e_ehsize)),
+            ("e_phentsize", 42, 2, format!("{} bytes", h.e_phentsize)),
+            (
+                "e_phnum",
+                44,
+                2,
+                format!("{} (resolved {})", h.e_phnum, h.resolved_program_count),
+            ),
+            ("e_shentsize", 46, 2, format!("{} bytes", h.e_shentsize)),
+            (
+                "e_shnum",
+                48,
+                2,
+                format!("{} (resolved {})", h.e_shnum, h.resolved_section_count),
+            ),
+            (
+                "e_shstrndx",
+                50,
+                2,
+                format!(
+                    "{} (resolved {})",
+                    h.e_shstrndx, h.resolved_string_table_index
+                ),
+            ),
+        ]
+    };
+    for (name, offset, size, decoded) in specs {
+        fields.push(header_field(bytes, name, offset, size, decoded)?);
+    }
+
+    let programs = report
+        .segments
+        .iter()
+        .map(|program| {
+            Ok(ProgramLayout {
+                index: program.index,
+                record: table_record(h.e_phoff, h.e_phentsize, program.index, bytes.len())?,
+                content: nonempty_range(program.p_offset, program.p_filesz, bytes.len()),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let sections = report
+        .sections
+        .iter()
+        .map(|section| {
+            Ok(SectionLayout {
+                index: section.index,
+                record: table_record(h.e_shoff, h.e_shentsize, section.index, bytes.len())?,
+                content: (section.sh_type != section_header::SHT_NOBITS)
+                    .then(|| nonempty_range(section.sh_offset, section.sh_size, bytes.len()))
+                    .flatten(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ElfLayout {
+        header_fields: fields,
+        programs,
+        sections,
+    })
+}
+
+fn header_field(
+    bytes: &[u8],
+    name: &str,
+    offset: u64,
+    size: u64,
+    decoded: String,
+) -> Result<HeaderField> {
+    let start = usize::try_from(offset)?;
+    let end = start
+        .checked_add(usize::try_from(size)?)
+        .context("ELF header field range overflow")?;
+    let raw = bytes
+        .get(start..end)
+        .context("ELF header field is outside the file")?
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(HeaderField {
+        name: name.to_string(),
+        range: FileRange { offset, size },
+        raw,
+        decoded,
+    })
+}
+
+fn table_record(base: u64, entry_size: u16, index: usize, file_len: usize) -> Result<FileRange> {
+    let offset = u64::try_from(index)?
+        .checked_mul(u64::from(entry_size))
+        .and_then(|delta| base.checked_add(delta))
+        .context("ELF table record offset overflow")?;
+    nonempty_range(offset, u64::from(entry_size), file_len)
+        .context("ELF table record is outside the file")
+}
+
+fn nonempty_range(offset: u64, size: u64, file_len: usize) -> Option<FileRange> {
+    let end = offset.checked_add(size)?;
+    (size != 0 && end <= u64::try_from(file_len).ok()?).then_some(FileRange { offset, size })
 }
 
 fn inspect_inner(bytes: &[u8]) -> Result<ElfHeaders> {
@@ -386,6 +642,58 @@ mod tests {
                 assert_eq!(result.segments[0].permissions, "R-X");
                 assert!(inspect(&b[..b.len() - 1]).is_err());
             }
+        }
+    }
+
+    #[test]
+    fn layout_preserves_ident_fields_and_class_specific_offsets() {
+        for (class, entry_offset, phoff_offset) in [(1, 24, 28), (2, 24, 32)] {
+            for endian in [1, 2] {
+                let bytes = minimal(class, endian);
+                let layout = layout(&bytes).unwrap();
+                assert_eq!(layout.header_fields.len(), 29);
+                assert_eq!(layout.header_fields[0].name, "EI_MAG0");
+                assert_eq!(layout.header_fields[15].name, "EI_PAD6");
+                assert_eq!(layout.header_fields[16].name, "e_type");
+                assert_eq!(layout.header_fields[16].raw.len(), 5);
+                let entry = layout
+                    .header_fields
+                    .iter()
+                    .find(|field| field.name == "e_entry")
+                    .unwrap();
+                assert_eq!(entry.range.offset, entry_offset);
+                let phoff = layout
+                    .header_fields
+                    .iter()
+                    .find(|field| field.name == "e_phoff")
+                    .unwrap();
+                assert_eq!(phoff.range.offset, phoff_offset);
+            }
+        }
+    }
+
+    #[test]
+    fn layout_separates_table_records_from_file_backed_contents() {
+        let bytes = crate::formats::fixture::elf_with_plt_call();
+        let report = inspect(&bytes).unwrap();
+        let layout = layout(&bytes).unwrap();
+        assert_eq!(layout.programs.len(), report.segments.len());
+        assert_eq!(layout.sections.len(), report.sections.len());
+        for (program, location) in report.segments.iter().zip(&layout.programs) {
+            assert_eq!(
+                location.record.offset,
+                report.header.e_phoff + program.index as u64 * u64::from(report.header.e_phentsize)
+            );
+            assert_eq!(
+                location.content.map(|range| range.offset),
+                (program.p_filesz != 0).then_some(program.p_offset)
+            );
+        }
+        for (section, location) in report.sections.iter().zip(&layout.sections) {
+            assert_eq!(
+                location.record.offset,
+                report.header.e_shoff + section.index as u64 * u64::from(report.header.e_shentsize)
+            );
         }
     }
 }

@@ -381,6 +381,7 @@ fn load_target(source: &TargetSource) -> Result<WorkResult> {
 #[derive(Debug, Clone, Default)]
 pub struct ListingView {
     pub cur: Option<u64>,
+    pub raw_file: bool,
     pub lines: Vec<Line>,
     pub cursor: usize,
     view_positions: navigation::ViewPositions,
@@ -396,6 +397,7 @@ pub struct ListingView {
 /// pane without caring which one currently owns the active state.
 pub struct ListingViewRef<'a> {
     pub cur: Option<u64>,
+    pub raw_file: bool,
     pub lines: &'a [Line],
     pub cursor: usize,
     pub pseudo: bool,
@@ -423,6 +425,8 @@ pub struct App {
 
     // ── listing (the ACTIVE pane; see `other` for the inactive column) ──
     pub cur: Option<u64>,
+    /// The active listing uses on-disk offsets rather than image addresses.
+    pub raw_file: bool,
     pub lines: Vec<Line>,
     pub cursor: usize,
     view_positions: navigation::ViewPositions,
@@ -537,6 +541,7 @@ impl App {
             filter: String::new(),
             browser: None,
             cur: None,
+            raw_file: false,
             lines: Vec::new(),
             cursor: 0,
             view_positions: navigation::ViewPositions::default(),
@@ -678,6 +683,7 @@ impl App {
                     }
                 }
                 self.lines = listing::data_view(&self.bin, self.base, &self.bytes, addr);
+                self.raw_file = false;
                 self.pseudo = false;
                 self.graph = false;
                 self.pseudo_lines.clear();
@@ -717,6 +723,7 @@ impl App {
             &self.strings,
             self.driver.as_ref().map(|d| &d.listing_hints),
         );
+        self.raw_file = false;
         self.cur = Some(faddr);
         self.reference_anchor = None;
         self.clamp_xsel();
@@ -746,6 +753,67 @@ impl App {
         }
     }
 
+    /// Open bytes by their actual on-disk offset. No image mapping is required
+    /// and every rendered row remains explicitly labelled as a file offset.
+    pub fn open_file_offset(&mut self, offset: u64, push: bool) {
+        let window = match crate::api::listing::file_hex_window(
+            &self.bin,
+            &self.bytes,
+            self.base,
+            crate::api::listing::FileHexQuery {
+                file_offset: crate::address::FileOffset(offset),
+                length: 512,
+            },
+        ) {
+            Ok(window) => window,
+            Err(error) => {
+                self.status = format!("cannot open file offset 0x{offset:x}: {error:#}");
+                return;
+            }
+        };
+        if push {
+            if let Some(previous) = self.navigation_location() {
+                self.history.push(previous);
+                self.future.clear();
+            }
+        }
+        self.lines = window
+            .rows
+            .into_iter()
+            .map(|row| {
+                let mappings = if row.mappings.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "  [{}]",
+                        row.mappings
+                            .iter()
+                            .map(|mapping| format!(
+                                "{} VA 0x{:x}",
+                                mapping.region,
+                                mapping.address.get()
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                Line::Data {
+                    addr: row.file_offset.get(),
+                    text: format!("{:<47}  |{}|{mappings}", row.hex, row.ascii),
+                }
+            })
+            .collect();
+        self.cur = Some(offset);
+        self.raw_file = true;
+        self.pseudo = false;
+        self.graph = false;
+        self.pseudo_lines.clear();
+        self.view_positions = navigation::ViewPositions::default();
+        self.reference_anchor = None;
+        self.cursor = 0;
+        self.status = format!("raw file bytes at OFF 0x{offset:x}; mapped VAs are annotations");
+    }
+
     /// The number of rows the listing pane is currently showing, which is the
     /// pseudocode length when that view is on and the disassembly length
     /// otherwise. Navigation and mouse mapping both clamp to it.
@@ -760,7 +828,10 @@ impl App {
     }
 
     fn current_function(&self) -> Option<&crate::analysis::engine::Function> {
-        self.cur.and_then(|addr| self.an.find_function(addr))
+        (!self.raw_file)
+            .then_some(self.cur)
+            .flatten()
+            .and_then(|addr| self.an.find_function(addr))
     }
 
     /// Rebuild the decompiled lines for the current function.
@@ -912,6 +983,7 @@ impl App {
     pub fn active_view(&self) -> ListingViewRef<'_> {
         ListingViewRef {
             cur: self.cur,
+            raw_file: self.raw_file,
             lines: &self.lines,
             cursor: self.cursor,
             pseudo: self.pseudo,
@@ -925,6 +997,7 @@ impl App {
     pub fn other_view(&self) -> ListingViewRef<'_> {
         ListingViewRef {
             cur: self.other.cur,
+            raw_file: self.other.raw_file,
             lines: &self.other.lines,
             cursor: self.other.cursor,
             pseudo: self.other.pseudo,
@@ -938,6 +1011,7 @@ impl App {
     /// the current analysis so edits made while it was inactive show up.
     fn swap_views(&mut self) {
         std::mem::swap(&mut self.cur, &mut self.other.cur);
+        std::mem::swap(&mut self.raw_file, &mut self.other.raw_file);
         std::mem::swap(&mut self.lines, &mut self.other.lines);
         std::mem::swap(&mut self.cursor, &mut self.other.cursor);
         std::mem::swap(&mut self.view_positions, &mut self.other.view_positions);
@@ -963,6 +1037,7 @@ impl App {
         }
         self.other = ListingView {
             cur: self.cur,
+            raw_file: self.raw_file,
             lines: self.lines.clone(),
             cursor: self.cursor,
             view_positions: self.view_positions,
@@ -1145,6 +1220,7 @@ impl App {
     fn navigation_location(&self) -> Option<NavigationLocation> {
         self.cur.map(|address| NavigationLocation {
             address,
+            file_offset: self.raw_file,
             cursor: self.cursor,
             positions: self.current_view_positions(),
             pseudo: self.pseudo,
@@ -1159,7 +1235,11 @@ impl App {
     fn restore_navigation(&mut self, location: NavigationLocation) {
         self.pseudo = location.pseudo;
         self.graph = location.graph;
-        self.open(location.address, false);
+        if location.file_offset {
+            self.open_file_offset(location.address, false);
+        } else {
+            self.open(location.address, false);
+        }
         self.view_positions = location.positions;
         self.cursor = location.cursor.min(self.listing_len().saturating_sub(1));
         self.focus = location.focus;
@@ -1175,6 +1255,26 @@ impl App {
             return;
         }
         self.cursor = self.cursor.saturating_add_signed(delta).min(len - 1);
+    }
+
+    fn page_raw_file(&mut self, forward: bool) {
+        let Some(start) = self.cur else {
+            return;
+        };
+        let next = if forward {
+            start.checked_add(512)
+        } else {
+            Some(start.saturating_sub(512))
+        };
+        let Some(next) = next else {
+            self.status = "raw file offset overflow".into();
+            return;
+        };
+        if next == start {
+            self.status = "already at the beginning of the file".into();
+            return;
+        }
+        self.open_file_offset(next, true);
     }
 
     /// The searchable text of listing row `i`, in whichever view is showing.
@@ -1658,6 +1758,9 @@ impl App {
     /// The address the cursor is on, which is what a name, note, or
     /// cross-reference lookup applies to.
     pub fn cursor_addr(&self) -> Option<u64> {
+        if self.focus == Focus::Listing && self.raw_file {
+            return None;
+        }
         if self.focus == Focus::Functions {
             if let Some(browser) = &self.browser {
                 return browser
@@ -1690,6 +1793,12 @@ impl App {
     /// control-flow target falls back to its data operand, opening the
     /// referenced bytes when they are not code.
     pub fn follow(&mut self) {
+        if self.raw_file {
+            self.status =
+                "raw file rows are not control-flow instructions; use D on an ELF catalog row"
+                    .into();
+            return;
+        }
         if self.pseudo {
             self.status = "switch to the disassembly (d) to follow a call".into();
             return;
@@ -1724,6 +1833,9 @@ impl App {
 
     /// The address the reference pane keys off: whatever is under the cursor.
     pub fn xref_at(&self) -> u64 {
+        if self.raw_file {
+            return 0;
+        }
         if self.focus == Focus::Xrefs {
             if let Some(address) = self.reference_anchor {
                 return address;
@@ -2104,6 +2216,15 @@ impl App {
     }
 
     fn relist(&mut self) {
+        if self.raw_file {
+            if let Some(offset) = self.cur {
+                let cursor = self.cursor;
+                self.open_file_offset(offset, false);
+                self.cursor = cursor.min(self.lines.len().saturating_sub(1));
+            }
+            self.refresh_catalog();
+            return;
+        }
         if let Some(addr) = self.cur {
             if let Some(f) = self.an.find_function(addr) {
                 self.lines = listing::function(
@@ -2346,6 +2467,9 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('b') => self.execute_command("bookmark"),
+            KeyCode::Char('+') | KeyCode::Char('=') => self.resize_pane(4),
+            KeyCode::Char('-') => self.resize_pane(-4),
+            KeyCode::Char('z') => self.toggle_pane_zoom(),
             KeyCode::Char(':') => {
                 self.command_history.reset();
                 self.ask(Ask::Command);
@@ -2389,10 +2513,42 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j') => self.step(1),
             KeyCode::Up | KeyCode::Char('k') => self.step(-1),
+            KeyCode::PageDown if self.focus == Focus::Listing && self.raw_file => {
+                if self.cursor.saturating_add(page as usize) >= self.lines.len() {
+                    self.page_raw_file(true);
+                } else {
+                    self.step(page);
+                }
+            }
+            KeyCode::PageUp if self.focus == Focus::Listing && self.raw_file => {
+                if self.cursor < page as usize {
+                    self.page_raw_file(false);
+                } else {
+                    self.step(-page);
+                }
+            }
             KeyCode::PageDown => self.step(page),
             KeyCode::PageUp => self.step(-page),
             KeyCode::Home => self.step(isize::MIN / 2),
             KeyCode::End => self.step(isize::MAX / 2),
+            KeyCode::Char('O')
+                if self.focus == Focus::Functions
+                    && self
+                        .browser
+                        .as_ref()
+                        .is_some_and(|browser| browser.catalog.is_elf_structure()) =>
+            {
+                self.open_browser_record()
+            }
+            KeyCode::Char('D')
+                if self.focus == Focus::Functions
+                    && self
+                        .browser
+                        .as_ref()
+                        .is_some_and(|browser| browser.catalog.is_elf_structure()) =>
+            {
+                self.open_browser_disassembly()
+            }
             KeyCode::Enter if self.focus == Focus::Functions && self.browser.is_some() => {
                 self.open_browser_selection()
             }
@@ -3194,6 +3350,65 @@ mod tests {
         app_with(&code, 0x1000)
     }
 
+    fn elf_app() -> App {
+        let bytes = crate::formats::fixture::elf_with_plt_call();
+        let bin = crate::formats::analyze("fixture.elf", &bytes).unwrap();
+        let db = Db::default();
+        let an = engine::analyze(&bin, &bytes, 100_000, &db);
+        let sinks = ranked_sinks(&an, &bin, &bytes);
+        let strings = listing::string_map(&bin, &bytes, engine::display_base(&bin));
+        App::new(bin, bytes, db, an, sinks, strings, None, "elf".into())
+    }
+
+    #[test]
+    fn elf_catalogs_open_real_file_offsets_and_restore_static_history() {
+        let mut app = elf_app();
+        let origin = app.navigation_location().unwrap();
+        app.execute_command("headers");
+        assert_eq!(
+            app.browser.as_ref().unwrap().catalog,
+            browser::Catalog::ElfHeaders
+        );
+        assert_eq!(app.browser.as_ref().unwrap().rows[0].label, "EI_MAG0");
+        app.open_browser_selection();
+        assert!(app.raw_file);
+        assert_eq!(app.cur, Some(0));
+        assert!(matches!(
+            app.lines.first(),
+            Some(Line::Data { addr: 0, .. })
+        ));
+        assert_eq!(app.cursor_addr(), None);
+        app.page_raw_file(true);
+        assert_eq!(app.cur, Some(512));
+        assert!(app.raw_file);
+        app.back();
+        assert_eq!(app.cur, Some(0));
+        app.back();
+        assert_eq!(app.navigation_location().unwrap(), origin);
+
+        app.execute_command("segments");
+        assert!(!app.browser.as_ref().unwrap().rows.is_empty());
+        app.open_browser_record();
+        assert!(app.raw_file);
+        assert_eq!(
+            app.cur,
+            app.browser.as_ref().unwrap().rows[0]
+                .record_offset
+                .map(|offset| offset.get())
+        );
+    }
+
+    #[test]
+    fn elf_catalog_commands_reject_non_elf_without_changing_navigation() {
+        let mut app = two_functions();
+        app.bin.format = Format::Pe;
+        let origin = app.navigation_location().unwrap();
+        app.execute_command("headers");
+        assert!(app.status.contains("requires an ELF file"));
+        assert!(app.browser.is_none());
+        assert_eq!(app.navigation_location().unwrap(), origin);
+    }
+
     #[test]
     fn assembly_patch_stages_reanalyzes_and_restores_original_bytes() {
         // mov eax, 1; ret -> xor eax, eax; nop; nop; nop; ret
@@ -3451,6 +3666,12 @@ mod tests {
     fn adaptive_panes_share_hit_testing_and_keyboard_controls() {
         use ratatui::layout::Rect;
         let mut app = two_functions();
+        assert_eq!(
+            app.panes(Rect::new(0, 0, 160, 40)).references.width,
+            0,
+            "an empty unfocused reference pane should not steal width"
+        );
+        app.focus = Focus::Xrefs;
         for (width, height) in [(100, 30), (160, 40)] {
             app.dims = (width, height);
             let panes = app.panes(Rect::new(0, 0, width, height));
@@ -3475,6 +3696,7 @@ mod tests {
             assert!(app.pane_at(width, height).is_none());
             assert!(app.pane_at(0, 0).is_none());
         }
+        app.focus = Focus::Functions;
         app.execute_command("focus functions");
         let before = app.pane_settings.left_width;
         app.execute_command("widen");
@@ -3495,6 +3717,29 @@ mod tests {
         app.execute_command("focus references");
         app.execute_command("narrow");
         assert_eq!(app.pane_settings.reference_width, 28);
+        app.execute_command("focus listing");
+        app.pane_settings.functions = true;
+        app.pane_settings.references = true;
+        let left_before = app.pane_settings.left_width;
+        app.on_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
+        assert_eq!(
+            app.pane_settings.left_width,
+            left_before - 4,
+            "growing the listing takes width from a visible side pane"
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('-'), KeyModifiers::NONE));
+        assert_eq!(app.pane_settings.left_width, left_before);
+        app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        let zoomed = app.panes(Rect::new(0, 0, 160, 40));
+        assert_eq!(zoomed.listing.width, 160);
+        assert_eq!(zoomed.functions.width, 0);
+        assert_eq!(zoomed.references.width, 0);
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let switched = app.panes(Rect::new(0, 0, 160, 40));
+        assert_eq!(app.focus, Focus::Xrefs);
+        assert_eq!(switched.references.width, 160);
+        app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert!(app.pane_settings.zoom.is_none());
         app.execute_command("focus listing");
         app.execute_command("close");
         assert!(app.status.contains("listing stays open"));
@@ -4410,6 +4655,9 @@ mod tests {
     #[test]
     fn the_interface_renders() {
         let mut app = two_functions();
+        // Empty secondary panes collapse during normal work, but explicitly
+        // focusing one must still make it available and render it.
+        app.focus = Focus::Xrefs;
         let out = rendered(&mut app, 110, 30);
         assert!(out.contains("functions"), "the function list is drawn");
         assert!(out.contains("entry"), "and lists what was recovered");
@@ -4686,15 +4934,17 @@ mod tests {
     fn a_click_focuses_that_pane_and_selects_the_row() {
         let mut app = data_ref_app();
         app.dims = (110, 30);
+        // Explicit focus temporarily reveals an empty adaptive pane. Check it
+        // before moving focus away, which intentionally collapses it again.
+        app.focus = Focus::Xrefs;
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 100, 26));
+        assert_eq!(app.focus, Focus::Xrefs);
+
         // A click in the left pane lands on the function list; with a single
         // recovered function the row index clamps to it.
         app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 5, 4));
         assert_eq!(app.focus, Focus::Functions);
         assert_eq!(app.selected_addr(), Some(0x1000));
-
-        // A click in the bottom-right corner lands in the xrefs pane.
-        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 60, 26));
-        assert_eq!(app.focus, Focus::Xrefs);
     }
 
     // ── splash ──

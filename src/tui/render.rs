@@ -261,7 +261,13 @@ fn catalog(f: &mut Frame, area: Rect, app: &App, browser: &super::browser::Brows
             let address = row
                 .address
                 .map(|value| format!("VA {:x}", value.get()))
-                .unwrap_or_else(|| "VA unresolved".into());
+                .unwrap_or_else(|| {
+                    if row.file_offset.is_some() {
+                        "FILE".into()
+                    } else {
+                        "VA unresolved".into()
+                    }
+                });
             let offset = row
                 .file_offset
                 .map(|value| format!(" OFF {:x}", value.get()))
@@ -493,14 +499,24 @@ fn listing(f: &mut Frame, area: Rect, app: &App, view: &super::ListingViewRef) {
         return;
     }
     let focused = view.focused;
-    let title = match view.cur {
-        Some(a) => format!(
-            "{} @ 0x{:x}{}",
-            app.an.label(a),
-            a + app.an.display_base,
-            position(view.cursor, view.lines.len())
-        ),
-        None => "listing".into(),
+    let title = if view.raw_file {
+        match view.cur {
+            Some(offset) => format!(
+                "raw file @ OFF 0x{offset:x}{}",
+                position(view.cursor, view.lines.len())
+            ),
+            None => "raw file".into(),
+        }
+    } else {
+        match view.cur {
+            Some(a) => format!(
+                "{} @ 0x{:x}{}",
+                app.an.label(a),
+                a + app.an.display_base,
+                position(view.cursor, view.lines.len())
+            ),
+            None => "listing".into(),
+        }
     };
 
     let items: Vec<ListItem> = view
@@ -513,7 +529,11 @@ fn listing(f: &mut Frame, area: Rect, app: &App, view: &super::ListingViewRef) {
             ))),
             Line::Data { addr, text } => ListItem::new(TLine::from(vec![
                 Span::styled(
-                    format!("{:012x}  ", addr + app.an.display_base),
+                    if view.raw_file {
+                        format!("OFF {:08x}  ", addr)
+                    } else {
+                        format!("{:012x}  ", addr + app.an.display_base)
+                    },
                     Style::default().fg(faint()),
                 ),
                 Span::styled(text.clone(), Style::default().fg(muted())),
@@ -1199,6 +1219,8 @@ fn footer_hints(focus: Focus, width: u16) -> String {
     };
     for hint in [
         " | Tab/S-Tab panes",
+        " | +/- size",
+        " | z zoom",
         enter,
         " | Backspace back",
         " | g goto",
@@ -1227,10 +1249,11 @@ fn help(f: &mut Frame, area: Rect) {
         "  :history       browse/filter saved past and forward view locations",
         "  :focus PANE    functions, listing, references (reveals closed pane)",
         "  :close         close focused side pane; :widen/:narrow adjust width",
+        "  + / -          grow / shrink focused pane; z maximize / restore",
         "  :              command mode; Tab completes, Up/Down recalls commands",
         "                 functions, function NAME, goto VA, cfg, disasm, decompile",
         "                 xrefs, callers, callees, types, rename NAME, comment TEXT, help",
-        "                 imports, exports, strings, sections; / filters catalog",
+        "                 catalogs: imports exports strings sections; ELF headers segments section-headers",
         "  b              toggle local bookmark; :bookmarks lists saved locations",
         "",
         "  /              filter the function list, or search the code when the",

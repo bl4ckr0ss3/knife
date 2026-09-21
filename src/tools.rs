@@ -72,6 +72,12 @@ pub fn catalog() -> Vec<ReadTool> {
         tool("iocs", "Indicators of compromise extracted from strings: URLs, hosts, IPs, paths, registry keys.", json!({}), &[]),
         tool("imports", "Imported functions the binary calls out to.", json!({}), &[]),
         tool("exports", "Functions the binary exports.", json!({}), &[]),
+        tool(
+            "elf_structure",
+            "Deterministic ELF header, program-header, or section-header records with on-disk byte ranges.",
+            json!({"view": {"type": "string", "enum": ["header", "segments", "section_headers"]}}),
+            &["view"],
+        ),
         tool("capabilities", "Behavioural capabilities inferred from imports/exports, grouped by category.", json!({}), &[]),
         tool("hardening", "Exploit-mitigation posture: ASLR, DEP/NX, stack canary, CFG, RELRO, and more.", json!({}), &[]),
         tool("triage", "Malware-triage verdict and the signals behind it.", json!({}), &[]),
@@ -107,6 +113,7 @@ pub fn dispatch(sess: &Session, name: &str, args: &Value) -> Result<Value> {
         "iocs" => Ok(iocs(sess)),
         "imports" => Ok(imports(sess)),
         "exports" => Ok(exports(sess)),
+        "elf_structure" => elf_structure(sess, args),
         "capabilities" => Ok(capabilities_tool(sess)),
         "hardening" => serde_json::to_value(hardening::run(&sess.bin)).map_err(Into::into),
         "triage" => Ok(triage_tool(sess)),
@@ -433,6 +440,31 @@ fn exports(sess: &Session) -> Value {
     json!({ "count": sess.bin.exports.len(), "exports": sess.bin.exports.iter().take(ROW_LIMIT).collect::<Vec<_>>() })
 }
 
+fn elf_structure(sess: &Session, args: &Value) -> Result<Value> {
+    let view = args
+        .get("view")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("elf_structure requires view"))?;
+    let (report, layout) = crate::api::elf_headers::inspect_with_layout(&sess.bytes)?;
+    match view {
+        "header" => Ok(json!({
+            "header": report.header,
+            "fields": layout.header_fields,
+        })),
+        "segments" => Ok(json!({
+            "segments": report.segments,
+            "locations": layout.programs,
+        })),
+        "section_headers" => Ok(json!({
+            "sections": report.sections,
+            "locations": layout.sections,
+        })),
+        other => Err(anyhow!(
+            "unknown ELF structure view '{other}'; expected header, segments, or section_headers"
+        )),
+    }
+}
+
 fn capabilities_tool(sess: &Session) -> Value {
     let caps = capabilities::matches(
         sess.bin
@@ -605,5 +637,35 @@ mod tests {
         for t in catalog() {
             assert!(seen.insert(t.name), "duplicate tool name {}", t.name);
         }
+    }
+
+    #[test]
+    fn elf_structure_tool_uses_the_shared_deterministic_report() {
+        let root = std::env::temp_dir().join(format!(
+            "knife-elf-tool-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("fixture.elf");
+        let database = root.join("fixture.json");
+        std::fs::write(&target, crate::formats::fixture::elf_with_plt_call()).unwrap();
+        let session = Session::open(
+            target.to_str().unwrap(),
+            database.to_str(),
+            100_000,
+            "ELF tool test",
+        )
+        .unwrap();
+        for (view, key) in [
+            ("header", "fields"),
+            ("segments", "segments"),
+            ("section_headers", "sections"),
+        ] {
+            let value = dispatch(&session, "elf_structure", &json!({"view": view})).unwrap();
+            assert!(value.get(key).is_some(), "{view}: {value}");
+        }
+        assert!(dispatch(&session, "elf_structure", &json!({"view": "invented"})).is_err());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -69,7 +69,7 @@ A client works on one binary at a time, so the server remembers which one.
 After a target is bound, `file` is optional on every tool. With nothing bound
 and no `file` argument, the call fails and says how to bind one.
 
-The analysis is cached per target, so thirty calls against one binary run the
+The analysis is cached per target, so repeated calls against one binary run the
 engine once.
 
 ## Tools
@@ -100,6 +100,7 @@ engine once.
 | `strings` | string literals matching a query, with reference counts |
 | `iocs` | URLs, hosts, IPs, paths and registry keys pulled from strings |
 | `imports` / `exports` | what the binary calls out to, and what it offers |
+| `elf_structure` | ELF header, program-header, or section-header records with exact file ranges |
 | `capabilities` | behaviour inferred from imports and exports, by category |
 | `driver_report` | Windows-driver / BYOVD surface: devices, IRP dispatch, decoded IOCTLs |
 | `read_bytes` | a hex+ascii dump at a virtual address |

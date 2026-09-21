@@ -25,6 +25,7 @@ pub enum Command {
     Close,
     Widen,
     Narrow,
+    Zoom,
     Reload,
     Split,
     Only,
@@ -41,6 +42,9 @@ pub const NAMES: &[&str] = &[
     "exports",
     "strings",
     "sections",
+    "headers",
+    "segments",
+    "section-headers",
     "types",
     "xrefs",
     "callers",
@@ -62,6 +66,7 @@ pub const NAMES: &[&str] = &[
     "close",
     "widen",
     "narrow",
+    "zoom",
     "reload",
     "split",
     "only",
@@ -158,6 +163,10 @@ impl super::App {
                 }
             }
             Command::Comment(text) => {
+                if self.raw_file {
+                    self.status = "raw file offsets cannot be annotated as image addresses".into();
+                    return;
+                }
                 if let Some(address) = self.cursor_addr().or(self.cur) {
                     self.commit_with_context(Ask::Note, address, text, None, None);
                 } else {
@@ -166,6 +175,10 @@ impl super::App {
             }
             Command::Search(text) => self.search_listing(text),
             Command::Bookmark => {
+                if self.raw_file {
+                    self.status = "raw file offsets cannot be bookmarked as image addresses".into();
+                    return;
+                }
                 let Some(address) = self.cursor_addr().or(self.cur) else {
                     self.status = "select an address before bookmarking".into();
                     return;
@@ -194,6 +207,7 @@ impl super::App {
             Command::Close => self.close_pane(),
             Command::Widen => self.resize_pane(4),
             Command::Narrow => self.resize_pane(-4),
+            Command::Zoom => self.toggle_pane_zoom(),
             Command::Forward => self.forward(),
             Command::NextFunction | Command::PreviousFunction => {
                 let forward = command == Command::NextFunction;
@@ -254,6 +268,9 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "search" => required().map(Command::Search),
         "functions" => no_args(Command::Functions),
         "sections" => no_args(Command::Catalog(super::browser::Catalog::Sections)),
+        "headers" => no_args(Command::Catalog(super::browser::Catalog::ElfHeaders)),
+        "segments" => no_args(Command::Catalog(super::browser::Catalog::ElfSegments)),
+        "section-headers" => no_args(Command::Catalog(super::browser::Catalog::ElfSectionHeaders)),
         "bookmark" => no_args(Command::Bookmark),
         "bookmarks" => no_args(Command::Catalog(super::browser::Catalog::Bookmarks)),
         "imports" => no_args(Command::Catalog(super::browser::Catalog::Imports)),
@@ -274,6 +291,7 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "close" => no_args(Command::Close),
         "widen" => no_args(Command::Widen),
         "narrow" => no_args(Command::Narrow),
+        "zoom" => no_args(Command::Zoom),
         "reload" => no_args(Command::Reload),
         "split" => no_args(Command::Split),
         "only" => no_args(Command::Only),
@@ -375,6 +393,8 @@ mod tests {
         );
         assert!(parse("split now").is_err());
         assert!(complete("spl").contains(&"split"));
+        assert_eq!(parse("zoom").unwrap(), Command::Zoom);
+        assert!(parse("zoom now").is_err());
     }
 
     #[test]
@@ -395,6 +415,22 @@ mod tests {
         assert!(parse("").is_err());
         assert_eq!(complete("de"), vec!["decompile"]);
         assert!(complete("goto de").is_empty());
+        assert_eq!(
+            parse("headers"),
+            Ok(Command::Catalog(super::super::browser::Catalog::ElfHeaders))
+        );
+        assert_eq!(
+            parse("segments"),
+            Ok(Command::Catalog(
+                super::super::browser::Catalog::ElfSegments
+            ))
+        );
+        assert_eq!(
+            parse("section-headers"),
+            Ok(Command::Catalog(
+                super::super::browser::Catalog::ElfSectionHeaders
+            ))
+        );
     }
 
     #[test]

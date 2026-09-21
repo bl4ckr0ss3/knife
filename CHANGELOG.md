@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.8.1
+
+- ELF structure inspection now covers the file header, every program header,
+  and every section header through the shared analysis API. `knife headers`
+  prints the same deterministic report as the TUI and MCP, including raw
+  values, decoded meanings, file offsets, entry sizes, and mapped addresses.
+- The TUI adds filterable `:headers`, `:segments`, and `:section-headers`
+  catalogs. Enter opens the selected on-disk bytes, `O` opens the containing
+  table record, and `D` follows a mapped address into disassembly; raw windows
+  remain explicitly labelled `OFF` so file offsets cannot be mistaken for
+  virtual addresses.
+- Pane control is keyboard-first: Tab and Shift+Tab move focus, `+` and `-`
+  resize the focused pane, and `z` maximizes or restores it. Empty reference
+  panes collapse automatically, while explicit focus reveals them again.
+- The README demo now exercises the real ELF structure and adaptive-pane
+  workflow.
+
 ## v1.8.0
 
 - Removed YARA. The `yara` subcommand, `info --rules`, and the yara-x

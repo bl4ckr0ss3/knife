@@ -243,6 +243,109 @@ pub struct HexRowSummary {
     pub ascii: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileHexQuery {
+    pub file_offset: FileOffset,
+    pub length: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileMapping {
+    pub address: StaticVa,
+    pub region: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileHexRowSummary {
+    pub file_offset: FileOffset,
+    pub byte_length: u64,
+    pub hex: String,
+    pub ascii: String,
+    /// All image mappings for this byte. Overlapping sections are retained
+    /// rather than forcing one arbitrary virtual-address interpretation.
+    pub mappings: Vec<FileMapping>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileHexWindow {
+    pub start: FileOffset,
+    pub rows: Vec<FileHexRowSummary>,
+    pub previous: Option<FileOffset>,
+    pub next: Option<FileOffset>,
+}
+
+/// Read an on-disk byte window without requiring the offset to be mapped.
+///
+/// This is intentionally separate from the virtual-address hex query. Front
+/// ends can therefore label and navigate the two address spaces honestly.
+pub fn file_hex_window(
+    binary: &Binary,
+    bytes: &[u8],
+    base: u64,
+    query: FileHexQuery,
+) -> Result<FileHexWindow> {
+    let requested = query.length.clamp(16, 65_536);
+    let start = usize::try_from(query.file_offset.get())
+        .map_err(|_| anyhow!("file offset is too large for this host"))?;
+    if start >= bytes.len() {
+        return Err(anyhow!("file offset is outside the file"));
+    }
+    let end = start.saturating_add(requested).min(bytes.len());
+    let mut rows = Vec::new();
+    for cursor in (start..end).step_by(16) {
+        let row_end = cursor.saturating_add(16).min(end);
+        let chunk = &bytes[cursor..row_end];
+        let offset = u64::try_from(cursor)
+            .map(FileOffset)
+            .map_err(|_| anyhow!("file offset overflow"))?;
+        let mappings = binary
+            .sections
+            .iter()
+            .filter_map(|section| {
+                let section_end = section.file_off.checked_add(section.file_size)?;
+                let location = offset.get();
+                if location < section.file_off || location >= section_end {
+                    return None;
+                }
+                let relative = location.checked_sub(section.file_off)?;
+                let address = base.checked_add(section.vaddr)?.checked_add(relative)?;
+                Some(FileMapping {
+                    address: StaticVa(address),
+                    region: section.name.clone(),
+                })
+            })
+            .collect();
+        rows.push(FileHexRowSummary {
+            file_offset: offset,
+            byte_length: chunk.len() as u64,
+            hex: chunk
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            ascii: chunk
+                .iter()
+                .map(|byte| {
+                    if (0x20..=0x7e).contains(byte) {
+                        *byte as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect(),
+            mappings,
+        });
+    }
+    let next = (end < bytes.len()).then_some(FileOffset(end as u64));
+    let previous = (start != 0).then(|| FileOffset(start.saturating_sub(requested) as u64));
+    Ok(FileHexWindow {
+        start: query.file_offset,
+        rows,
+        previous,
+        next,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OverviewBucketSummary {
     pub file_offset: FileOffset,

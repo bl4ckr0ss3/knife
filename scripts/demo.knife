@@ -1,4 +1,5 @@
-# Real TUI frames: functions -> strings -> sections -> imports -> history.
+# Real ELF TUI frames: functions -> headers -> raw bytes -> segments ->
+# section headers -> strings -> split comparison.
 # No simulated loading animation or vulnerability verdicts.
 size 110 30
 hold 24
@@ -6,32 +7,39 @@ key down 3
 key enter
 hold 24
 key :
-type strings
-key enter
-key /
-type 7-Zip
+type headers
 key enter
 hold 30
-key down 3
+key down 4
+key enter
+hold 30
+key z
+hold 24
+key z
+hold 12
+key backspace
+key + 2
 hold 18
 key :
-type sections
+type segments
 key enter
 hold 30
 key down
 key enter
 hold 24
+key backspace
 key :
-type imports
+type section-headers
 key enter
 hold 30
 key down 2
+key enter
+hold 24
+key backspace
 key :
-type history
+type strings
 key enter
 hold 30
-key enter
-hold 18
 key :
 type functions
 key enter

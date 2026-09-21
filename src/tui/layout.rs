@@ -8,6 +8,7 @@ pub struct PaneSettings {
     pub references: bool,
     pub left_width: u16,
     pub reference_width: u16,
+    pub zoom: Option<Focus>,
 }
 
 impl Default for PaneSettings {
@@ -17,6 +18,7 @@ impl Default for PaneSettings {
             references: true,
             left_width: 38,
             reference_width: 32,
+            zoom: None,
         }
     }
 }
@@ -42,6 +44,33 @@ impl App {
                 Constraint::Length(1),
             ])
             .split(area);
+        if self.pane_settings.zoom.is_some() {
+            // Focus changes while zoomed (Tab, mouse, or :focus) switch the
+            // maximized pane instead of leaving focus on an invisible pane.
+            let zoom = self.focus;
+            let content = rows[1];
+            return Panes {
+                header: rows[0],
+                footer: rows[2],
+                functions: if zoom == Focus::Functions {
+                    content
+                } else {
+                    Rect::default()
+                },
+                listing: if zoom == Focus::Listing {
+                    content
+                } else {
+                    Rect::default()
+                },
+                listing_right: Rect::default(),
+                references: if zoom == Focus::Xrefs && !self.split {
+                    content
+                } else {
+                    Rect::default()
+                },
+                detail: Rect::default(),
+            };
+        }
         let left = self.pane_settings.functions || self.focus == Focus::Functions;
         let detail_height = match self.left {
             LeftView::Sinks if !self.sinks.is_empty() => 6,
@@ -78,7 +107,10 @@ impl App {
                 detail: center[1],
             };
         }
-        let refs = self.pane_settings.references || self.focus == Focus::Xrefs;
+        // An empty reference pane is noise, especially in raw-file views.
+        // Keep it collapsed until it has rows or the user focuses it.
+        let refs = (self.pane_settings.references && !self.xref_rows().is_empty())
+            || self.focus == Focus::Xrefs;
         let wide = area.width >= 132;
         let cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -112,6 +144,7 @@ impl App {
     }
 
     pub fn close_pane(&mut self) {
+        self.pane_settings.zoom = None;
         match self.focus {
             Focus::Functions => self.pane_settings.functions = false,
             Focus::Xrefs => self.pane_settings.references = false,
@@ -129,15 +162,62 @@ impl App {
     }
 
     pub fn resize_pane(&mut self, delta: i16) {
-        let width = match self.focus {
-            Focus::Functions => &mut self.pane_settings.left_width,
-            Focus::Xrefs => &mut self.pane_settings.reference_width,
+        let applied = match self.focus {
+            Focus::Functions => {
+                self.pane_settings.left_width = self
+                    .pane_settings
+                    .left_width
+                    .saturating_add_signed(delta)
+                    .clamp(20, 80);
+                self.pane_settings.left_width
+            }
+            Focus::Xrefs => {
+                self.pane_settings.reference_width = self
+                    .pane_settings
+                    .reference_width
+                    .saturating_add_signed(delta)
+                    .clamp(20, 80);
+                self.pane_settings.reference_width
+            }
             Focus::Listing => {
-                self.status = "focus functions or references to resize its width".into();
-                return;
+                // Growing the center means taking equal space from the side
+                // panes; shrinking it returns space to both.
+                let side_delta = delta.saturating_neg();
+                if self.pane_settings.functions {
+                    self.pane_settings.left_width = self
+                        .pane_settings
+                        .left_width
+                        .saturating_add_signed(side_delta)
+                        .clamp(20, 80);
+                }
+                if self.pane_settings.references {
+                    self.pane_settings.reference_width = self
+                        .pane_settings
+                        .reference_width
+                        .saturating_add_signed(side_delta)
+                        .clamp(20, 80);
+                }
+                0
             }
         };
-        *width = width.saturating_add_signed(delta).clamp(20, 80);
-        self.status = "pane width updated; reference width applies in wide terminals".into();
+        self.status = if self.focus == Focus::Listing {
+            "listing width updated by resizing visible side panes".into()
+        } else {
+            format!("focused pane width: {applied} columns")
+        };
+    }
+
+    pub fn toggle_pane_zoom(&mut self) {
+        if self.pane_settings.zoom.is_some() {
+            self.pane_settings.zoom = None;
+            self.status = "restored pane layout".into();
+            return;
+        }
+        if self.focus == Focus::Xrefs && self.split {
+            self.status = "references are unavailable while listings are split".into();
+            return;
+        }
+        self.pane_settings.zoom = Some(self.focus);
+        self.status = "focused pane maximized; z restores the layout".into();
     }
 }
