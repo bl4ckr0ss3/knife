@@ -458,6 +458,7 @@ pub struct App {
     pub future: Vec<NavigationLocation>,
     pub status: String,
     pub help: bool,
+    pub help_scroll: usize,
     pub quit: bool,
     /// Cursor into the cross-reference list (a separate list pane, so it has a
     /// selection of its own like the other two).
@@ -559,6 +560,7 @@ impl App {
             future: Vec::new(),
             status: String::new(),
             help: false,
+            help_scroll: 0,
             quit: false,
             xsel: 0,
             reference_anchor: None,
@@ -2454,7 +2456,28 @@ impl App {
         }
 
         if self.help {
-            self.help = false;
+            let max = render::help_max_scroll(self.dims.0, self.dims.1);
+            let page = render::help_page_size(self.dims.0, self.dims.1);
+            self.help_scroll = self.help_scroll.min(max);
+            match key.code {
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.quit = true
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.help_scroll = self.help_scroll.saturating_add(1).min(max)
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1)
+                }
+                KeyCode::PageDown => {
+                    self.help_scroll = self.help_scroll.saturating_add(page).min(max)
+                }
+                KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(page),
+                KeyCode::Home => self.help_scroll = 0,
+                KeyCode::End => self.help_scroll = max,
+                KeyCode::Esc | KeyCode::Char('?') => self.help = false,
+                _ => {}
+            }
             return;
         }
 
@@ -2465,7 +2488,10 @@ impl App {
             KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => self.forward(),
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
-            KeyCode::Char('?') => self.help = true,
+            KeyCode::Char('?') => {
+                self.help_scroll = 0;
+                self.help = true;
+            }
             KeyCode::Char('b') => self.execute_command("bookmark"),
             KeyCode::Char('+') | KeyCode::Char('=') => self.resize_pane(4),
             KeyCode::Char('-') => self.resize_pane(-4),
@@ -2484,18 +2510,17 @@ impl App {
                     self.cycle_split_focus(reverse);
                     return;
                 }
+                let references = self.pane_settings.references && !self.xref_rows().is_empty();
                 self.focus = if reverse {
                     match self.focus {
                         Focus::Listing if self.pane_settings.functions => Focus::Functions,
-                        Focus::Listing | Focus::Functions if self.pane_settings.references => {
-                            Focus::Xrefs
-                        }
+                        Focus::Listing | Focus::Functions if references => Focus::Xrefs,
                         _ => Focus::Listing,
                     }
                 } else {
                     match self.focus {
                         Focus::Functions => Focus::Listing,
-                        Focus::Listing if self.pane_settings.references => Focus::Xrefs,
+                        Focus::Listing if references => Focus::Xrefs,
                         Focus::Listing | Focus::Xrefs if self.pane_settings.functions => {
                             Focus::Functions
                         }
@@ -2870,8 +2895,17 @@ impl App {
         if !inner.contains(point) {
             return None;
         }
-        let mut idx = usize::from(row - inner.y)
-            + selection.saturating_sub(usize::from(inner.height).saturating_sub(1));
+        let viewport = match focus {
+            Focus::Functions if self.browser.is_none() && self.left == LeftView::Functions => {
+                render::viewport_start(selection, len, usize::from(inner.height))
+            }
+            Focus::Listing if !self.graph => {
+                render::viewport_start(selection, len, usize::from(inner.height))
+            }
+            Focus::Xrefs => render::viewport_start(selection, len, usize::from(inner.height)),
+            _ => selection.saturating_sub(usize::from(inner.height).saturating_sub(1)),
+        };
+        let mut idx = usize::from(row - inner.y) + viewport;
         if focus == Focus::Listing && self.graph {
             let inspector_height = if inner.height >= 9 { 6 } else { 0 };
             idx = self
@@ -2902,6 +2936,17 @@ impl App {
     }
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
+        if self.help {
+            let max = render::help_max_scroll(self.dims.0, self.dims.1);
+            match m.kind {
+                MouseEventKind::ScrollUp => self.help_scroll = self.help_scroll.saturating_sub(1),
+                MouseEventKind::ScrollDown => {
+                    self.help_scroll = self.help_scroll.saturating_add(1).min(max)
+                }
+                _ => {}
+            }
+            return;
+        }
         self.activate_column_at(m.column, m.row);
         match m.kind {
             MouseEventKind::ScrollUp => self.step(-1),
@@ -2912,15 +2957,18 @@ impl App {
                 };
                 self.focus = focus;
                 if focus == Focus::Functions && self.browser.is_some() {
+                    let panes =
+                        self.panes(ratatui::layout::Rect::new(0, 0, self.dims.0, self.dims.1));
+                    let inner = panes.functions.inner(ratatui::layout::Margin::new(1, 1));
                     if let Some(browser) = &mut self.browser {
-                        let height = usize::from(self.dims.1.saturating_sub(4))
-                            .div_ceil(2)
-                            .max(1);
-                        let start = browser
-                            .selection
-                            .saturating_sub(height / 2)
-                            .min(browser.visible.len().saturating_sub(height));
-                        browser.selection = (start + usize::from(m.row.saturating_sub(2)) / 2)
+                        let height = usize::from(inner.height).div_ceil(2).max(1);
+                        let start = render::viewport_start(
+                            browser.selection,
+                            browser.visible.len(),
+                            height,
+                        );
+                        browser.selection = (start
+                            + usize::from(m.row.saturating_sub(inner.y)) / 2)
                             .min(browser.visible.len().saturating_sub(1));
                     }
                     self.open_browser_selection();
@@ -3736,8 +3784,10 @@ mod tests {
         assert_eq!(zoomed.references.width, 0);
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let switched = app.panes(Rect::new(0, 0, 160, 40));
-        assert_eq!(app.focus, Focus::Xrefs);
-        assert_eq!(switched.references.width, 160);
+        assert_eq!(app.focus, Focus::Functions);
+        assert_eq!(switched.functions.width, 160);
+        app.execute_command("focus references");
+        assert_eq!(app.panes(Rect::new(0, 0, 160, 40)).references.width, 160);
         app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
         assert!(app.pane_settings.zoom.is_none());
         app.execute_command("focus listing");
@@ -4613,6 +4663,10 @@ mod tests {
                 let mut app = two_functions();
                 app.pane_settings.functions = functions;
                 app.pane_settings.references = references;
+                if references {
+                    app.refview = RefView::From;
+                    assert!(!app.xref_rows().is_empty());
+                }
                 let current = app.cur;
                 let mut visible = vec![Focus::Listing];
                 if functions {
@@ -4720,6 +4774,7 @@ mod tests {
     fn the_help_overlay_and_prompt_render() {
         let mut app = two_functions();
         app.help = true;
+        app.help_scroll = render::help_max_scroll(110, 30);
         assert!(rendered(&mut app, 110, 30).contains("re-analyse"));
 
         app.help = false;
@@ -4733,6 +4788,112 @@ mod tests {
         let out = rendered(&mut app, 110, 30);
         assert!(out.contains("name:"), "the prompt shows what it wants");
         assert!(out.contains("parse_header"), "and what has been typed");
+    }
+
+    #[test]
+    fn help_scrolls_in_a_short_terminal_without_moving_the_workspace() {
+        let mut app = two_functions();
+        app.dims = (40, 10);
+        let before = app.cur;
+        app.on_key(KeyEvent::from(KeyCode::Char('?')));
+        let first = rendered(&mut app, 40, 10);
+        assert!(first.contains("keys"));
+        assert!(first.contains("Esc/? close"));
+        app.on_key(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(app.help_scroll, render::help_page_size(40, 10));
+        app.on_key(KeyEvent::from(KeyCode::End));
+        assert_eq!(app.help_scroll, render::help_max_scroll(40, 10));
+        let last = rendered(&mut app, 40, 10);
+        assert_ne!(first, last);
+        app.dims = (80, 24);
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        assert!(app.help_scroll <= render::help_max_scroll(80, 24));
+        app.dims = (40, 10);
+        app.on_key(KeyEvent::from(KeyCode::Home));
+        assert_eq!(app.help_scroll, 0);
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 2, 2));
+        assert_eq!(app.help_scroll, 1);
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(!app.help);
+        assert!(!app.quit);
+        assert_eq!(app.cur, before);
+    }
+
+    #[test]
+    fn large_lists_render_the_selected_window_and_mouse_uses_that_window() {
+        let mut app = two_functions();
+        app.dims = (100, 20);
+        app.an.functions = (0..50_000)
+            .map(|index| engine::Function {
+                addr: 0x1000 + index,
+                name: format!("fn_{index:05}"),
+                blocks: Vec::new(),
+                size: 1,
+                incoming: 0,
+                calls: Vec::new(),
+                named: false,
+                tables: Vec::new(),
+            })
+            .collect();
+        app.order = (0..50_000).collect();
+        app.sel = 49_999;
+        app.focus = Focus::Functions;
+        let output = rendered(&mut app, 100, 20);
+        assert!(output.contains("fn_49999"));
+        assert!(!output.contains("fn_00000"));
+        let panes = app.panes(ratatui::layout::Rect::new(0, 0, 100, 20));
+        let start = render::viewport_start(49_999, 50_000, usize::from(panes.functions.height - 2));
+        assert_eq!(
+            app.pane_at(panes.functions.x + 1, panes.functions.y + 1),
+            Some((Focus::Functions, start))
+        );
+
+        app.lines = (0..10_000)
+            .map(|addr| Line::Data {
+                addr,
+                text: format!("row_{addr:05}"),
+            })
+            .collect();
+        app.raw_file = true;
+        app.cursor = 9_999;
+        app.focus = Focus::Listing;
+        let output = rendered(&mut app, 100, 20);
+        assert!(output.contains("row_09999"));
+        assert!(!output.contains("row_00000"));
+        let panes = app.panes(ratatui::layout::Rect::new(0, 0, 100, 20));
+        let start = render::viewport_start(9_999, 10_000, usize::from(panes.listing.height - 2));
+        assert_eq!(
+            app.pane_at(panes.listing.x + 1, panes.listing.y + 1),
+            Some((Focus::Listing, start))
+        );
+
+        app.pseudo_lines = (0..10_000)
+            .map(|index| crate::analysis::ir::Line {
+                label: false,
+                text: format!("pseudo_{index:05}"),
+            })
+            .collect();
+        app.pseudo = true;
+        app.raw_file = false;
+        let output = rendered(&mut app, 100, 20);
+        assert!(output.contains("pseudo_09999"));
+        assert!(!output.contains("pseudo_00000"));
+        assert_eq!(
+            app.pane_at(panes.listing.x + 1, panes.listing.y + 1),
+            Some((Focus::Listing, start))
+        );
+
+        app.split_clone();
+        app.active_is_left = false;
+        let output = rendered(&mut app, 100, 20);
+        assert!(output.contains("pseudo_09999"));
+        let panes = app.panes(ratatui::layout::Rect::new(0, 0, 100, 20));
+        let start =
+            render::viewport_start(9_999, 10_000, usize::from(panes.listing_right.height - 2));
+        assert_eq!(
+            app.pane_at(panes.listing_right.x + 1, panes.listing_right.y + 1),
+            Some((Focus::Listing, start))
+        );
     }
 
     #[test]
@@ -4774,6 +4935,8 @@ mod tests {
     fn tab_cycles_through_three_panes() {
         let mut app = two_functions();
         app.splash = false;
+        app.refview = RefView::From;
+        assert!(!app.xref_rows().is_empty());
         assert_eq!(app.focus, Focus::Functions);
         for _ in 0..2 {
             app.on_key(KeyEvent::from(KeyCode::Tab));
@@ -4781,6 +4944,42 @@ mod tests {
         assert_eq!(app.focus, Focus::Xrefs);
         app.on_key(KeyEvent::from(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Functions);
+    }
+
+    #[test]
+    fn tab_skips_empty_references_but_explicit_focus_reveals_them() {
+        let mut app = two_functions();
+        assert!(app.xref_rows().is_empty());
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Listing);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Functions);
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.focus, Focus::Listing);
+        app.execute_command("focus references");
+        assert_eq!(app.focus, Focus::Xrefs);
+        assert!(
+            app.panes(ratatui::layout::Rect::new(0, 0, 160, 40))
+                .references
+                .width
+                > 0
+        );
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Functions);
+        app.refview = RefView::From;
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Xrefs);
+    }
+
+    #[test]
+    fn split_view_rejects_focus_on_hidden_references() {
+        let mut app = two_functions();
+        app.split_clone();
+        let before = app.focus;
+        app.execute_command("focus references");
+        assert_eq!(app.focus, before);
+        assert!(app.status.contains("hidden while split"));
     }
 
     #[test]

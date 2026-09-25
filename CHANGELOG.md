@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.8.2
+
+- Help now scrolls and wraps to the terminal width. Arrow keys, Page Up/Down,
+  and Home/End navigate it; Esc or `?` closes it.
+- Function, disassembly, pseudocode, and xref panes format only the visible
+  rows when drawing. Mouse selection uses the same window as the renderer,
+  including near the end of large lists and in split view.
+- Tab skips an empty reference pane. Explicit `:focus references` and xref
+  commands still reveal it; split view rejects focus on its hidden reference
+  pane.
+
 ## v1.8.1
 
 - ELF structure inspection now covers the file header, every program header,

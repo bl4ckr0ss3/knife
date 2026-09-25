@@ -203,6 +203,9 @@ impl super::App {
                 }
             }
             Command::Back => self.back(),
+            Command::Focus(Focus::Xrefs) if self.split => {
+                self.status = "references are hidden while split; :only closes a pane".into();
+            }
             Command::Focus(focus) => self.focus = focus,
             Command::Close => self.close_pane(),
             Command::Widen => self.resize_pane(4),

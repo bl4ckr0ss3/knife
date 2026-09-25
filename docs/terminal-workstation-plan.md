@@ -9,7 +9,10 @@ complete query parity is still stabilization work.
 - Desktop GUI workspace members and GUI-only dependencies removed.
 - Shared typed addresses, navigation, references and analyst annotations.
 - Monochrome TUI, forward/back navigation, catalog filtering and pane controls.
-- ELF header/program-header/section-header inspection in the core and CLI.
+- ELF header/program-header/section-header inspection in the core, CLI, TUI,
+  and MCP.
+- Scrollable help and viewport rendering for large function, listing,
+  pseudocode, and reference views. Tab skips empty references.
 - Reproducible README terminal animation and MP4 via scripts/record-demo.ps1.
 - Background `:reload` that rereads the target from disk, preserving the
   session on failure and following content identity for annotations.
@@ -25,8 +28,9 @@ complete query parity is still stabilization work.
 
 ## Next work
 
-1. Expose ELF headers and segments through TUI views using the shared API.
-2. Improve scrollable help and CLI/MCP query parity.
+1. Check remaining CLI/MCP query parity and document intentional differences.
+2. Dogfood large PE/ELF/Mach-O targets across terminals; prioritize measured
+   navigation or analysis bottlenecks over more pane features.
 
 Decompiler and inferred-type views remain experimental. New capabilities should
 be small, independently testable changes rather than another architecture rewrite.

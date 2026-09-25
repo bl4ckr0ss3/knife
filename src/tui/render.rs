@@ -74,6 +74,18 @@ const FIXED_FUNCTION_COLUMNS: usize = 15;
 /// address. Whatever the pane has left over is split between the two names.
 const FIXED_SINK_COLUMNS: usize = 14;
 
+/// Center the selected row when possible. Renderers and mouse hit testing use
+/// the same window so a click always selects the row drawn beneath it.
+pub(crate) fn viewport_start(selection: usize, total: usize, height: usize) -> usize {
+    selection
+        .saturating_sub(height / 2)
+        .min(total.saturating_sub(height))
+}
+
+fn list_height(area: Rect) -> usize {
+    usize::from(area.height.saturating_sub(2))
+}
+
 pub fn loading(f: &mut Frame, title: &str, elapsed_seconds: u64) {
     let title: String = title
         .chars()
@@ -139,7 +151,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     footer(f, panes.footer, app);
 
     if app.help {
-        help(f, f.area());
+        help(f, f.area(), app);
     }
 }
 
@@ -196,9 +208,13 @@ fn functions(f: &mut Frame, area: Rect, app: &App) {
     let name_w = usize::from(area.width.saturating_sub(3))
         .saturating_sub(FIXED_FUNCTION_COLUMNS)
         .clamp(8, 40);
+    let height = list_height(area);
+    let start = viewport_start(app.sel, app.order.len(), height);
     let items: Vec<ListItem> = app
         .order
         .iter()
+        .skip(start)
+        .take(height)
         .map(|&i| {
             let fun = &app.an.functions[i];
             let here = current == Some(fun.addr);
@@ -230,7 +246,7 @@ fn functions(f: &mut Frame, area: Rect, app: &App) {
 
     let mut state = ListState::default();
     if !app.order.is_empty() {
-        state.select(Some(app.sel));
+        state.select(Some(app.sel - start));
     }
     f.render_stateful_widget(
         List::new(items)
@@ -247,10 +263,7 @@ fn catalog(f: &mut Frame, area: Rect, app: &App, browser: &super::browser::Brows
     let height = usize::from(area.height.saturating_sub(2))
         .div_ceil(2)
         .max(1);
-    let start = browser
-        .selection
-        .saturating_sub(height / 2)
-        .min(browser.visible.len().saturating_sub(height));
+    let start = viewport_start(browser.selection, browser.visible.len(), height);
     let items: Vec<ListItem> = browser
         .visible
         .iter()
@@ -519,9 +532,13 @@ fn listing(f: &mut Frame, area: Rect, app: &App, view: &super::ListingViewRef) {
         }
     };
 
+    let height = list_height(area);
+    let start = viewport_start(view.cursor, view.lines.len(), height);
     let items: Vec<ListItem> = view
         .lines
         .iter()
+        .skip(start)
+        .take(height)
         .map(|l| match l {
             Line::Label { text, .. } => ListItem::new(TLine::from(Span::styled(
                 format!("  {text}:"),
@@ -577,7 +594,7 @@ fn listing(f: &mut Frame, area: Rect, app: &App, view: &super::ListingViewRef) {
 
     let mut state = ListState::default();
     if !view.lines.is_empty() {
-        state.select(Some(view.cursor));
+        state.select(Some(view.cursor - start));
     }
     f.render_stateful_widget(
         List::new(items)
@@ -936,9 +953,13 @@ fn pseudo(f: &mut Frame, area: Rect, app: &App, view: &super::ListingViewRef) {
         None => "pseudocode".into(),
     };
 
+    let height = list_height(area);
+    let start = viewport_start(view.cursor, view.pseudo_lines.len(), height);
     let mut items: Vec<ListItem> = view
         .pseudo_lines
         .iter()
+        .skip(start)
+        .take(height)
         .map(|l| {
             if l.label {
                 // A jump label reads like one; the signature and braces are the
@@ -966,7 +987,7 @@ fn pseudo(f: &mut Frame, area: Rect, app: &App, view: &super::ListingViewRef) {
 
     let mut state = ListState::default();
     if !view.pseudo_lines.is_empty() {
-        state.select(Some(view.cursor.min(view.pseudo_lines.len() - 1)));
+        state.select(Some(view.cursor.min(view.pseudo_lines.len() - 1) - start));
     }
     f.render_stateful_widget(
         List::new(items)
@@ -1120,6 +1141,9 @@ fn xrefs(f: &mut Frame, area: Rect, app: &App) {
     } else {
         " no recovered calls; unresolved indirect calls may exist"
     };
+    let height = list_height(area);
+    let selected_row = app.xsel.min(rows.len().saturating_sub(1));
+    let start = viewport_start(selected_row, rows.len(), height);
     let items: Vec<ListItem> = if rows.is_empty() {
         vec![ListItem::new(TLine::from(Span::styled(
             empty,
@@ -1127,6 +1151,8 @@ fn xrefs(f: &mut Frame, area: Rect, app: &App) {
         )))]
     } else {
         rows.iter()
+            .skip(start)
+            .take(height)
             .map(|row| {
                 ListItem::new(TLine::from(vec![
                     Span::styled(
@@ -1149,7 +1175,7 @@ fn xrefs(f: &mut Frame, area: Rect, app: &App) {
 
     let mut state = ListState::default();
     if !rows.is_empty() {
-        state.select(Some(app.xsel.min(rows.len() - 1)));
+        state.select(Some(selected_row - start));
     }
     f.render_stateful_widget(
         List::new(items)
@@ -1234,9 +1260,7 @@ fn footer_hints(focus: Focus, width: u16) -> String {
     hints
 }
 
-fn help(f: &mut Frame, area: Rect) {
-    let text = vec![
-        "",
+const HELP_LINES: &[&str] = &[
         "  ↑ ↓ / j k      move            Tab/Shift+Tab  next/previous pane",
         "  pgup pgdn      page            home end       first / last",
         "  mouse          wheel scrolls, click picks a pane and an entry",
@@ -1282,24 +1306,78 @@ fn help(f: &mut Frame, area: Rect) {
         "  immediately; staged patches affect analysis but never modify the input;",
         "  they are already on disk when you quit.",
         "",
-        "  any key to dismiss",
+        "  ↑/↓ scroll, PgUp/PgDn page, Home/End jump; Esc or ? closes help",
     ];
-    let w = 74.min(area.width.saturating_sub(4));
-    let h = (text.len() as u16 + 2).min(area.height);
-    let box_area = Rect {
-        x: area.x + (area.width.saturating_sub(w)) / 2,
-        y: area.y + (area.height.saturating_sub(h)) / 2,
-        width: w,
-        height: h,
-    };
+
+fn help_geometry(area: Rect) -> Rect {
+    let width = area.width.saturating_sub(2).min(76);
+    let height = area.height.min(HELP_LINES.len() as u16 + 3);
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
+}
+
+fn help_lines(width: usize) -> Vec<String> {
+    let mut wrapped = Vec::new();
+    for line in HELP_LINES {
+        let mut rest = line.trim_end();
+        if rest.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+        while rest.chars().count() > width {
+            let limit = rest
+                .char_indices()
+                .nth(width)
+                .map_or(rest.len(), |(i, _)| i);
+            let cut = rest[..limit].rfind(' ').filter(|&i| i > 0).unwrap_or(limit);
+            wrapped.push(rest[..cut].trim_end().to_string());
+            rest = rest[cut..].trim_start();
+        }
+        wrapped.push(rest.to_string());
+    }
+    wrapped
+}
+
+pub(crate) fn help_page_size(width: u16, height: u16) -> usize {
+    usize::from(
+        help_geometry(Rect::new(0, 0, width, height))
+            .height
+            .saturating_sub(3),
+    )
+}
+
+pub(crate) fn help_max_scroll(width: u16, height: u16) -> usize {
+    let box_area = help_geometry(Rect::new(0, 0, width, height));
+    help_lines(usize::from(box_area.width.saturating_sub(2)).max(1))
+        .len()
+        .saturating_sub(help_page_size(width, height))
+}
+
+fn help(f: &mut Frame, area: Rect, app: &App) {
+    let box_area = help_geometry(area);
+    let lines = help_lines(usize::from(box_area.width.saturating_sub(2)).max(1));
+    let page = usize::from(box_area.height.saturating_sub(3));
+    let start = app.help_scroll.min(lines.len().saturating_sub(page));
+    let end = (start + page).min(lines.len());
+    let mut content: Vec<TLine> = lines[start..end]
+        .iter()
+        .map(|line| TLine::from(Span::styled(line.clone(), Style::default().fg(muted()))))
+        .collect();
+    content.push(TLine::from(Span::styled(
+        if box_area.width < 42 {
+            "Esc/? close | ↑↓ scroll"
+        } else {
+            "↑↓ scroll  PgUp/PgDn page  Home/End jump  Esc/? close"
+        },
+        Style::default().fg(faint()),
+    )));
     f.render_widget(Clear, box_area);
     f.render_widget(
-        Paragraph::new(
-            text.into_iter()
-                .map(|l| TLine::from(Span::styled(l, Style::default().fg(muted()))))
-                .collect::<Vec<_>>(),
-        )
-        .block(pane("keys", true)),
+        Paragraph::new(content).block(pane(&format!("keys {}/{}", end, lines.len()), true)),
         box_area,
     );
 }

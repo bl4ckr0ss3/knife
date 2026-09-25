@@ -13,7 +13,7 @@ binary. Static only: it reads the bytes on disk and never runs the target.
 ![platforms](https://img.shields.io/badge/platform-linux%20%C2%B7%20macos%20%C2%B7%20windows-informational)
 [![Discord](https://img.shields.io/badge/Discord-join%20the%20server-5865F2?logo=discord&logoColor=white&logoWidth=20)](https://discord.gg/hU5NYVfzd)
 
-<img src="assets/demo.gif" width="990" alt="knife TUI: function navigation, strings, split-view comparison, and history">
+<img src="assets/demo.gif" width="990" alt="knife TUI: ELF structures, raw bytes, pane controls, and split-view comparison">
 
 [Watch the MP4 demo](assets/demo.mp4)
 
@@ -74,13 +74,14 @@ directories first, PE/ELF/Mach-O badges sniffed from the magic bytes, `/`
 filters, Enter opens the workspace, and quitting the workspace returns to the
 explorer (`knife tui` without a file and `knife <dir>` do the same).
 
-`?` shows help, `:` opens command mode. The essentials:
+`?` shows scrollable help (`↑`/`↓`, Page Up/Down, Home/End; `Esc` or `?`
+closes it), and `:` opens command mode. The essentials:
 
 | key | does |
 |---|---|
 | `↵` | open a function, follow the call under the cursor, or jump to a xref |
 | `⌫` | back |
-| `Tab` / `Shift+Tab` | focus the next / previous pane |
+| `Tab` / `Shift+Tab` | focus the next / previous pane, skipping empty xrefs |
 | `+` / `-` | grow / shrink the focused pane |
 | `z` | maximize the focused pane; press again to restore |
 | `g` | goto a symbol; `va:0x..` static VA, `off:0x..` file offset |
@@ -101,6 +102,7 @@ and annotations survive, a failed reload keeps the old session.
 records. Enter opens file-backed bytes, `O` opens the table record, and `D`
 follows a mapped static address into disassembly. File offsets are always
 labelled `OFF`; Knife does not pretend header bytes are virtual addresses.
+`:focus references` or `:xrefs` opens the reference pane even when it is empty.
 Tab completes commands, Up/Down recalls them.
 
 Your names, notes, bookmarks, patches, types and prototypes save immediately
