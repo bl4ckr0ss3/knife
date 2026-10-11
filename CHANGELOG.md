@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+- **WAT listing for WebAssembly functions** (`knife wat`, MCP `wat` tool).
+  Linear, depth-aware decode of one function body — control flow
+  (block/loop/if/else/end with indentation), calls, memarg loads/stores,
+  br_table, the numeric opcode set, and the 0xFC misc prefix — rendered at
+  body file offsets so addresses line up with the section table and symbols.
+  Function bodies export their export names as symbol names when the `name`
+  section does not name them (wasm-bindgen builds keep their
+  `workbenchengine_*` / `classify` names this way). Unsupported opcodes
+  (SIMD 0xFD) stop the listing with an explicit marker instead of a guess.
+- **WebAssembly support.** `knife info/sections/imports/exports/strings/hashes/
+  map/entropy/scan/diff` now work on `.wasm` modules. The section table,
+  imports grouped by module, exports, custom sections (with a decoded
+  `producers` toolchain fingerprint and `name`-section detection), memory
+  pages, and function-body locations all come from knife's own spec walker —
+  goblin has no wasm parser. Every content parser degrades section-by-section:
+  a truncated or hostile module keeps the rows that parsed, records a
+  `trailing` region for what a broken table left behind, and notes what could
+  not be walked. Code views (`dis`, `funcs`, `pseudo`, `graph`, `audit`) refuse
+  with the architecture diagnostic, since there is no wasm lifter. The MCP
+  server now serves read tools (`info`, `hashes`, `entropy`, `strings`, …)
+  from a data-only session, so non-native architectures get their full
+  container view instead of a blanket refusal.
+
 ## v1.8.2
 
 - Help now scrolls and wraps to the terminal width. Arrow keys, Page Up/Down,

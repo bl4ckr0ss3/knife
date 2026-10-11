@@ -959,6 +959,7 @@ mod tests {
                 addr: slot,
                 name: sink.into(),
                 kind: SymKind::Import,
+size: None,
             }];
             let mut bytes = vec![0u8; va as usize];
             bytes.extend_from_slice(&code);
@@ -993,6 +994,7 @@ mod tests {
                 addr: slot,
                 name: sink.into(),
                 kind: SymKind::Import,
+size: None,
             }];
             let mut bytes = vec![0u8; va as usize];
             bytes.extend_from_slice(&code);
@@ -1004,6 +1006,7 @@ mod tests {
                 addr,
                 name: name.into(),
                 kind: SymKind::Import,
+size: None,
             });
             self
         }
@@ -1393,6 +1396,7 @@ mod tests {
             addr: other,
             name: "getpid".into(),
             kind: SymKind::Import,
+size: None,
         });
         let f = h.findings();
         assert!(

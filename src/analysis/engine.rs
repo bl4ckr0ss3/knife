@@ -202,6 +202,24 @@ pub struct Analysis {
 }
 
 impl Analysis {
+    /// An analysis for architectures the engine cannot lift (wasm, MIPS, …).
+    /// Read-tools keep working off the container facts; code views must refuse
+    /// through [`crate::workspace::Session`]'s architecture gate.
+    pub fn empty(arch: crate::model::Arch) -> Analysis {
+        Analysis {
+            functions: Vec::new(),
+            function_names: BTreeMap::new(),
+            xrefs_to: BTreeMap::new(),
+            xrefs_from: BTreeMap::new(),
+            names: BTreeMap::new(),
+            imports: BTreeMap::new(),
+            display_base: 0,
+            bits: arch.bits(),
+            arch,
+            truncated: false,
+        }
+    }
+
     /// Rebuild lookup-only state omitted from the persistent cache.
     pub(crate) fn rebuild_indexes(&mut self) {
         self.function_names.clear();
