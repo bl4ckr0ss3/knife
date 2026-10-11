@@ -7,7 +7,7 @@
 
 use crate::analysis::{
     audit, capabilities, driver, engine, entropy, graphs, hardening, hashes, ir, loldrivers,
-    signatures, signing, sinks, strings, triage,
+    signatures, signing, sinks, strings, triage, wat,
 };
 use crate::listing::{self, Annot, Line};
 use crate::model::SymKind;
@@ -78,6 +78,8 @@ pub fn catalog() -> Vec<ReadTool> {
             json!({"view": {"type": "string", "enum": ["header", "segments", "section_headers"]}}),
             &["view"],
         ),
+        tool("wat", "WAT-style listing of one WebAssembly function (selector: name, index, or hex body address), or the function table when omitted.",
+             json!({"selector": {"type": "string"}}), &[]),
         tool("capabilities", "Behavioural capabilities inferred from imports/exports, grouped by category.", json!({}), &[]),
         tool("hardening", "Exploit-mitigation posture: ASLR, DEP/NX, stack canary, CFG, RELRO, and more.", json!({}), &[]),
         tool("triage", "Malware-triage verdict and the signals behind it.", json!({}), &[]),
@@ -155,6 +157,7 @@ pub fn dispatch(sess: &Session, name: &str, args: &Value) -> Result<Value> {
             serde_json::to_value(signing::summarize(&sess.bin, &sess.bytes)).map_err(Into::into)
         }
         "hashes" => Ok(hashes_tool(sess)),
+        "wat" => Ok(wat_tool(sess, args)),
         "entropy" => Ok(entropy_tool(sess)),
         "driver_report" => driver_report(sess),
         "call_graph" => call_graph(sess, &sel(args)?),
@@ -612,6 +615,34 @@ fn entropy_tool(sess: &Session) -> Value {
         "map": entropy::entropy_map(&sess.bytes, 64),
         "note": "8.0 is maximum; sustained values above ~7.2 suggest compression or encryption.",
     })
+}
+
+fn wat_tool(sess: &Session, args: &Value) -> Value {
+    let selector = args
+        .get("selector")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if selector.is_empty() {
+        let rows: Vec<Value> = sess
+            .bin
+            .symbols
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                json!({
+                    "index": i,
+                    "addr": format!("0x{:x}", s.addr),
+                    "size": s.size,
+                    "name": if s.name.is_empty() { format!("sub_{:x}", s.addr) } else { s.name.clone() },
+                })
+            })
+            .collect();
+        return json!({ "count": rows.len(), "functions": rows });
+    }
+    match wat::render_function(&sess.bin, &sess.bytes, selector) {
+        Ok(listing) => json!({ "listing": listing }),
+        Err(e) => json!({ "error": e.to_string() }),
+    }
 }
 
 fn driver_report(sess: &Session) -> Result<Value> {

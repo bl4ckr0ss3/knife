@@ -79,8 +79,8 @@ struct WasmInfo {
     /// Function bodies found in the code section, as `(file offset, size)`.
     func_bodies: Vec<(u64, u64)>,
     exports: Vec<String>,
-    /// `(kind label, name)` — exports may name memories/tables/globals too.
-    export_kinds: Vec<(&'static str, String)>,
+    /// `(kind label, index, name)` — exports may name memories/tables/globals too.
+    export_kinds: Vec<(&'static str, u32, String)>,
     start_func: Option<u32>,
     /// Memory declarations as `(min pages, max pages)`.
     memories: Vec<(u32, Option<u32>)>,
@@ -403,9 +403,9 @@ fn parse_export(info: &mut WasmInfo, payload: &[u8]) -> Option<()> {
     for _ in 0..n {
         let name = c.name()?;
         let kind = export_kind(c.u8()?)?;
-        c.uleb()?;
+        let idx = c.uleb()?;
         info.exports.push(name.clone());
-        info.export_kinds.push((kind, name));
+        info.export_kinds.push((kind, idx, name));
     }
     Some(())
 }
@@ -749,7 +749,16 @@ pub fn build(path: &str, bytes: &[u8]) -> Result<Binary> {
     // Function symbols carry real names when the `name` custom section
         // has a function map (wasm-bindgen keeps it), and every body carries
         // its declared size. Defined functions index from the import count.
+        // Exported functions take their export name when the name section did
+        // not name them — for bindgen builds the export names are the ones an
+        // analyst actually searches for (classify, workbenchengine_*).
         let import_count = info.import_funcs.len() as u32;
+        let mut export_names: std::collections::BTreeMap<u32, String> = Default::default();
+        for (kind, idx, name) in &info.export_kinds {
+            if *kind == "func" {
+                export_names.entry(*idx).or_insert_with(|| name.clone());
+            }
+        }
         let bin = Binary {
         path: path.to_string(),
         size: bytes.len() as u64,
@@ -779,6 +788,7 @@ pub fn build(path: &str, bytes: &[u8]) -> Result<Binary> {
                     .iter()
                     .find(|(i, _)| *i == idx)
                     .map(|(_, n)| n.clone())
+                    .or_else(|| export_names.get(&idx).cloned())
                     .unwrap_or_default();
                 Symbol {
                     addr: *off,
@@ -909,9 +919,53 @@ mod fixture_bytes {
         out
     }
 
+    /// A module with one exported function exercising the decoder: locals,
+/// consts, arithmetic, a memarg load, control flow (if/else/return), so the
+/// WAT rendering has real shapes to prove.
+    pub fn wasm_wat_demo() -> Vec<u8> {
+        let mut out = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
+        // type: (i32, i32) -> i32
+        out.extend(section(SEC_TYPE, &[0x01, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F]));
+        // function: func 0 : type 0
+        out.extend(section(SEC_FUNCTION, &[0x01, 0x00]));
+        // export: "demo" : func 0
+        let mut exp = vec![0x01];
+        exp.extend(named("demo"));
+        exp.extend([0x00, 0x00]);
+        out.extend(section(SEC_EXPORT, &exp));
+        // code: body with one extra i32 local, then the demo sequence.
+        //   i32.const 16; local.get 0; i32.add; local.set 2
+        //   local.get 2; i32.load offset=8
+        //   if; local.get 2; return; else; i32.const 42; end; end
+        let body: Vec<u8> = [
+            &[
+                0x01, 0x01, 0x7F, // 1 local group: 1 x i32
+                0x41, 0x10, // i32.const 16
+                0x20, 0x00, // local.get 0
+                0x6A, // i32.add
+                0x21, 0x02, // local.set 2
+                0x20, 0x02, // local.get 2
+                0x28, 0x02, 0x08, // i32.load align=4 offset=8
+                0x04, 0x40, // if (void)
+                0x20, 0x02, // local.get 2
+                0x0F, // return
+                0x05, // else
+                0x41, 0x2A, // i32.const 42
+                0x0B, // end (if)
+                0x0B, // end (func)
+            ][..],
+        ]
+        .concat();
+        let mut code = vec![0x01];
+        code.extend(uleb(body.len() as u32));
+        code.extend(body);
+        out.extend(section(SEC_CODE, &code));
+        out
+    }
+
     /// A minimal module plus a `name` custom section carrying a function-name
-/// map: the shape wasm-bindgen ships, and the reason wasm triage gets real
-/// symbols without a lifter.
+    /// map: the shape wasm-bindgen ships, and the reason wasm triage gets real
+    /// symbols without a lifter.
     pub fn wasm_named() -> Vec<u8> {
         let mut out = wasm_minimal();
         // name section: module name "m", function 0 -> "the_run"
@@ -1046,6 +1100,57 @@ mod tests {
         assert_eq!(hit.target, 19);
         assert_eq!(hit.len, 4);
         assert_eq!(hit.addr, 23); // pair sits right after the string bytes
+    }
+
+    #[test]
+    fn wat_listing_renders_control_flow_and_memarg() {
+        let bytes = fixture_bytes::wasm_wat_demo();
+        let bin = build("t.wasm", &bytes).unwrap();
+        let listing = crate::analysis::wat::render_function(&bin, &bytes, "demo").unwrap();
+        // Header + locals, then the exact instruction sequence with depth.
+        assert!(listing.contains("; function demo @"));
+        assert!(listing.contains("; locals: 1 i32"));
+        assert!(listing.contains("i32.const 16"));
+        assert!(listing.contains("local.get 0"));
+        assert!(listing.contains("i32.add"));
+        assert!(listing.contains("local.set 2"));
+        assert!(listing.contains("i32.load offset=8"));
+        assert!(listing.contains("if"));
+        assert!(listing.contains("  local.get 2")); // inside the if: indented
+        assert!(listing.contains("  return"));
+        assert!(listing.contains("else"));
+        assert!(listing.contains("  i32.const 42"));
+        // The final `end` closes the function and there is no partial marker.
+        assert!(!listing.contains("; partial"));
+        let lines: Vec<&str> = listing.lines().collect();
+        assert!(lines.last().unwrap().ends_with("end"));
+        // Selector by index and by address resolve to the same function.
+        let by_index = crate::analysis::wat::render_function(&bin, &bytes, "0").unwrap();
+        let addr = bin.symbols[0].addr;
+        let by_addr = crate::analysis::wat::render_function(
+            &bin,
+            &bytes,
+            &format!("{addr:#x}"),
+        )
+        .unwrap();
+        assert_eq!(listing, by_index);
+        assert_eq!(listing, by_addr);
+    }
+
+    #[test]
+    fn wat_listing_marks_unsupported_opcodes_explicitly() {
+        let bytes = fixture_bytes::wasm_wat_demo();
+        let bin = build("t.wasm", &bytes).unwrap();
+        // Corrupt the body's last instruction with SIMD 0xFD: the listing
+        // must stop there with a marker, not guess.
+        let mut corrupt = bytes.clone();
+        let code_sec = corrupt.iter().position(|b| *b == 0x0B).unwrap() - 0; // find end byte
+        let _ = code_sec;
+        // Locate the body: last two bytes of the file are the two `end`s.
+        let n = corrupt.len();
+        corrupt[n - 1] = 0xFD;
+        let listing = crate::analysis::wat::render_function(&bin, &corrupt, "0").unwrap();
+        assert!(listing.contains("; partial: unsupported opcode 0xfd"));
     }
 
     #[test]

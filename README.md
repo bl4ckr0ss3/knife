@@ -279,9 +279,10 @@ severity, `/` filters. The kernel API catalogue feeds `knife sinks` and
   PE/ELF/Mach-O into a single neutral model; every command works on every
   format. WebAssembly modules are parsed by knife itself (goblin has no wasm
   parser): the full section table, imports grouped by module, exports, custom
-  sections including the `producers` toolchain fingerprint, and function-body
-  locations — all without a wasm lifter, so code views refuse while every byte
-  and data view works.
+  sections including the `producers` toolchain fingerprint and the decoded
+  `name` section, function-body locations, and a `knife wat` listing of any
+  function body — all without a wasm lifter, so code views refuse while every
+  byte and data view works.
 - **A real analysis engine.** Recursive-descent disassembly seeded from the
   entry point and every named symbol, jump-table resolution, basic blocks, CFG,
   xref counting. On `kernel32.dll`: 2605 functions, 1515 named.

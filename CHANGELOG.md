@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **WAT listing for WebAssembly functions** (`knife wat`, MCP `wat` tool).
+  Linear, depth-aware decode of one function body — control flow
+  (block/loop/if/else/end with indentation), calls, memarg loads/stores,
+  br_table, the numeric opcode set, and the 0xFC misc prefix — rendered at
+  body file offsets so addresses line up with the section table and symbols.
+  Function bodies export their export names as symbol names when the `name`
+  section does not name them (wasm-bindgen builds keep their
+  `workbenchengine_*` / `classify` names this way). Unsupported opcodes
+  (SIMD 0xFD) stop the listing with an explicit marker instead of a guess.
 - **WebAssembly support.** `knife info/sections/imports/exports/strings/hashes/
   map/entropy/scan/diff` now work on `.wasm` modules. The section table,
   imports grouped by module, exports, custom sections (with a decoded

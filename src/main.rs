@@ -330,6 +330,13 @@ enum Command {
     Scan { file: String },
     /// List archive (.a/.lib) members.
     Ls { file: String },
+    /// WAT-style listing of one WebAssembly function (or the function table).
+    Wat {
+        file: String,
+        /// Function name, defined-function index, or hex body address.
+        #[arg(long)]
+        func: Option<String>,
+    },
     /// Shell completion script.
     Completions { shell: clap_complete::Shell },
     /// Compare two binaries (exit 1 on change).
@@ -613,6 +620,7 @@ fn real_main() -> Result<()> {
         Command::Map { file, buckets } => cmd_map(&file, buckets, cli.json),
         Command::Scan { file } => cmd_scan(&file, cli.json),
         Command::Ls { file } => cmd_ls(&file),
+        Command::Wat { file, func } => cmd_wat(&file, func.as_deref(), cli.json),
         Command::Completions { shell } => {
             use clap::CommandFactory;
             let mut stdout = std::io::stdout();
@@ -2276,6 +2284,47 @@ fn cmd_strings(file: &str, min: usize, pointers: bool, as_json: bool) -> Result<
         }
     }
     output::finish(out)
+}
+
+/// WAT listing for one WebAssembly function, or the function table when no
+/// selector is given. Reads only container facts — no engine session.
+fn cmd_wat(file: &str, func: Option<&str>, as_json: bool) -> Result<()> {
+    let bytes = load(file)?;
+    let bin = parse(file, &bytes)?;
+    if bin.format != crate::model::Format::Wasm {
+        anyhow::bail!("wat: {} is not a WebAssembly module", bin.format.label());
+    }
+    let Some(selector) = func else {
+        let rows: Vec<serde_json::Value> = bin
+            .symbols
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                json!({
+                    "index": i,
+                    "addr": format!("0x{:x}", s.addr),
+                    "size": s.size,
+                    "name": if s.name.is_empty() { format!("sub_{:x}", s.addr) } else { s.name.clone() },
+                })
+            })
+            .collect();
+        if as_json {
+            println!("{}", serde_json::to_string_pretty(&json!({ "count": rows.len(), "functions": rows }))?);
+        } else {
+            section_header(&format!("wasm functions ({})", rows.len()));
+            for r in &rows {
+                println!("  {:>4} {:<14} {:>6} B  {}", r["index"], r["addr"], r["size"], r["name"]);
+            }
+        }
+        return Ok(());
+    };
+    let listing = crate::analysis::wat::render_function(&bin, &bytes, selector)?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&json!({ "listing": listing }))?);
+    } else {
+        print!("{listing}");
+    }
+    Ok(())
 }
 
 fn cmd_iocs(file: &str, as_json: bool) -> Result<()> {
