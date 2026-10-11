@@ -63,6 +63,8 @@ fn sniff_format(path: &Path) -> Option<&'static str> {
         Some("Mach-O fat")
     } else if magic.starts_with(b"!<arch>") {
         Some("archive")
+    } else if magic.starts_with(&[0x00, 0x61, 0x73, 0x6D]) {
+        Some("WebAssembly")
     } else {
         None
     }

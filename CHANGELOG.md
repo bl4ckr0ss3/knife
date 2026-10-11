@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- **WebAssembly support.** `knife info/sections/imports/exports/strings/hashes/
+  map/entropy/scan/diff` now work on `.wasm` modules. The section table,
+  imports grouped by module, exports, custom sections (with a decoded
+  `producers` toolchain fingerprint and `name`-section detection), memory
+  pages, and function-body locations all come from knife's own spec walker —
+  goblin has no wasm parser. Every content parser degrades section-by-section:
+  a truncated or hostile module keeps the rows that parsed, records a
+  `trailing` region for what a broken table left behind, and notes what could
+  not be walked. Code views (`dis`, `funcs`, `pseudo`, `graph`, `audit`) refuse
+  with the architecture diagnostic, since there is no wasm lifter. The MCP
+  server now serves read tools (`info`, `hashes`, `entropy`, `strings`, …)
+  from a data-only session, so non-native architectures get their full
+  container view instead of a blanket refusal.
+
 ## v1.8.2
 
 - Help now scrolls and wraps to the terminal width. Arrow keys, Page Up/Down,

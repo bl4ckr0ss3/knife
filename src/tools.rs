@@ -95,10 +95,45 @@ pub fn catalog() -> Vec<ReadTool> {
     ]
 }
 
+/// Tools whose answers come from recovered code rather than container facts.
+/// The MCP server opens these against a code-analyzed session; everything else
+/// also works on architectures without a lifter (wasm, MIPS, …).
+pub fn needs_code(name: &str) -> bool {
+    matches!(
+        name,
+        "list_functions"
+            | "disassemble"
+            | "decompile"
+            | "audit"
+            | "xrefs"
+            | "callees"
+            | "paths_to"
+            | "trace_taint"
+            | "call_graph"
+            | "sinks"
+    )
+}
+
+/// Guard for code tools on a data-only session: refuse with the same shape as
+/// `Session::open`'s architecture diagnostic instead of answering from an
+/// empty analysis, which would read as "no functions exist".
+fn require_code(sess: &Session) -> Result<()> {
+    if sess.code_analyzed {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "this tool needs x86, x64, or AArch64 disassembly; this is {}",
+        sess.bin.arch.label()
+    )
+}
+
 /// Run one tool by name against a session, returning structured JSON. Unknown
 /// names error. Text-shaped results (disassembly, pseudocode, a hex dump) are
 /// returned as a JSON string so a consumer can print them verbatim.
 pub fn dispatch(sess: &Session, name: &str, args: &Value) -> Result<Value> {
+    if needs_code(name) {
+        require_code(sess)?;
+    }
     match name {
         "info" => Ok(info(sess)),
         "list_functions" => Ok(list_functions(sess, args)),

@@ -8,6 +8,9 @@ pub enum Format {
     Pe,
     Elf,
     MachO,
+    /// WebAssembly module (`.wasm`). Sections are parsed, but the engine has
+    /// no wasm lifter: code views refuse, byte/data views work.
+    Wasm,
     Archive,
     Unknown,
 }
@@ -18,6 +21,7 @@ impl Format {
             Format::Pe => "PE",
             Format::Elf => "ELF",
             Format::MachO => "Mach-O",
+            Format::Wasm => "WebAssembly",
             Format::Archive => "archive",
             Format::Unknown => "unknown",
         }
@@ -32,6 +36,9 @@ pub enum Arch {
     Aarch64,
     Mips,
     Riscv,
+    /// WebAssembly bytecode. Not machine code: the disassembler and the
+    /// lifting passes refuse it, while every byte/data view still works.
+    Wasm,
     Other,
 }
 
@@ -44,6 +51,7 @@ impl Arch {
             Arch::Aarch64 => "AArch64",
             Arch::Mips => "MIPS",
             Arch::Riscv => "RISC-V",
+            Arch::Wasm => "wasm32",
             Arch::Other => "other",
         }
     }
@@ -51,7 +59,7 @@ impl Arch {
     #[allow(dead_code)]
     pub fn bits(self) -> u32 {
         match self {
-            Arch::X86 | Arch::Arm | Arch::Mips => 32,
+            Arch::X86 | Arch::Arm | Arch::Mips | Arch::Wasm => 32,
             _ => 64,
         }
     }
