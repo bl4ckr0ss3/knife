@@ -265,6 +265,7 @@ mod tests {
             addr: global,
             name: "GetLastError".into(),
             kind: crate::model::SymKind::Import,
+            size: None,
         });
         let mut bytes = bytes;
         bytes.resize((global + 8) as usize, 0);

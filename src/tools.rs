@@ -67,8 +67,8 @@ pub fn catalog() -> Vec<ReadTool> {
              json!({"selector": {"type": "string"}}), &["selector"]),
         tool("trace_taint", "For one function, the exploitable-looking sinks it contains with each dangerous argument's provenance, plus the call chains that reach the function — how caller-controlled input flows to a dangerous call.",
              json!({"selector": {"type": "string"}}), &["selector"]),
-        tool("strings", "String literals whose text contains a query (empty query lists the first strings), with reference counts.",
-             json!({"query": {"type": "string"}, "limit": {"type": "integer"}}), &[]),
+        tool("strings", "String literals whose text contains a query (empty query lists the first strings), with reference counts; pointers=true resolves (pointer,length) slice pairs instead — Rust &str tables, panic Locations, format templates.",
+             json!({"query": {"type": "string"}, "limit": {"type": "integer"}, "pointers": {"type": "boolean"}}), &[]),
         tool("iocs", "Indicators of compromise extracted from strings: URLs, hosts, IPs, paths, registry keys.", json!({}), &[]),
         tool("imports", "Imported functions the binary calls out to.", json!({}), &[]),
         tool("exports", "Functions the binary exports.", json!({}), &[]),
@@ -101,8 +101,7 @@ pub fn catalog() -> Vec<ReadTool> {
 pub fn needs_code(name: &str) -> bool {
     matches!(
         name,
-        "list_functions"
-            | "disassemble"
+        "disassemble"
             | "decompile"
             | "audit"
             | "xrefs"
@@ -239,25 +238,64 @@ fn list_functions(sess: &Session, args: &Value) -> Value {
         .map(|v| v as usize)
         .unwrap_or(200)
         .min(ROW_LIMIT);
-    let rows: Vec<Value> = sess
-        .an
-        .functions
-        .iter()
-        .filter(|f| !named_only || f.named)
-        .filter(|f| needle.is_empty() || f.name.to_lowercase().contains(&needle))
-        .take(limit)
-        .map(|f| {
-            json!({
-                "addr": format!("0x{:x}", f.addr),
-                "name": f.name,
-                "named": f.named,
-                "blocks": f.blocks.len(),
-                "incoming": f.incoming,
-                "size": f.size,
+    // Without a lifter (wasm, MIPS, …) the container metadata is still the
+    // truth: named bodies from the wasm `name` section, declared sizes, no
+    // CFG facts. Reporting zero functions would be a lie; so would blocks.
+    let (rows, count, note) = if sess.code_analyzed {
+        let rows: Vec<Value> = sess
+            .an
+            .functions
+            .iter()
+            .filter(|f| !named_only || f.named)
+            .filter(|f| needle.is_empty() || f.name.to_lowercase().contains(&needle))
+            .take(limit)
+            .map(|f| {
+                json!({
+                    "addr": format!("0x{:x}", f.addr),
+                    "name": f.name,
+                    "named": f.named,
+                    "blocks": f.blocks.len(),
+                    "incoming": f.incoming,
+                    "size": f.size,
+                })
             })
-        })
-        .collect();
-    json!({ "count": sess.an.functions.len(), "functions": rows })
+            .collect();
+        (rows, sess.an.functions.len(), None)
+    } else {
+        let rows: Vec<Value> = sess
+            .bin
+            .symbols
+            .iter()
+            .filter(|s| matches!(s.kind, SymKind::Func | SymKind::Export))
+            .filter(|s| !named_only || !s.name.is_empty())
+            .filter(|s| needle.is_empty() || s.name.to_lowercase().contains(&needle))
+            .take(limit)
+            .map(|s| {
+                let named = !s.name.is_empty();
+                json!({
+                    "addr": format!("0x{:x}", s.addr),
+                    "name": if named { s.name.clone() } else { format!("sub_{:x}", s.addr) },
+                    "named": named,
+                    "blocks": 0,
+                    "incoming": 0,
+                    "size": s.size,
+                })
+            })
+            .collect();
+        (
+            rows,
+            sess.bin.symbols.len(),
+            Some(format!(
+                "no lifter for {}; names and sizes are container metadata, blocks/incoming unknown",
+                sess.bin.arch.label()
+            )),
+        )
+    };
+    let mut out = json!({ "count": count, "functions": rows });
+    if let Some(n) = note {
+        out["note"] = json!(n);
+    }
+    out
 }
 
 fn disassemble(sess: &Session, selector: &str) -> Result<String> {
@@ -427,17 +465,40 @@ fn trace_taint(sess: &Session, selector: &str) -> Result<Value> {
 }
 
 fn strings_tool(sess: &Session, args: &Value) -> Value {
-    let q = args
-        .get("query")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_lowercase();
     let limit = args
         .get("limit")
         .and_then(Value::as_u64)
         .map(|v| v as usize)
         .unwrap_or(80)
         .min(ROW_LIMIT);
+    // pointers=true: resolve (pointer, length) slice pairs — how Rust keeps
+    // &str tables, panic Locations and format templates in the data image.
+    if args.get("pointers").and_then(Value::as_bool).unwrap_or(false) {
+        let refs = strings::resolve_pointers(&sess.bin, &sess.bytes, limit);
+        let q = args
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_lowercase();
+        let rows: Vec<Value> = refs
+            .iter()
+            .filter(|r| q.is_empty() || r.text.to_lowercase().contains(&q))
+            .map(|r| {
+                json!({
+                    "addr": format!("0x{:x}", r.addr),
+                    "target": format!("0x{:x}", r.target),
+                    "len": r.len,
+                    "text": r.text,
+                })
+            })
+            .collect();
+        return json!({ "count": rows.len(), "pointers": rows });
+    }
+    let q = args
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_lowercase();
     let base = engine::display_base(&sess.bin);
     let string_map = listing::string_map(&sess.bin, &sess.bytes, base);
     let rows: Vec<Value> = string_map

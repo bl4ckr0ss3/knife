@@ -88,6 +88,10 @@ enum Command {
         file: String,
         #[arg(long, default_value_t = 5)]
         min: usize,
+        /// Resolve (pointer, length) slice pairs instead of raw strings:
+        /// Rust &str tables, panic Locations, format templates.
+        #[arg(long)]
+        pointers: bool,
     },
     /// Indicators of compromise (defanged).
     Iocs { file: String },
@@ -404,7 +408,9 @@ fn real_main() -> Result<()> {
         Command::Audit { file, reachable } => {
             cmd_audit(&file, reachable, cli.json, cli.db.as_deref())
         }
-        Command::Strings { file, min } => cmd_strings(&file, min, cli.json),
+        Command::Strings { file, min, pointers } => {
+            cmd_strings(&file, min, pointers, cli.json)
+        }
         Command::Iocs { file } => cmd_iocs(&file, cli.json),
         Command::Hashes { file } => cmd_hashes(&file, cli.json),
         Command::Drv { file, reachable } => cmd_drv(&file, reachable, cli.json, cli.db.as_deref()),
@@ -2235,8 +2241,28 @@ fn cmd_audit(file: &str, reachable_only: bool, as_json: bool, db_path: Option<&s
     Ok(())
 }
 
-fn cmd_strings(file: &str, min: usize, as_json: bool) -> Result<()> {
+fn cmd_strings(file: &str, min: usize, pointers: bool, as_json: bool) -> Result<()> {
     let bytes = load(file)?;
+    if pointers {
+        let bin = parse(file, &bytes)?;
+        // Row cap shared with the tool catalog (tools::ROW_LIMIT), restated here so
+        // the binary crate does not depend on the catalog module.
+        let refs = strs::resolve_pointers(&bin, &bytes, 400);
+        let mut out = output::bulk();
+        if as_json {
+            serde_json::to_writer_pretty(&mut out, &refs)?;
+            writeln!(out)?;
+        } else {
+            for r in &refs {
+                writeln!(
+                    out,
+                    "0x{:08x} -> 0x{:08x} ({:>4} B)  {}",
+                    r.addr, r.target, r.len, r.text
+                )?;
+            }
+        }
+        return output::finish(out);
+    }
     let strings = strs::extract(&bytes, min);
     // Millions of lines are normal here, so both forms stream through one
     // buffer rather than a syscall (or a whole serialized document) per string.

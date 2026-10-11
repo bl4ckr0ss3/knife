@@ -88,6 +88,13 @@ struct WasmInfo {
     tables: usize,
     elem_segments: usize,
     data_segments: usize,
+    /// Active data segments as `(load address, file offset, length)` — the
+    /// pointer map that turns image u32s into file positions.
+    data_ranges: Vec<(u64, u64, u64)>,
+    /// `name` custom section: function index → name map.
+    func_names: Vec<(u32, String)>,
+    /// `name` custom section: module name, when present.
+    module_name: Option<String>,
     /// Custom section names, in file order.
     customs: Vec<String>,
     /// Decoded `producers` section, as `field: name version, …` lines.
@@ -454,16 +461,23 @@ fn parse_code(info: &mut WasmInfo, payload: &[u8], payload_off: u64) -> Option<(
     Some(())
 }
 
-fn parse_data(info: &mut WasmInfo, payload: &[u8]) -> Option<()> {
+fn parse_data(info: &mut WasmInfo, payload: &[u8], payload_off: u64) -> Option<()> {
     let mut c = Cur::new(payload);
     let n = c.uleb()?;
     for _ in 0..n {
         let flags = c.uleb()?;
         match flags {
             0 => {
+                // active, implicit memory 0: offset expr, then the bytes. The
+                // offset is the segment's load address — what image pointers
+                // name — and the byte vector's file position is where those
+                // bytes live, so the pair becomes a pointer-map range.
+                let mem = read_const_expr(&payload[c.p..])?;
                 c.skip_expr()?;
                 let m = c.uleb()? as usize;
+                let file = payload_off + c.p as u64;
                 c.bytes(m)?;
+                info.data_ranges.push((mem as u64, file, m as u64));
             }
             1 => {
                 let m = c.uleb()? as usize;
@@ -471,15 +485,64 @@ fn parse_data(info: &mut WasmInfo, payload: &[u8]) -> Option<()> {
             }
             2 => {
                 c.uleb()?;
+                let mem = read_const_expr(&payload[c.p..])?;
                 c.skip_expr()?;
                 let m = c.uleb()? as usize;
+                let file = payload_off + c.p as u64;
                 c.bytes(m)?;
+                info.data_ranges.push((mem as u64, file, m as u64));
             }
             _ => return None,
         }
         info.data_segments += 1;
     }
     Some(())
+}
+
+/// Value of a `i32.const N; end` / `i64.const N; end` offset expression — the
+/// shape every data-segment offset uses. Anything else is not supported for
+/// pointer mapping (the segment still parses; it just does not map).
+fn read_const_expr(payload: &[u8]) -> Option<i64> {
+    let mut c = Cur::new(payload);
+    match c.u8()? {
+        0x41 | 0x42 => c.sleb_i64(),
+        _ => None,
+    }
+}
+
+/// The `name` custom section: a vector of subsections, each an id byte, a
+/// size prefix, and a payload. Subsection 1 is the function-name map — the
+/// one that matters for triage: real symbols without a lifter. Malformed
+/// subsections are skipped, not fatal.
+fn decode_name_section(info: &mut WasmInfo, payload: &[u8]) {
+    let mut c = Cur::new(payload);
+    loop {
+        let Some(sub) = c.u8() else { break };
+        let Some(sz) = c.uleb() else { break };
+        let end = (c.p + sz as usize).min(payload.len());
+        let sub_payload = &payload[c.p..end];
+        match sub {
+            0 => {
+                let mut mc = Cur::new(sub_payload);
+                if let Some(m) = mc.name() {
+                    info.module_name = Some(m);
+                }
+            }
+            1 => {
+                let mut mc = Cur::new(sub_payload);
+                if let Some(n) = mc.uleb() {
+                    for _ in 0..n {
+                        match (mc.uleb(), mc.name()) {
+                            (Some(i), Some(name)) => info.func_names.push((i, name)),
+                            _ => break,
+                        }
+                    }
+                }
+            }
+            _ => {} // local names (2), globals/… (4+) — not triage material
+        }
+        c.p = end;
+    }
 }
 
 /// `producers`: a vector of (field name, vector of (tool name, version)).
@@ -511,6 +574,10 @@ fn parse_content(info: &mut WasmInfo, sec: &RawSection, bytes: &[u8]) -> bool {
                 info.customs.push(nm.clone());
                 if nm == "name" {
                     info.has_name_section = true;
+                    // Payload after the section name: named subsections.
+                    let mut nc = Cur::new(payload);
+                    let _ = nc.name();
+                    decode_name_section(info, &payload[nc.p.min(payload.len())..]);
                 }
                 if nm == "producers" {
                     // Payload after the section name.
@@ -535,7 +602,7 @@ fn parse_content(info: &mut WasmInfo, sec: &RawSection, bytes: &[u8]) -> bool {
         SEC_START => parse_start(info, payload),
         SEC_ELEM => parse_elem(info, payload),
         SEC_CODE => parse_code(info, payload, sec.payload_off),
-        SEC_DATA => parse_data(info, payload),
+        SEC_DATA => parse_data(info, payload, sec.payload_off),
         SEC_DATACOUNT => Some(()), // the count is redundant with the data walk
         _ => Some(()),
     };
@@ -564,6 +631,9 @@ pub fn build(path: &str, bytes: &[u8]) -> Result<Binary> {
         tables: 0,
         elem_segments: 0,
         data_segments: 0,
+        data_ranges: Vec::new(),
+        func_names: Vec::new(),
+        module_name: None,
         customs: Vec::new(),
         producers: None,
         has_name_section: false,
@@ -638,7 +708,14 @@ pub fn build(path: &str, bytes: &[u8]) -> Result<Binary> {
         notes.push(format!("module version {version} (spec version is 1)"));
     }
     if info.has_name_section {
-        notes.push("custom 'name' section present (symbol names survive)".into());
+        notes.push(format!(
+            "custom 'name' section: {} function name(s){}",
+            info.func_names.len(),
+            info.module_name
+                .as_ref()
+                .map(|m| format!(", module '{m}'"))
+                .unwrap_or_default()
+        ));
     }
     if let Some(s) = info.start_func {
         notes.push(format!("start function index {s}"));
@@ -669,7 +746,11 @@ pub fn build(path: &str, bytes: &[u8]) -> Result<Binary> {
         ));
     }
 
-    let bin = Binary {
+    // Function symbols carry real names when the `name` custom section
+        // has a function map (wasm-bindgen keeps it), and every body carries
+        // its declared size. Defined functions index from the import count.
+        let import_count = info.import_funcs.len() as u32;
+        let bin = Binary {
         path: path.to_string(),
         size: bytes.len() as u64,
         format: Format::Wasm,
@@ -677,7 +758,7 @@ pub fn build(path: &str, bytes: &[u8]) -> Result<Binary> {
         bits: 32,
         endian_little: true,
         is_lib: true,
-        is_stripped: !info.has_name_section,
+        is_stripped: info.func_names.is_empty(),
         // `entry` carries the start function *index* — wasm has no native
         // entry address. The note above says so.
         entry: info.start_func.map(|s| s as u64).unwrap_or(0),
@@ -687,22 +768,37 @@ pub fn build(path: &str, bytes: &[u8]) -> Result<Binary> {
         sections: model_sections,
         imports,
         exports: info.exports,
-        // Function bodies live at file offsets in the code section; the
-        // identity address map makes those the symbol addresses. They carry
-        // no names (names live in the `name` custom section, which the
-        // triage parser records but does not decode), so they are engine
-        // hints rather than presented symbols.
         symbols: info
             .func_bodies
             .iter()
-            .map(|(off, _)| Symbol {
-                addr: *off,
-                name: String::new(),
-                kind: SymKind::Func,
+            .enumerate()
+            .map(|(k, (off, size))| {
+                let idx = import_count + k as u32;
+                let name = info
+                    .func_names
+                    .iter()
+                    .find(|(i, _)| *i == idx)
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_default();
+                Symbol {
+                    addr: *off,
+                    name,
+                    kind: SymKind::Func,
+                    size: Some(*size),
+                }
             })
             .collect(),
         func_hints: info.func_bodies.iter().map(|(off, _)| *off).collect(),
         libs,
+        pointer_map: info
+            .data_ranges
+            .iter()
+            .map(|(mem, file, len)| crate::model::PointerRange {
+                mem: *mem,
+                file: *file,
+                len: *len,
+            })
+            .collect(),
         rpaths: Vec::new(),
         overall_entropy: 0.0,
         overlay_off: None,
@@ -812,6 +908,48 @@ mod fixture_bytes {
         out.extend(section(SEC_DATA, &dat));
         out
     }
+
+    /// A minimal module plus a `name` custom section carrying a function-name
+/// map: the shape wasm-bindgen ships, and the reason wasm triage gets real
+/// symbols without a lifter.
+    pub fn wasm_named() -> Vec<u8> {
+        let mut out = wasm_minimal();
+        // name section: module name "m", function 0 -> "the_run"
+        let mut ns = named("name");
+        let mut module_sub = vec![0x00];
+        let module_name = named("m");
+        module_sub.extend(uleb(module_name.len() as u32));
+        module_sub.extend(module_name);
+        let mut func_sub = vec![0x01];
+        let mut map = uleb(1);
+        map.extend(uleb(0));
+        map.extend(named("the_run"));
+        func_sub.extend(uleb(map.len() as u32));
+        func_sub.extend(map);
+        ns.extend(module_sub);
+        ns.extend(func_sub);
+        out.extend(section(SEC_CUSTOM, &ns));
+        out
+    }
+
+    /// A data section whose segment loads at a realistic address and whose
+/// payload ends with a planted (pointer, length) pair aimed at the string:
+/// the slice-table shape `resolve_pointers` exists for, with the wasm
+/// memory→file translation exercised end to end.
+    pub fn wasm_with_slice_table() -> Vec<u8> {
+        let mut out = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
+        // data: one active segment at memory 0x100000 (the wasm-bindgen load
+        // base; sleb128 80 80 C0 00), 4 bytes "ABCD", then the (ptr,len) pair
+        // as an image pointer. Section layout: id@8, size@9, payload@10.. =
+        // [01 00 41 80 80 C0 00 0B 04 41 42 43 44] (13 B) + pair (8 B).
+        let mut dat = vec![0x01, 0x00, 0x41, 0x80, 0x80, 0xC0, 0x00, 0x0B, 0x04];
+        dat.extend_from_slice(b"ABCD");
+        let abcd_mem: u32 = 0x0010_0000; // load address of the segment = of "ABCD"
+        dat.extend_from_slice(&abcd_mem.to_le_bytes());
+        dat.extend_from_slice(&4u32.to_le_bytes());
+        out.extend(section(SEC_DATA, &dat));
+        out
+    }
 }
 
 #[cfg(test)]
@@ -870,6 +1008,44 @@ mod tests {
         );
         // Declared function (index 1 in the full index space) got a body hint.
         assert_eq!(bin.func_hints.len(), 1);
+    }
+
+    #[test]
+    fn name_section_gives_named_sized_symbols() {
+        let bytes = fixture_bytes::wasm_named();
+        let bin = build("t.wasm", &bytes).unwrap();
+        assert!(!bin.is_stripped);
+        assert_eq!(bin.symbols.len(), 1);
+        let s = &bin.symbols[0];
+        assert_eq!(s.name, "the_run");
+        assert_eq!(s.kind, SymKind::Func);
+        assert_eq!(s.addr, 31); // body offset in the minimal layout
+        assert_eq!(s.size, Some(2)); // locals-count + `end`
+        assert!(bin
+            .notes
+            .iter()
+            .any(|n| n.contains("custom 'name' section: 1 function name(s)")));
+    }
+
+    #[test]
+    fn slice_table_pair_resolves_through_memory_map() {
+        let bytes = fixture_bytes::wasm_with_slice_table();
+        let bin = build("t.wasm", &bytes).unwrap();
+        // The active segment registered its load address: memory 0x100000 ->
+        // file 19, where the "ABCD" bytes live.
+        assert_eq!(bin.pointer_map.len(), 1);
+        assert_eq!((bin.pointer_map[0].mem, bin.pointer_map[0].file, bin.pointer_map[0].len),
+                   (0x100000, 19, 4));
+        let refs = crate::analysis::strings::resolve_pointers(&bin, &bytes, 400);
+        // The planted pair (mem pointer 0x100000, len 4) resolves through the
+        // map to the in-segment string.
+        let hit = refs
+            .iter()
+            .find(|r| r.text == "ABCD")
+            .expect("planted slice pair not resolved");
+        assert_eq!(hit.target, 19);
+        assert_eq!(hit.len, 4);
+        assert_eq!(hit.addr, 23); // pair sits right after the string bytes
     }
 
     #[test]

@@ -105,6 +105,7 @@ pub fn build(path: &str, bytes: &[u8], pe: PE) -> Binary {
                 addr: rva as u64,
                 name: name.to_string(),
                 kind: SymKind::Export,
+                size: None,
             });
         }
     }
@@ -118,6 +119,7 @@ pub fn build(path: &str, bytes: &[u8], pe: PE) -> Binary {
             addr: imp.offset as u64,
             name: format!("{module}!{}", resolve_name(imp.dll, imp.ordinal, &imp.name)),
             kind: SymKind::Import,
+                size: None,
         });
     }
 
@@ -229,6 +231,7 @@ pub fn build(path: &str, bytes: &[u8], pe: PE) -> Binary {
         symbols,
         func_hints,
         libs: pe.libraries.iter().map(|s| s.to_string()).collect(),
+        pointer_map: Vec::new(),
         rpaths: Vec::new(),
         overall_entropy: 0.0,
         overlay_off: None,

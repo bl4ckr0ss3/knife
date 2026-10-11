@@ -99,6 +99,7 @@ pub fn build(path: &str, bytes: &[u8], elf: Elf) -> Binary {
                     addr: sym.st_value,
                     name: name.to_string(),
                     kind: SymKind::Func,
+                size: None,
                 });
             }
         }
@@ -130,6 +131,7 @@ pub fn build(path: &str, bytes: &[u8], elf: Elf) -> Binary {
                 addr: reloc.r_offset,
                 name: name.to_string(),
                 kind: SymKind::Import,
+                size: None,
             });
         }
     }
@@ -240,6 +242,7 @@ pub fn build(path: &str, bytes: &[u8], elf: Elf) -> Binary {
         symbols,
         func_hints,
         libs: elf.libraries.iter().map(|s| s.to_string()).collect(),
+        pointer_map: Vec::new(),
         rpaths: elf
             .rpaths
             .iter()

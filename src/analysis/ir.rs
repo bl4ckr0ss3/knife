@@ -4530,6 +4530,7 @@ mod tests {
             addr: slot,
             name: sink.into(),
             kind: SymKind::Import,
+size: None,
         }];
         let mut bytes = vec![0u8; va as usize];
         bytes.extend_from_slice(&code);
@@ -4606,6 +4607,7 @@ mod tests {
             addr: 0x2000,
             name: "malloc".into(),
             kind: SymKind::Import,
+size: None,
         }];
         let mut bytes = vec![0u8; va as usize];
         bytes.extend_from_slice(&code);
@@ -4671,6 +4673,7 @@ mod tests {
             addr: 0x2000,
             name: "malloc".into(),
             kind: SymKind::Import,
+size: None,
         }];
         let mut bytes = vec![0u8; va as usize];
         bytes.extend_from_slice(&code);
@@ -4718,6 +4721,7 @@ mod tests {
             addr: 0x2000,
             name: "strlen".into(),
             kind: SymKind::Import,
+size: None,
         }];
         let mut bytes = vec![0u8; va as usize];
         bytes.extend_from_slice(&code);
@@ -4767,6 +4771,7 @@ mod tests {
             addr: 0x2000,
             name: "strlen".into(),
             kind: SymKind::Import,
+size: None,
         }];
         let mut bytes = vec![0u8; va as usize];
         bytes.extend_from_slice(&code);
@@ -4818,6 +4823,7 @@ mod tests {
             addr: 0x2000,
             name: "strlen".into(),
             kind: SymKind::Import,
+size: None,
         }];
         let mut bytes = vec![0u8; va as usize];
         bytes.extend_from_slice(&code);
@@ -5832,6 +5838,7 @@ mod tests {
             addr: slot,
             name: name.into(),
             kind: SymKind::Import,
+size: None,
         }];
         let mut bytes = vec![0u8; va as usize];
         bytes.extend_from_slice(&code);
@@ -6178,6 +6185,7 @@ mod tests {
             addr: slot,
             name: sink.into(),
             kind: SymKind::Import,
+size: None,
         }];
         let mut bytes = vec![0u8; 0x2008];
         // 0x1000: push 0x2000 ; call [0x4000] ; ret
