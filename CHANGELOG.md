@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.8.3
 
 - **WAT listing for WebAssembly functions** (`knife wat`, MCP `wat` tool).
   Linear, depth-aware decode of one function body — control flow

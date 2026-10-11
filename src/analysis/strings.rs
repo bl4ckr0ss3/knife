@@ -62,12 +62,8 @@ pub fn resolve_pointers(bin: &crate::model::Binary, bytes: &[u8], limit: usize) 
         while i + 8 <= end && out.len() < limit {
             let at = i;
             let ptr = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
-            let len = u32::from_le_bytes([
-                bytes[i + 4],
-                bytes[i + 5],
-                bytes[i + 6],
-                bytes[i + 7],
-            ]) as usize;
+            let len = u32::from_le_bytes([bytes[i + 4], bytes[i + 5], bytes[i + 6], bytes[i + 7]])
+                as usize;
             i += 1;
             // Plausible &str-shaped reference: sane length, then resolve the
             // pointer through the load image (or identity) and require a
@@ -83,7 +79,7 @@ pub fn resolve_pointers(bin: &crate::model::Binary, bytes: &[u8], limit: usize) 
                     .iter()
                     .find(|r| (r.mem..r.mem + r.len).contains(&(ptr as u64)))
                 {
-                    Some(r) => (r.file as u64 + (ptr as u64 - r.mem)) as usize,
+                    Some(r) => (r.file + (ptr as u64 - r.mem)) as usize,
                     None => continue,
                 }
             };

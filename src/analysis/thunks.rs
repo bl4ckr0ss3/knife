@@ -254,7 +254,7 @@ mod tests {
             addr: 0x2000,
             name: "strcpy".into(),
             kind: SymKind::Import,
-                size: None,
+            size: None,
         }];
         // jmp [rip+0xffa] at 0x1000: ends at 0x1006, so it targets 0x2000.
         let mut bytes = vec![0u8; 16];
@@ -278,7 +278,7 @@ mod tests {
             addr: 0x2000,
             name: "memcpy".into(),
             kind: SymKind::Import,
-                size: None,
+            size: None,
         }];
         let mut bytes = vec![0u8; 16];
         bytes[0..4].copy_from_slice(&ENDBR64);
@@ -304,7 +304,7 @@ mod tests {
             addr: 0x2000,
             name: "strcpy".into(),
             kind: SymKind::Import,
-                size: None,
+            size: None,
         }];
         let mut bytes = vec![0u8; 16];
         bytes[0] = 0xff;
@@ -321,7 +321,7 @@ mod tests {
             addr: 0x8049000,
             name: "system".into(),
             kind: SymKind::Import,
-                size: None,
+            size: None,
         }];
         let mut bytes = vec![0u8; 16];
         bytes[0] = 0xff;

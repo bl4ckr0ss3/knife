@@ -476,7 +476,11 @@ fn strings_tool(sess: &Session, args: &Value) -> Value {
         .min(ROW_LIMIT);
     // pointers=true: resolve (pointer, length) slice pairs — how Rust keeps
     // &str tables, panic Locations and format templates in the data image.
-    if args.get("pointers").and_then(Value::as_bool).unwrap_or(false) {
+    if args
+        .get("pointers")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         let refs = strings::resolve_pointers(&sess.bin, &sess.bytes, limit);
         let q = args
             .get("query")
@@ -618,10 +622,7 @@ fn entropy_tool(sess: &Session) -> Value {
 }
 
 fn wat_tool(sess: &Session, args: &Value) -> Value {
-    let selector = args
-        .get("selector")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let selector = args.get("selector").and_then(Value::as_str).unwrap_or("");
     if selector.is_empty() {
         let rows: Vec<Value> = sess
             .bin

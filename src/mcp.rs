@@ -383,10 +383,7 @@ fn session<'a>(cache: &'a mut Option<(String, Session)>, file: &str) -> Result<&
 /// Session for read tools that never touch recovered code. Architectures the
 /// engine cannot lift (wasm, MIPS, …) still get their full container view.
 fn session_data<'a>(cache: &'a mut Option<(String, Session)>, file: &str) -> Result<&'a Session> {
-    let stale = cache
-        .as_ref()
-        .map(|(p, _)| p != file)
-        .unwrap_or(true);
+    let stale = cache.as_ref().map(|(p, _)| p != file).unwrap_or(true);
     if stale {
         let sess = Session::open_data(file, None)?;
         *cache = Some((file.to_string(), sess));
