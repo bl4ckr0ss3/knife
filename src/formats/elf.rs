@@ -99,7 +99,7 @@ pub fn build(path: &str, bytes: &[u8], elf: Elf) -> Binary {
                     addr: sym.st_value,
                     name: name.to_string(),
                     kind: SymKind::Func,
-                size: None,
+                    size: None,
                 });
             }
         }

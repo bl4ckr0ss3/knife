@@ -415,9 +415,11 @@ fn real_main() -> Result<()> {
         Command::Audit { file, reachable } => {
             cmd_audit(&file, reachable, cli.json, cli.db.as_deref())
         }
-        Command::Strings { file, min, pointers } => {
-            cmd_strings(&file, min, pointers, cli.json)
-        }
+        Command::Strings {
+            file,
+            min,
+            pointers,
+        } => cmd_strings(&file, min, pointers, cli.json),
         Command::Iocs { file } => cmd_iocs(&file, cli.json),
         Command::Hashes { file } => cmd_hashes(&file, cli.json),
         Command::Drv { file, reachable } => cmd_drv(&file, reachable, cli.json, cli.db.as_deref()),
@@ -2309,18 +2311,27 @@ fn cmd_wat(file: &str, func: Option<&str>, as_json: bool) -> Result<()> {
             })
             .collect();
         if as_json {
-            println!("{}", serde_json::to_string_pretty(&json!({ "count": rows.len(), "functions": rows }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({ "count": rows.len(), "functions": rows }))?
+            );
         } else {
             section_header(&format!("wasm functions ({})", rows.len()));
             for r in &rows {
-                println!("  {:>4} {:<14} {:>6} B  {}", r["index"], r["addr"], r["size"], r["name"]);
+                println!(
+                    "  {:>4} {:<14} {:>6} B  {}",
+                    r["index"], r["addr"], r["size"], r["name"]
+                );
             }
         }
         return Ok(());
     };
     let listing = crate::analysis::wat::render_function(&bin, &bytes, selector)?;
     if as_json {
-        println!("{}", serde_json::to_string_pretty(&json!({ "listing": listing }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "listing": listing }))?
+        );
     } else {
         print!("{listing}");
     }

@@ -119,7 +119,7 @@ pub fn build(path: &str, bytes: &[u8], pe: PE) -> Binary {
             addr: imp.offset as u64,
             name: format!("{module}!{}", resolve_name(imp.dll, imp.ordinal, &imp.name)),
             kind: SymKind::Import,
-                size: None,
+            size: None,
         });
     }
 

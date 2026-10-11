@@ -166,7 +166,7 @@ fn build_one(path: &str, bytes: &[u8], m: MachO) -> Binary {
             addr: nl.n_value,
             name: name.to_string(),
             kind: SymKind::Func,
-                size: None,
+            size: None,
         });
     }
 

@@ -453,9 +453,7 @@ fn parse_code(info: &mut WasmInfo, payload: &[u8], payload_off: u64) -> Option<(
     for _ in 0..n {
         let body_size = c.uleb()? as usize;
         let body_off = payload_off + c.p as u64;
-        if c.bytes(body_size).is_none() {
-            return None;
-        }
+        c.bytes(body_size)?;
         info.func_bodies.push((body_off, body_size as u64));
     }
     Some(())
@@ -516,8 +514,7 @@ fn read_const_expr(payload: &[u8]) -> Option<i64> {
 /// subsections are skipped, not fatal.
 fn decode_name_section(info: &mut WasmInfo, payload: &[u8]) {
     let mut c = Cur::new(payload);
-    loop {
-        let Some(sub) = c.u8() else { break };
+    while let Some(sub) = c.u8() {
         let Some(sz) = c.uleb() else { break };
         let end = (c.p + sz as usize).min(payload.len());
         let sub_payload = &payload[c.p..end];
@@ -645,7 +642,9 @@ pub fn build(path: &str, bytes: &[u8]) -> Result<Binary> {
         if sec.truncated {
             notes.push(format!(
                 "section '{}' claims more bytes than the file holds; clamped",
-                sec.name.clone().unwrap_or_else(|| section_label(sec.id).to_string())
+                sec.name
+                    .clone()
+                    .unwrap_or_else(|| section_label(sec.id).to_string())
             ));
         }
         // A section that failed to walk keeps its row but flags the miss.
@@ -747,19 +746,19 @@ pub fn build(path: &str, bytes: &[u8]) -> Result<Binary> {
     }
 
     // Function symbols carry real names when the `name` custom section
-        // has a function map (wasm-bindgen keeps it), and every body carries
-        // its declared size. Defined functions index from the import count.
-        // Exported functions take their export name when the name section did
-        // not name them — for bindgen builds the export names are the ones an
-        // analyst actually searches for (classify, workbenchengine_*).
-        let import_count = info.import_funcs.len() as u32;
-        let mut export_names: std::collections::BTreeMap<u32, String> = Default::default();
-        for (kind, idx, name) in &info.export_kinds {
-            if *kind == "func" {
-                export_names.entry(*idx).or_insert_with(|| name.clone());
-            }
+    // has a function map (wasm-bindgen keeps it), and every body carries
+    // its declared size. Defined functions index from the import count.
+    // Exported functions take their export name when the name section did
+    // not name them — for bindgen builds the export names are the ones an
+    // analyst actually searches for (classify, workbenchengine_*).
+    let import_count = info.import_funcs.len() as u32;
+    let mut export_names: std::collections::BTreeMap<u32, String> = Default::default();
+    for (kind, idx, name) in &info.export_kinds {
+        if *kind == "func" {
+            export_names.entry(*idx).or_insert_with(|| name.clone());
         }
-        let bin = Binary {
+    }
+    let bin = Binary {
         path: path.to_string(),
         size: bytes.len() as u64,
         format: Format::Wasm,
@@ -911,7 +910,10 @@ mod fixture_bytes {
         prod.extend(named("0.24.5"));
         out.extend(section(SEC_CUSTOM, &prod));
         // code: one body with two locals of i32, then end
-        out.extend(section(SEC_CODE, &[0x01, 0x05, 0x01, 0x01, 0x7F, 0x41, 0x00, 0x0B]));
+        out.extend(section(
+            SEC_CODE,
+            &[0x01, 0x05, 0x01, 0x01, 0x7F, 0x41, 0x00, 0x0B],
+        ));
         // data: one active segment into memory 0 at offset 0, 4 bytes
         let mut dat = vec![0x01, 0x00, 0x41, 0x00, 0x0B, 0x04];
         dat.extend_from_slice(b"ABCD");
@@ -920,12 +922,15 @@ mod fixture_bytes {
     }
 
     /// A module with one exported function exercising the decoder: locals,
-/// consts, arithmetic, a memarg load, control flow (if/else/return), so the
-/// WAT rendering has real shapes to prove.
+    /// consts, arithmetic, a memarg load, control flow (if/else/return), so the
+    /// WAT rendering has real shapes to prove.
     pub fn wasm_wat_demo() -> Vec<u8> {
         let mut out = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
         // type: (i32, i32) -> i32
-        out.extend(section(SEC_TYPE, &[0x01, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F]));
+        out.extend(section(
+            SEC_TYPE,
+            &[0x01, 0x60, 0x02, 0x7F, 0x7F, 0x01, 0x7F],
+        ));
         // function: func 0 : type 0
         out.extend(section(SEC_FUNCTION, &[0x01, 0x00]));
         // export: "demo" : func 0
@@ -937,24 +942,22 @@ mod fixture_bytes {
         //   i32.const 16; local.get 0; i32.add; local.set 2
         //   local.get 2; i32.load offset=8
         //   if; local.get 2; return; else; i32.const 42; end; end
-        let body: Vec<u8> = [
-            &[
-                0x01, 0x01, 0x7F, // 1 local group: 1 x i32
-                0x41, 0x10, // i32.const 16
-                0x20, 0x00, // local.get 0
-                0x6A, // i32.add
-                0x21, 0x02, // local.set 2
-                0x20, 0x02, // local.get 2
-                0x28, 0x02, 0x08, // i32.load align=4 offset=8
-                0x04, 0x40, // if (void)
-                0x20, 0x02, // local.get 2
-                0x0F, // return
-                0x05, // else
-                0x41, 0x2A, // i32.const 42
-                0x0B, // end (if)
-                0x0B, // end (func)
-            ][..],
-        ]
+        let body: Vec<u8> = [&[
+            0x01, 0x01, 0x7F, // 1 local group: 1 x i32
+            0x41, 0x10, // i32.const 16
+            0x20, 0x00, // local.get 0
+            0x6A, // i32.add
+            0x21, 0x02, // local.set 2
+            0x20, 0x02, // local.get 2
+            0x28, 0x02, 0x08, // i32.load align=4 offset=8
+            0x04, 0x40, // if (void)
+            0x20, 0x02, // local.get 2
+            0x0F, // return
+            0x05, // else
+            0x41, 0x2A, // i32.const 42
+            0x0B, // end (if)
+            0x0B, // end (func)
+        ][..]]
         .concat();
         let mut code = vec![0x01];
         code.extend(uleb(body.len() as u32));
@@ -987,9 +990,9 @@ mod fixture_bytes {
     }
 
     /// A data section whose segment loads at a realistic address and whose
-/// payload ends with a planted (pointer, length) pair aimed at the string:
-/// the slice-table shape `resolve_pointers` exists for, with the wasm
-/// memory→file translation exercised end to end.
+    /// payload ends with a planted (pointer, length) pair aimed at the string:
+    /// the slice-table shape `resolve_pointers` exists for, with the wasm
+    /// memory→file translation exercised end to end.
     pub fn wasm_with_slice_table() -> Vec<u8> {
         let mut out = vec![0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00];
         // data: one active segment at memory 0x100000 (the wasm-bindgen load
@@ -1055,10 +1058,12 @@ mod tests {
         let data = bin.sections.iter().find(|s| s.name == "data").unwrap();
         assert!(data.entropy > 0.0);
         assert_eq!(data.file_size, 12); // 6 header bytes + 4 payload + section hdr
-        // Section entropy must agree with the shared helper.
+                                        // Section entropy must agree with the shared helper.
         assert_eq!(
             data.entropy,
-            entropy::entropy(&bytes[data.file_off as usize..(data.file_off + data.file_size) as usize])
+            entropy::entropy(
+                &bytes[data.file_off as usize..(data.file_off + data.file_size) as usize]
+            )
         );
         // Declared function (index 1 in the full index space) got a body hint.
         assert_eq!(bin.func_hints.len(), 1);
@@ -1088,8 +1093,14 @@ mod tests {
         // The active segment registered its load address: memory 0x100000 ->
         // file 19, where the "ABCD" bytes live.
         assert_eq!(bin.pointer_map.len(), 1);
-        assert_eq!((bin.pointer_map[0].mem, bin.pointer_map[0].file, bin.pointer_map[0].len),
-                   (0x100000, 19, 4));
+        assert_eq!(
+            (
+                bin.pointer_map[0].mem,
+                bin.pointer_map[0].file,
+                bin.pointer_map[0].len
+            ),
+            (0x100000, 19, 4)
+        );
         let refs = crate::analysis::strings::resolve_pointers(&bin, &bytes, 400);
         // The planted pair (mem pointer 0x100000, len 4) resolves through the
         // map to the in-segment string.
@@ -1127,12 +1138,8 @@ mod tests {
         // Selector by index and by address resolve to the same function.
         let by_index = crate::analysis::wat::render_function(&bin, &bytes, "0").unwrap();
         let addr = bin.symbols[0].addr;
-        let by_addr = crate::analysis::wat::render_function(
-            &bin,
-            &bytes,
-            &format!("{addr:#x}"),
-        )
-        .unwrap();
+        let by_addr =
+            crate::analysis::wat::render_function(&bin, &bytes, &format!("{addr:#x}")).unwrap();
         assert_eq!(listing, by_index);
         assert_eq!(listing, by_addr);
     }
