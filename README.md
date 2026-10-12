@@ -4,8 +4,9 @@
 
 **Find the bug, not just the binary.** A reverse engineer's toolkit in Rust.
 
-Parse, triage, disassemble, and audit **PE, ELF, and Mach-O** from one small
-binary. Static only: it reads the bytes on disk and never runs the target.
+Parse, triage, disassemble, and audit **PE, ELF, Mach-O, and WebAssembly** from
+one small binary. Static only: it reads the bytes on disk and never runs the
+target.
 
 [![ci](https://github.com/bl4ckr0ss3/knife/actions/workflows/ci.yml/badge.svg)](https://github.com/bl4ckr0ss3/knife/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/reknife.svg)](https://crates.io/crates/reknife)
@@ -276,7 +277,12 @@ severity, `/` filters. The kernel API catalogue feeds `knife sinks` and
 
 - **Cross-format, one model.** [goblin](https://github.com/m4b/goblin) parses
   PE/ELF/Mach-O into a single neutral model; every command works on every
-  format.
+  format. WebAssembly modules are parsed by knife itself (goblin has no wasm
+  parser): the full section table, imports grouped by module, exports, custom
+  sections including the `producers` toolchain fingerprint and the decoded
+  `name` section, function-body locations, and a `knife wat` listing of any
+  function body — all without a wasm lifter, so code views refuse while every
+  byte and data view works.
 - **A real analysis engine.** Recursive-descent disassembly seeded from the
   entry point and every named symbol, jump-table resolution, basic blocks, CFG,
   xref counting. On `kernel32.dll`: 2605 functions, 1515 named.

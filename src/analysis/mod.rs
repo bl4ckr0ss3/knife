@@ -23,3 +23,4 @@ pub mod sinks;
 pub mod strings;
 pub mod thunks;
 pub mod triage;
+pub mod wat;

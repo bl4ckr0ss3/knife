@@ -11,12 +11,32 @@ pub struct Session {
     pub bytes: Vec<u8>,
     pub db: db::Db,
     pub an: engine::Analysis,
+    /// Whether `an` carries recovered code. False when the architecture has
+    /// no lifter (wasm, MIPS, …) and the session was opened data-only: read
+    /// tools work off container facts, and code tools must refuse.
+    pub code_analyzed: bool,
 }
 
 impl Session {
     /// Load one analysis workspace. `need` identifies the requesting feature
     /// in unsupported-architecture diagnostics.
     pub fn open(file: &str, db_path: Option<&str>, budget: usize, need: &str) -> Result<Session> {
+        let mut s = Session::open_data(file, db_path)?;
+        if !disasm::supported(s.bin.arch) {
+            anyhow::bail!(
+                "{need} needs x86, x64, or AArch64 disassembly; this is {}",
+                s.bin.arch.label()
+            );
+        }
+        s.an = cache::load_or_analyze(&s.bin, &s.bytes, budget, &s.db, &workspace_sha(&s.bytes));
+        s.code_analyzed = true;
+        Ok(s)
+    }
+
+    /// Load container facts without code analysis. Used by read-only views
+    /// and by architectures the engine cannot lift: the parse, the staged
+    /// patches, and the annotation database all behave exactly as `open`.
+    pub fn open_data(file: &str, db_path: Option<&str>) -> Result<Session> {
         let original = std::fs::read(file).with_context(|| format!("cannot read {file}"))?;
         let original_bin = formats::analyze(file, &original)?;
         let sha256 = hashes::sha256_hex(&original);
@@ -27,21 +47,19 @@ impl Session {
         } else {
             formats::analyze(file, &bytes).context("staged patches make the binary unparsable")?
         };
-        if !disasm::supported(bin.arch) {
-            anyhow::bail!(
-                "{need} needs x86, x64, or AArch64 disassembly; this is {}",
-                bin.arch.label()
-            );
-        }
-        let workspace_sha256 = hashes::sha256_hex(&bytes);
-        let an = cache::load_or_analyze(&bin, &bytes, budget, &store, &workspace_sha256);
+        let an = engine::Analysis::empty(bin.arch);
         Ok(Session {
             bin,
             bytes,
             db: store,
             an,
+            code_analyzed: false,
         })
     }
+}
+
+fn workspace_sha(bytes: &[u8]) -> String {
+    hashes::sha256_hex(bytes)
 }
 
 #[cfg(test)]

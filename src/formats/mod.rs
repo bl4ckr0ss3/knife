@@ -8,14 +8,24 @@ pub mod fixture;
 mod macho;
 pub mod pdbsym;
 mod pe;
+mod wasm;
 
 use crate::analysis::entropy::entropy;
 use crate::model::{Binary, Format, Section};
 use anyhow::{bail, Result};
 use goblin::Object;
 
+/// The wasm module magic, before goblin's `Object::parse`: goblin has no wasm
+/// variant, so the check must come first.
+pub fn is_wasm(bytes: &[u8]) -> bool {
+    bytes.len() >= 8 && bytes[0..4] == [0x00, 0x61, 0x73, 0x6D]
+}
+
 #[allow(dead_code)]
 pub fn detect(bytes: &[u8]) -> Format {
+    if is_wasm(bytes) {
+        return Format::Wasm;
+    }
     match Object::parse(bytes) {
         Ok(Object::PE(_)) => Format::Pe,
         Ok(Object::Elf(_)) => Format::Elf,
@@ -55,12 +65,15 @@ fn catch_parse(path: &str, bytes: &[u8]) -> Result<Binary> {
 }
 
 fn build_from_object(path: &str, bytes: &[u8]) -> Result<Binary> {
+    if is_wasm(bytes) {
+        return wasm::build(path, bytes);
+    }
     match Object::parse(bytes) {
         Ok(Object::PE(pe)) => Ok(pe::build(path, bytes, pe)),
         Ok(Object::Elf(elf)) => Ok(elf::build(path, bytes, elf)),
         Ok(Object::Mach(mach)) => macho::build(path, bytes, mach),
         Ok(Object::Archive(_)) => bail!("archive files are listed, not analyzed (try `knife ls`)"),
-        _ => bail!("unrecognized format: not PE, ELF, or Mach-O"),
+        _ => bail!("unrecognized format: not PE, ELF, Mach-O, or WebAssembly"),
     }
 }
 

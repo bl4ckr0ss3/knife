@@ -179,6 +179,7 @@ fn read(path: &Path, wanted: &Wanted) -> Result<Option<Vec<Symbol>>, String> {
                     addr: u64::from(rva.0),
                     name: data.name.to_string().into_owned(),
                     kind: SymKind::Func,
+                    size: None,
                 });
             }
         }

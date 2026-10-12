@@ -166,6 +166,7 @@ fn build_one(path: &str, bytes: &[u8], m: MachO) -> Binary {
             addr: nl.n_value,
             name: name.to_string(),
             kind: SymKind::Func,
+            size: None,
         });
     }
 
@@ -188,6 +189,7 @@ fn build_one(path: &str, bytes: &[u8], m: MachO) -> Binary {
         symbols,
         func_hints: Vec::new(),
         libs: m.libs.iter().map(|s| s.to_string()).collect(),
+        pointer_map: Vec::new(),
         rpaths: m.rpaths.iter().map(|s| s.to_string()).collect(),
         overall_entropy: 0.0,
         overlay_off: None,

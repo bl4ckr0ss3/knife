@@ -424,5 +424,4 @@ mod tests {
             assert!(operation.emits_evidence);
         }
     }
-
 }

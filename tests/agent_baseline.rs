@@ -27,6 +27,24 @@ fn fixture_session() -> (std::path::PathBuf, Session) {
 }
 
 #[test]
+fn wasm_container_functions_remain_paginated_without_native_analysis() {
+    let (root, _) = fixture_session();
+    let target = root.join("fixture.wasm");
+    let bytes = [
+        0, 97, 115, 109, 1, 0, 0, 0, 1, 4, 1, 96, 0, 0, 3, 2, 1, 0, 7, 7, 1, 3, 114, 117, 110, 0,
+        0, 10, 4, 1, 2, 0, 11,
+    ];
+    std::fs::write(&target, bytes).unwrap();
+    let session = Session::open_data(target.to_str().unwrap(), None).unwrap();
+    let functions = tools::dispatch(&session, "list_functions", &json!({"limit": 1})).unwrap();
+    assert_eq!(functions["returned"], 1);
+    assert!(functions["functions"][0]["blocks"].is_null());
+    assert!(tools::dispatch(&session, "wat", &json!({})).is_ok());
+    assert!(tools::dispatch(&session, "disassemble", &json!({"selector": "run"})).is_err());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn session_status_establishes_identity_coverage_and_limitations() {
     let (root, session) = fixture_session();
     let first = tools::dispatch(&session, "session_status", &json!({})).unwrap();

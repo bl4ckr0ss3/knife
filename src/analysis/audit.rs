@@ -238,7 +238,7 @@ fn classify(
             // bottom band. This is exactly the false positive a run against real
             // software surfaces: `strcpy(local, "some literal")`.
             if dest_is_stack {
-                let source = source_arg(api).map(&prov);
+                let source = source_arg(api).map(prov);
                 if source.as_ref().is_some_and(|p| p.is_only(Origin::Fixed)) {
                     return Some(mk(
                         "stack-overflow",
@@ -959,6 +959,7 @@ mod tests {
                 addr: slot,
                 name: sink.into(),
                 kind: SymKind::Import,
+                size: None,
             }];
             let mut bytes = vec![0u8; va as usize];
             bytes.extend_from_slice(&code);
@@ -993,6 +994,7 @@ mod tests {
                 addr: slot,
                 name: sink.into(),
                 kind: SymKind::Import,
+                size: None,
             }];
             let mut bytes = vec![0u8; va as usize];
             bytes.extend_from_slice(&code);
@@ -1004,6 +1006,7 @@ mod tests {
                 addr,
                 name: name.into(),
                 kind: SymKind::Import,
+                size: None,
             });
             self
         }
@@ -1393,6 +1396,7 @@ mod tests {
             addr: other,
             name: "getpid".into(),
             kind: SymKind::Import,
+            size: None,
         });
         let f = h.findings();
         assert!(

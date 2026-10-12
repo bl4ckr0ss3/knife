@@ -8,7 +8,7 @@
 use crate::address::{FileOffset, StaticVa};
 use crate::analysis::{
     audit, capabilities, driver, engine, entropy, graphs, hardening, hashes, ir, loldrivers,
-    signatures, signing, sinks, strings, triage,
+    signatures, signing, sinks, strings, triage, wat,
 };
 use crate::api::edits::{apply_analyst_edit, AnalystEdit};
 use crate::api::evidence::{
@@ -80,7 +80,7 @@ pub fn read_catalog() -> Vec<OperationDescriptor> {
         tool("trace_taint", "For one function, the exploitable-looking sinks it contains with each dangerous argument's provenance, plus the call chains that reach the function — how caller-controlled input flows to a dangerous call.",
              selector_props(), &[]).with_any_required(&["selector", "address"]),
         tool("strings", "String literals whose text contains a query (empty query lists the first strings), with reference counts.",
-             json!({"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1}, "cursor": {"type": "string"}}), &[]).with_result_mode(ResultMode::Paginated),
+             json!({"query": {"type": "string"}, "pointers": {"type": "boolean", "description": "resolve pointer/length string pairs (bounded to 400 candidates)"}, "limit": {"type": "integer", "minimum": 1}, "cursor": {"type": "string"}}), &[]).with_result_mode(ResultMode::Paginated),
         tool("iocs", "Indicators of compromise extracted from strings: URLs, hosts, IPs, paths, registry keys.", json!({}), &[]),
         tool("imports", "Imported functions the binary calls out to.", json!({}), &[]),
         tool("exports", "Functions the binary exports.", json!({}), &[]),
@@ -90,6 +90,8 @@ pub fn read_catalog() -> Vec<OperationDescriptor> {
             json!({"view": {"type": "string", "enum": ["header", "segments", "section_headers"]}}),
             &["view"],
         ),
+        tool("wat", "WAT-style listing of one WebAssembly function (selector: name, index, or hex body address), or the function table when omitted.",
+             json!({"selector": {"type": "string"}}), &[]),
         tool("capabilities", "Behavioural capabilities inferred from imports/exports, grouped by category.", json!({}), &[]),
         tool("hardening", "Exploit-mitigation posture: ASLR, DEP/NX, stack canary, CFG, RELRO, and more.", json!({}), &[]),
         tool("triage", "Malware-triage verdict and the signals behind it.", json!({}), &[]),
@@ -206,10 +208,47 @@ pub fn dispatch_system(store: &ResultStore, name: &str, args: &Value) -> Result<
     }
 }
 
+/// Tools whose answers come from recovered code rather than container facts.
+/// The MCP server opens these against a code-analyzed session; everything else
+/// also works on architectures without a lifter (wasm, MIPS, …).
+pub fn needs_code(name: &str) -> bool {
+    matches!(
+        name,
+        "disassemble"
+            | "inspect_address_context"
+            | "resolve_containing_function"
+            | "read_function_instructions"
+            | "decompile"
+            | "audit"
+            | "xrefs"
+            | "callees"
+            | "paths_to"
+            | "trace_taint"
+            | "call_graph"
+            | "sinks"
+    )
+}
+
+/// Guard for code tools on a data-only session: refuse with the same shape as
+/// `Session::open`'s architecture diagnostic instead of answering from an
+/// empty analysis, which would read as "no functions exist".
+fn require_code(sess: &Session) -> Result<()> {
+    if sess.code_analyzed {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "this tool needs x86, x64, or AArch64 disassembly; this is {}",
+        sess.bin.arch.label()
+    )
+}
+
 /// Run one tool by name against a session, returning structured JSON. Unknown
 /// names error. Text-shaped results (disassembly, pseudocode, a hex dump) are
 /// returned as a JSON string so a consumer can print them verbatim.
 pub fn dispatch(sess: &Session, name: &str, args: &Value) -> Result<Value> {
+    if needs_code(name) {
+        require_code(sess)?;
+    }
     match name {
         "session_status" => session_status(sess),
         "info" => Ok(info(sess)),
@@ -237,6 +276,7 @@ pub fn dispatch(sess: &Session, name: &str, args: &Value) -> Result<Value> {
             serde_json::to_value(signing::summarize(&sess.bin, &sess.bytes)).map_err(Into::into)
         }
         "hashes" => Ok(hashes_tool(sess)),
+        "wat" => Ok(wat_tool(sess, args)),
         "entropy" => Ok(entropy_tool(sess)),
         "driver_report" => driver_report(sess),
         "call_graph" => call_graph(sess, &sel(args)?),
@@ -399,6 +439,13 @@ fn operation_availability(
     operation: &OperationDescriptor,
 ) -> OperationAvailability {
     let reason = match operation.name {
+        name if needs_code(name) && !sess.code_analyzed => Some(
+            "this target has container metadata only; native code analysis is unavailable"
+                .to_string(),
+        ),
+        "wat" if sess.bin.format != crate::model::Format::Wasm => {
+            Some("the active target is not WebAssembly".to_string())
+        }
         "decompile" | "audit" | "trace_taint" | "driver_report" if !sess.bin.arch.is_x86() => {
             Some("the current lifting engine supports x86 and x86-64 only".to_string())
         }
@@ -484,6 +531,36 @@ fn info(sess: &Session) -> Value {
 }
 
 fn list_functions(sess: &Session, args: &Value) -> Result<Value> {
+    if !sess.code_analyzed {
+        let needle = args
+            .get("filter")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_lowercase();
+        let named_only = args
+            .get("named_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let matched: Vec<_> = sess
+            .bin
+            .symbols
+            .iter()
+            .filter(|s| matches!(s.kind, SymKind::Func | SymKind::Export))
+            .filter(|s| !named_only || !s.name.is_empty())
+            .filter(|s| needle.is_empty() || s.name.to_lowercase().contains(&needle))
+            .collect();
+        let page = PageWindow::from_args(
+            args,
+            matched.len(),
+            200,
+            ROW_LIMIT,
+            &format!("list_functions:container:{needle}:{named_only}"),
+        )?;
+        let rows: Vec<_> = matched.into_iter().skip(page.offset).take(page.limit).map(|s| json!({"addr": format!("0x{:x}", s.addr), "name": s.name, "named": !s.name.is_empty(), "size": s.size, "blocks": null, "incoming": null})).collect();
+        return Ok(
+            json!({"count": rows.len(), "matched": page.total, "returned": rows.len(), "next_cursor": page.next_cursor, "functions": rows, "note": "Names and sizes come from container metadata; control flow has not been analyzed."}),
+        );
+    }
     let needle = args
         .get("filter")
         .and_then(Value::as_str)
@@ -1125,6 +1202,33 @@ fn trace_taint(sess: &Session, selector: &str) -> Result<Value> {
 }
 
 fn strings_tool(sess: &Session, args: &Value) -> Result<Value> {
+    if args
+        .get("pointers")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let q = args
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_lowercase();
+        let refs = strings::resolve_pointers(&sess.bin, &sess.bytes, ROW_LIMIT);
+        let matched: Vec<_> = refs
+            .iter()
+            .filter(|r| q.is_empty() || r.text.to_lowercase().contains(&q))
+            .collect();
+        let page = PageWindow::from_args(
+            args,
+            matched.len(),
+            80,
+            ROW_LIMIT,
+            &format!("strings:pointers:{q}"),
+        )?;
+        let rows: Vec<_> = matched.into_iter().skip(page.offset).take(page.limit).map(|r| json!({"addr": format!("0x{:x}", r.addr), "target": format!("0x{:x}", r.target), "len": r.len, "text": r.text})).collect();
+        return Ok(
+            json!({"count": rows.len(), "matched": page.total, "next_cursor": page.next_cursor, "pointers": rows, "coverage_limit": ROW_LIMIT}),
+        );
+    }
     let q = args
         .get("query")
         .and_then(Value::as_str)
@@ -1254,6 +1358,31 @@ fn entropy_tool(sess: &Session) -> Value {
         "map": entropy::entropy_map(&sess.bytes, 64),
         "note": "8.0 is maximum; sustained values above ~7.2 suggest compression or encryption.",
     })
+}
+
+fn wat_tool(sess: &Session, args: &Value) -> Value {
+    let selector = args.get("selector").and_then(Value::as_str).unwrap_or("");
+    if selector.is_empty() {
+        let rows: Vec<Value> = sess
+            .bin
+            .symbols
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                json!({
+                    "index": i,
+                    "addr": format!("0x{:x}", s.addr),
+                    "size": s.size,
+                    "name": if s.name.is_empty() { format!("sub_{:x}", s.addr) } else { s.name.clone() },
+                })
+            })
+            .collect();
+        return json!({ "count": rows.len(), "functions": rows });
+    }
+    match wat::render_function(&sess.bin, &sess.bytes, selector) {
+        Ok(listing) => json!({ "listing": listing }),
+        Err(e) => json!({ "error": e.to_string() }),
+    }
 }
 
 fn driver_report(sess: &Session) -> Result<Value> {

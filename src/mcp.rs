@@ -334,11 +334,13 @@ fn call_tool(msg: &Value, srv: &mut Server) -> Result<ToolCallOutput> {
         })?,
     };
 
-    // `open` binds the target and reports what was read, so a client can see the
-    // file parsed before it starts asking questions whose answers assume it did.
+    // `open` binds the target and reports what was read, so a client can see
+    // the file parsed before it starts asking questions whose answers assume
+    // it did. Container facts are enough for that report; the code engine
+    // wakes up on the first tool that actually needs it.
     if name == "open" {
         let (value, target_sha256) = {
-            let sess = session(&mut srv.cache, &file)?;
+            let sess = session_data(&mut srv.cache, &file)?;
             let info = tools::dispatch(sess, "info", &json!({}))?;
             (
                 json!({ "ok": true, "target": file, "info": info }),
@@ -353,7 +355,15 @@ fn call_tool(msg: &Value, srv: &mut Server) -> Result<ToolCallOutput> {
     // is JSON.
     if tools::read_catalog().iter().any(|t| t.name == name) {
         let (value, target_sha256) = {
-            let sess = session(&mut srv.cache, &file)?;
+            let native = matches!(
+                session_data(&mut srv.cache, &file)?.bin.arch,
+                crate::model::Arch::X86 | crate::model::Arch::X86_64 | crate::model::Arch::Aarch64
+            );
+            let sess = if tools::needs_code(&name) || native {
+                session(&mut srv.cache, &file)?
+            } else {
+                session_data(&mut srv.cache, &file)?
+            };
             (
                 tools::dispatch(sess, &name, &args)?,
                 crate::analysis::hashes::sha256_hex(&sess.bytes),
@@ -406,7 +416,12 @@ fn retain_output(
 }
 
 fn session<'a>(cache: &'a mut Option<(String, Session)>, file: &str) -> Result<&'a Session> {
-    let stale = cache.as_ref().map(|(p, _)| p != file).unwrap_or(true);
+    // Full session: code tools need recovered code. A cached data-only
+    // session for the same file is upgraded in place.
+    let stale = cache
+        .as_ref()
+        .map(|(p, s)| p != file || !s.code_analyzed)
+        .unwrap_or(true);
     if stale {
         let sess = Session::open(file, None, ANALYSIS_BUDGET, "the MCP server")?;
         *cache = Some((file.to_string(), sess));
@@ -414,6 +429,16 @@ fn session<'a>(cache: &'a mut Option<(String, Session)>, file: &str) -> Result<&
     Ok(&cache.as_ref().expect("just set").1)
 }
 
+/// Session for read tools that never touch recovered code. Architectures the
+/// engine cannot lift (wasm, MIPS, …) still get their full container view.
+fn session_data<'a>(cache: &'a mut Option<(String, Session)>, file: &str) -> Result<&'a Session> {
+    let stale = cache.as_ref().map(|(p, _)| p != file).unwrap_or(true);
+    if stale {
+        let sess = Session::open_data(file, None)?;
+        *cache = Some((file.to_string(), sess));
+    }
+    Ok(&cache.as_ref().expect("just set").1)
+}
 fn session_mut<'a>(
     cache: &'a mut Option<(String, Session)>,
     file: &str,

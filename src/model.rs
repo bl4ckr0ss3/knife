@@ -8,6 +8,9 @@ pub enum Format {
     Pe,
     Elf,
     MachO,
+    /// WebAssembly module (`.wasm`). Sections are parsed, but the engine has
+    /// no wasm lifter: code views refuse, byte/data views work.
+    Wasm,
     Archive,
     Unknown,
 }
@@ -18,6 +21,7 @@ impl Format {
             Format::Pe => "PE",
             Format::Elf => "ELF",
             Format::MachO => "Mach-O",
+            Format::Wasm => "WebAssembly",
             Format::Archive => "archive",
             Format::Unknown => "unknown",
         }
@@ -32,6 +36,9 @@ pub enum Arch {
     Aarch64,
     Mips,
     Riscv,
+    /// WebAssembly bytecode. Not machine code: the disassembler and the
+    /// lifting passes refuse it, while every byte/data view still works.
+    Wasm,
     Other,
 }
 
@@ -44,6 +51,7 @@ impl Arch {
             Arch::Aarch64 => "AArch64",
             Arch::Mips => "MIPS",
             Arch::Riscv => "RISC-V",
+            Arch::Wasm => "wasm32",
             Arch::Other => "other",
         }
     }
@@ -51,7 +59,7 @@ impl Arch {
     #[allow(dead_code)]
     pub fn bits(self) -> u32 {
         match self {
-            Arch::X86 | Arch::Arm | Arch::Mips => 32,
+            Arch::X86 | Arch::Arm | Arch::Mips | Arch::Wasm => 32,
             _ => 64,
         }
     }
@@ -116,10 +124,16 @@ pub enum SymKind {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Symbol {
-    /// Image address (PE: RVA; ELF/Mach-O: virtual address).
+    /// Image address (PE: RVA; ELF/Mach-O: virtual address). For wasm this is
+    /// the function body's file offset (identity address map).
     pub addr: u64,
     pub name: String,
     pub kind: SymKind,
+    /// Container-declared extent, when the format records one (PE exports do
+    /// not; wasm code bodies and ELF symbol sizes do). Formats that lack it
+    /// leave `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
 }
 
 /// The PE load configuration directory, where the linker records the pointers
@@ -171,6 +185,15 @@ pub struct HardeningFacts {
     pub fortify_syms: usize,
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct PointerRange {
+    /// Address pointers name (the load address of the range).
+    pub mem: u64,
+    /// File offset the range's bytes live at.
+    pub file: u64,
+    pub len: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Binary {
     pub path: String,
@@ -198,6 +221,12 @@ pub struct Binary {
     pub func_hints: Vec<u64>,
     pub libs: Vec<String>,
     pub rpaths: Vec<String>,
+    /// Load-image ranges for formats whose pointers name memory rather than
+    /// the file: wasm data segments load at their segment offset, so a u32
+    /// in the image is a memory address that must translate through one of
+    /// these ranges. Empty when pointers already are file offsets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pointer_map: Vec<PointerRange>,
     pub overall_entropy: f64,
     pub overlay_off: Option<u64>,
     pub overlay_size: u64,
@@ -247,6 +276,7 @@ impl Binary {
             symbols: Vec::new(),
             func_hints: Vec::new(),
             libs: Vec::new(),
+            pointer_map: Vec::new(),
             rpaths: Vec::new(),
             overall_entropy: 0.0,
             overlay_off: None,
