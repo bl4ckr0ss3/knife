@@ -12,6 +12,7 @@ pub mod listing;
 pub mod mcp;
 pub mod model;
 pub mod output;
+pub mod providers;
 #[cfg(test)]
 mod robustness;
 pub mod tools;

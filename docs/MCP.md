@@ -79,6 +79,11 @@ engine once.
 | tool | what it answers |
 |---|---|
 | `open` | analyse a binary and make it the session target |
+| `provider_status` | optional external engines, versions, safety mode, licenses, limitations, and operations |
+| `yarax_validate_rules` | compile bounded inline YARA rules and inspect their diagnostics/inventory without a target |
+| `list_retained_results` | bounded results currently retained by this server process |
+| `get_retained_result` | exact structured payload for a returned result reference |
+| `session_status` | content identity, analysis coverage, per-target tool availability, limitations, and versioned evidence |
 | `info` | format, architecture, entry point, sections, function and import counts |
 | `triage` | malware-triage verdict and the signals behind it |
 | `hashes` | md5/sha1/sha256 and imphash |
@@ -88,6 +93,10 @@ engine once.
 | `signatures` | byte-signature hits: crypto constants, packers, embedded formats |
 | `loldrivers` | whether the sha256 matches a known vulnerable driver |
 | `list_functions` | recovered functions, with incoming call counts |
+| `inspect_address_context` | section/file mapping, symbol, containing function, instruction, and xref counts for an address |
+| `resolve_containing_function` | recovered function containing an interior static address |
+| `address_to_file_offset` | checked static-VA to on-disk file-offset conversion |
+| `read_function_instructions` | structured, cursor-paginated instruction rows, including bytes, targets, blocks, and file offsets |
 | `disassemble` | one function's disassembly |
 | `decompile` | one function's pseudocode |
 | `xrefs` | what calls or jumps to an address or function |
@@ -103,7 +112,9 @@ engine once.
 | `elf_structure` | ELF header, program-header, or section-header records with exact file ranges |
 | `capabilities` | behaviour inferred from imports and exports, by category |
 | `driver_report` | Windows-driver / BYOVD surface: devices, IRP dispatch, decoded IOCTLs |
-| `read_bytes` | a hex+ascii dump at a virtual address |
+| `read_bytes` | an exact-length bounded hex+ascii dump at a static virtual address |
+| `rizin_*` | independent Rizin metadata, symbols, functions, disassembly, xrefs, CFG, and call-graph evidence |
+| `yarax_scan` / `yarax_scan_range` | native YARA-X matching over the exact workspace or a mapped static-address range |
 | `set_name` | persist an analyst name for the code at an address |
 | `set_note` | attach an analyst note to an address |
 | `set_prototype` | set a function's return and parameter C types |
@@ -112,10 +123,33 @@ engine once.
 The four `set_*`/`stage_*` tools mutate the saved database beside the binary,
 exactly as the equivalent CLI commands do. Nothing writes to the binary itself.
 
+Every advertised MCP tool comes from the shared Knife operation registry and
+carries machine-readable annotations describing
+whether it is read-only or writes the analysis project. Future debugger and
+export operations use the same contract to distinguish target execution and
+target writes. `session_status` and the address/instruction operations return a
+versioned evidence envelope that separates observations, static-analysis
+inferences, and unknowns and carries limitations with the result.
+`session_status` also tells an agent which operations are usable for the active
+format and architecture and gives an explicit reason when one is not. Existing
+tools retain their response shapes while they migrate to that envelope.
+
+Successful tool calls include a content-addressed `knife/resultId` in their MCP
+result metadata. The corresponding structured payload is retained in a bounded,
+process-local ledger and can be recovered with `get_retained_result` without an
+active target. Identical operation results share a stable reference. The ledger
+evicts its oldest entries when its item or byte budget is reached.
+
+`list_functions`, `strings`, and `read_function_instructions` accept an optional
+opaque `cursor`. Their results include `next_cursor` when another page exists.
+Cursors are bound to the query that created them, so changing a filter, function,
+or instruction start address while continuing a page is rejected.
+
 ## A session
 
 ```
 open      { "file": "/samples/suspect.sys" }
+session_status {}
 triage    {}
 audit     { "reachable": true }
 trace_taint { "selector": "sub_140003a10" }

@@ -28,8 +28,11 @@ complete query parity is still stabilization work.
 
 ## Next work
 
-1. Check remaining CLI/MCP query parity and document intentional differences.
-2. Dogfood large PE/ELF/Mach-O targets across terminals; prioritize measured
+1. Continue the evidence and operation-registry baseline in
+   [agent-platform-plan.md](agent-platform-plan.md), migrating capabilities in
+   small compatibility-tested slices.
+2. Check remaining CLI/MCP query parity and document intentional differences.
+3. Dogfood large PE/ELF/Mach-O targets across terminals; prioritize measured
    navigation or analysis bottlenecks over more pane features.
 
 Decompiler and inferred-type views remain experimental. New capabilities should

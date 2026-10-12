@@ -12,7 +12,7 @@
 //! an absolute path on each of thirty tool calls is context an agent should be
 //! spending on the binary instead, and a path retyped is a path mistyped.
 
-use crate::analysis::engine;
+use crate::api::results::{ResultId, ResultStore};
 use crate::{tools, workspace::Session, ANALYSIS_BUDGET};
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -30,7 +30,15 @@ const INSTRUCTIONS: &str = concat!(
     "malware.\n",
     "\n",
     "Call `open` with the path first: it binds the target, and every later call may\n",
-    "then omit `file`.\n",
+    "then omit `file`. Call `session_status` next to establish target identity,\n",
+    "analysis coverage, limitations, and an evidence record before drawing conclusions.\n",
+    "Successful calls include a bounded `knife/resultId`; use `get_retained_result`\n",
+    "to retrieve the exact structured payload without rerunning analysis.\n",
+    "Call `provider_status` to discover optional external engines. Provider-prefixed\n",
+    "tools such as `rizin_functions` are independent static-analysis evidence; use\n",
+    "them to corroborate Knife findings, not as proof of runtime behavior.\n",
+    "`yarax_validate_rules`, `yarax_scan`, and `yarax_scan_range` compile bounded\n",
+    "inline rules with the native YARA-X engine and report exact match offsets.\n",
     "\n",
     "Where to go next:\n",
     "- `triage`, `hardening`, `signatures`, `entropy` — what the file is, whether it\n",
@@ -87,6 +95,18 @@ struct Server {
     /// The last file analysed, cached so repeated tool calls on one target do
     /// not re-run the whole engine each time.
     cache: Option<(String, Session)>,
+    /// Bounded structured results addressable by later agent calls.
+    results: ResultStore,
+}
+
+impl Server {
+    fn new(target: Option<String>) -> Self {
+        Self {
+            target,
+            cache: None,
+            results: ResultStore::default(),
+        }
+    }
 }
 
 /// Run the server until stdin closes. `target` is the optional `--file` binding.
@@ -94,10 +114,7 @@ pub fn run(target: Option<String>) -> Result<()> {
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
     let mut out = std::io::stdout();
-    let mut srv = Server {
-        target,
-        cache: None,
-    };
+    let mut srv = Server::new(target);
 
     while let Some(frame) = read_frame(&mut reader)? {
         // A frame we cannot read still gets an answer. Dropping it keeps the
@@ -136,8 +153,8 @@ pub fn run(target: Option<String>) -> Result<()> {
             "ping" => ok(id.clone(), json!({})),
             "tools/list" => ok(id.clone(), json!({ "tools": tool_list() })),
             "tools/call" => match call_tool(&msg, &mut srv) {
-                Ok(text) => ok(id.clone(), tool_text(&text, false)),
-                Err(e) => ok(id.clone(), tool_text(&format!("error: {e:#}"), true)),
+                Ok(result) => ok(id.clone(), tool_success(result)),
+                Err(e) => ok(id.clone(), tool_error(&format!("error: {e:#}"))),
             },
             _ => err(id.clone(), -32601, "method not found"),
         }))
@@ -168,8 +185,29 @@ fn err(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
-fn tool_text(text: &str, is_error: bool) -> Value {
-    json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
+#[derive(Debug)]
+struct ToolCallOutput {
+    text: String,
+    structured: Option<Value>,
+    result_id: Option<ResultId>,
+}
+
+fn tool_success(output: ToolCallOutput) -> Value {
+    let mut result = json!({
+        "content": [{ "type": "text", "text": output.text }],
+        "isError": false,
+    });
+    if let Some(structured) = output.structured {
+        result["structuredContent"] = structured;
+    }
+    if let Some(result_id) = output.result_id {
+        result["_meta"] = json!({ "knife/resultId": result_id });
+    }
+    result
+}
+
+fn tool_error(text: &str) -> Value {
+    json!({ "content": [{ "type": "text", "text": text }], "isError": true })
 }
 
 fn initialize() -> Value {
@@ -197,58 +235,73 @@ fn tool_list() -> Vec<Value> {
                 "required": ["file"] }),
     )];
 
-    // Read tools come from the shared catalog; MCP only adds its transport
-    // `file` argument to each. Write tools are MCP-specific and listed after.
+    // Every operation comes from the shared catalog; MCP adds only its
+    // transport-level `file` argument.
     all.extend(tools::catalog().into_iter().map(|t| {
-        let mut schema = t.params;
-        if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
-            props.insert("file".into(), file_arg());
+        let mut schema = t.params.clone();
+        if t.target == crate::api::operations::TargetRequirement::Active {
+            if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+                props.insert("file".into(), file_arg());
+            }
         }
-        tool(t.name, t.description, schema)
+        tool_from_operation(&t, schema)
     }));
 
-    let addr = || json!({ "type": "string", "description": "address (0x...)" });
-    all.push(tool(
-        "set_name",
-        "Persist an analyst name for the code at an address. Mutates the saved database.",
-        json!({ "type": "object", "properties": {
-            "file": file_arg(), "address": addr(), "name": { "type": "string" } },
-            "required": ["address", "name"] }),
-    ));
-    all.push(tool(
-        "set_note",
-        "Attach an analyst note to an address. Mutates the saved database.",
-        json!({ "type": "object", "properties": {
-            "file": file_arg(), "address": addr(), "note": { "type": "string" } },
-            "required": ["address", "note"] }),
-    ));
-    all.push(tool(
-        "set_prototype",
-        "Set a function prototype: a return C type and ordered parameter C types. Mutates the saved database.",
-        json!({ "type": "object", "properties": {
-            "file": file_arg(),
-            "function": { "type": "string", "description": "name or address (0x...)" },
-            "returns": { "type": "string" },
-            "params": { "type": "array", "items": { "type": "string" } } },
-            "required": ["function", "returns"] }),
-    ));
-    all.push(tool(
-        "stage_patch",
-        "Stage a byte patch at a file offset (replacement bytes as hex). Staged only; exporting writes it out.",
-        json!({ "type": "object", "properties": {
-            "file": file_arg(),
-            "offset": { "type": "string", "description": "file offset (0x...)" },
-            "bytes": { "type": "string", "description": "replacement bytes as hex, e.g. 90 90" } },
-            "required": ["offset", "bytes"] }),
-    ));
     all
 }
 
-fn tool(name: &str, description: &str, schema: Value) -> Value {
-    json!({ "name": name, "description": description, "inputSchema": schema })
+fn tool_from_operation(
+    operation: &crate::api::operations::OperationDescriptor,
+    schema: Value,
+) -> Value {
+    let mut tool = tool_with_access(
+        operation.name,
+        operation.description,
+        schema,
+        operation.access,
+    );
+    tool["_meta"]["knife/targetRequirement"] = json!(operation.target);
+    tool["_meta"]["knife/resultMode"] = json!(operation.result_mode);
+    tool["_meta"]["knife/emitsEvidence"] = json!(operation.emits_evidence);
+    tool
 }
 
-fn call_tool(msg: &Value, srv: &mut Server) -> Result<String> {
+fn tool(name: &str, description: &str, schema: Value) -> Value {
+    tool_with_access(
+        name,
+        description,
+        schema,
+        crate::api::operations::OperationAccess::ReadOnly,
+    )
+}
+
+fn tool_with_access(
+    name: &str,
+    description: &str,
+    schema: Value,
+    access: crate::api::operations::OperationAccess,
+) -> Value {
+    use crate::api::operations::OperationAccess;
+
+    let read_only = access == OperationAccess::ReadOnly;
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": schema,
+        "annotations": {
+            "readOnlyHint": read_only,
+            "destructiveHint": access == OperationAccess::TargetWrite,
+            "idempotentHint": read_only,
+            "openWorldHint": access == OperationAccess::TargetExecution,
+        },
+        "_meta": {
+            "knife/access": access,
+            "knife/evidenceContract": crate::api::evidence::EVIDENCE_CONTRACT_VERSION,
+        },
+    })
+}
+
+fn call_tool(msg: &Value, srv: &mut Server) -> Result<ToolCallOutput> {
     let params = msg.get("params").cloned().unwrap_or(json!({}));
     let name = params
         .get("name")
@@ -256,6 +309,15 @@ fn call_tool(msg: &Value, srv: &mut Server) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("missing tool name"))?
         .to_string();
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
+
+    // Platform-session operations require no binary and are intentionally not
+    // retained themselves: retaining a retrieval would recursively wrap the
+    // result ledger.
+    if tools::system_catalog().iter().any(|tool| tool.name == name) {
+        let value = tools::dispatch_system(&srv.results, &name, &args)?;
+        return Ok(output(value, None));
+    }
+
     // A call may name a file, and naming one makes it the target from then on.
     // Otherwise it inherits whatever `--file` or an earlier `open` bound. With
     // nothing bound the error says how to bind something, because "missing
@@ -275,89 +337,72 @@ fn call_tool(msg: &Value, srv: &mut Server) -> Result<String> {
     // `open` binds the target and reports what was read, so a client can see the
     // file parsed before it starts asking questions whose answers assume it did.
     if name == "open" {
-        let sess = session(&mut srv.cache, &file)?;
-        let info = tools::dispatch(sess, "info", &json!({}))?;
-        return Ok(json!({ "ok": true, "target": file, "info": info }).to_string());
+        let (value, target_sha256) = {
+            let sess = session(&mut srv.cache, &file)?;
+            let info = tools::dispatch(sess, "info", &json!({}))?;
+            (
+                json!({ "ok": true, "target": file, "info": info }),
+                crate::analysis::hashes::sha256_hex(&sess.bytes),
+            )
+        };
+        return Ok(retain_output(srv, &name, Some(&target_sha256), value));
     }
 
     // Read tools dispatch through the shared catalog. A string result (a
     // disassembly, pseudocode, a hex dump) is returned verbatim; anything else
     // is JSON.
-    if tools::catalog().iter().any(|t| t.name == name) {
-        let sess = session(&mut srv.cache, &file)?;
-        let v = tools::dispatch(sess, &name, &args)?;
-        return Ok(match v {
-            Value::String(text) => text,
-            other => other.to_string(),
-        });
+    if tools::read_catalog().iter().any(|t| t.name == name) {
+        let (value, target_sha256) = {
+            let sess = session(&mut srv.cache, &file)?;
+            (
+                tools::dispatch(sess, &name, &args)?,
+                crate::analysis::hashes::sha256_hex(&sess.bytes),
+            )
+        };
+        return Ok(retain_output(srv, &name, Some(&target_sha256), value));
     }
 
-    // Write tools mutate the saved database, exactly as the CLI edit commands do;
-    // the Session layer re-applies them on the next open.
-    match name.as_str() {
-        "set_name" | "set_note" => {
-            let va = addr_arg(&args, "address")?;
-            let key = if name == "set_name" { "name" } else { "note" };
-            let text = args
-                .get(key)
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("missing `{key}`"))?
-                .to_string();
+    if tools::mutation_catalog().iter().any(|t| t.name == name) {
+        let (result, target_sha256) = {
             let sess = session_mut(&mut srv.cache, &file)?;
-            let at = va.wrapping_sub(engine::display_base(&sess.bin));
-            if name == "set_name" {
-                sess.db.set_name(at, &text);
-            } else {
-                sess.db.set_note(at, &text);
-            }
-            sess.db.save()?;
-            Ok(json!({ "ok": true, "address": format!("0x{va:x}"), key: text }).to_string())
-        }
-        "set_prototype" => {
-            let selector = args
-                .get("function")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("missing `function`"))?
-                .to_string();
-            let returns = args
-                .get("returns")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("missing `returns`"))?
-                .to_string();
-            let ps: Vec<String> = args
-                .get("params")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let sess = session_mut(&mut srv.cache, &file)?;
-            let func = resolve(&sess.an, &selector)
-                .ok_or_else(|| anyhow::anyhow!("no function '{selector}'"))?;
-            let at = func.addr.wrapping_sub(sess.an.display_base);
-            let fname = func.name.clone();
-            sess.db.set_prototype(at, &returns, &ps)?;
-            sess.db.save()?;
-            Ok(json!({ "ok": true, "function": fname,
-                       "prototype": format!("{returns} ({})", ps.join(", ")) })
-            .to_string())
-        }
-        "stage_patch" => {
-            let offset = addr_arg(&args, "offset")?;
-            let hex = args
-                .get("bytes")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow::anyhow!("missing `bytes`"))?;
-            let raw = parse_hex_bytes(hex)?;
-            let sess = session_mut(&mut srv.cache, &file)?;
-            let n = sess.db.stage_patch(&sess.bytes, offset, &raw)?;
-            sess.db.save()?;
-            Ok(json!({ "ok": true, "offset": format!("0x{offset:x}"), "staged": n }).to_string())
-        }
-        other => anyhow::bail!("unknown tool '{other}'"),
+            (
+                tools::dispatch_mut(sess, &name, &args)?,
+                crate::analysis::hashes::sha256_hex(&sess.bytes),
+            )
+        };
+        // Reopen on the next read so names feed function recovery and staged
+        // bytes feed parsing/analysis instead of leaving the bound session
+        // stale after a successful project mutation.
+        srv.cache = None;
+        return Ok(retain_output(srv, &name, Some(&target_sha256), result));
     }
+
+    anyhow::bail!("unknown tool '{name}'")
+}
+
+fn output(value: Value, result_id: Option<ResultId>) -> ToolCallOutput {
+    match value {
+        Value::String(text) => ToolCallOutput {
+            text,
+            structured: None,
+            result_id,
+        },
+        structured => ToolCallOutput {
+            text: structured.to_string(),
+            structured: Some(structured),
+            result_id,
+        },
+    }
+}
+
+fn retain_output(
+    srv: &mut Server,
+    operation: &str,
+    target_sha256: Option<&str>,
+    value: Value,
+) -> ToolCallOutput {
+    let result_id = srv.results.insert(operation, target_sha256, value.clone());
+    output(value, result_id)
 }
 
 fn session<'a>(cache: &'a mut Option<(String, Session)>, file: &str) -> Result<&'a Session> {
@@ -367,16 +412,6 @@ fn session<'a>(cache: &'a mut Option<(String, Session)>, file: &str) -> Result<&
         *cache = Some((file.to_string(), sess));
     }
     Ok(&cache.as_ref().expect("just set").1)
-}
-
-fn resolve<'a>(an: &'a engine::Analysis, sel: &str) -> Option<&'a engine::Function> {
-    if let Some(f) = an.find_by_name(sel) {
-        return Some(f);
-    }
-    let hex = sel.trim().trim_start_matches("0x").trim_start_matches("0X");
-    u64::from_str_radix(hex, 16)
-        .ok()
-        .and_then(|a| an.find_function(a).or_else(|| an.function_at(a)))
 }
 
 fn session_mut<'a>(
@@ -389,28 +424,6 @@ fn session_mut<'a>(
         *cache = Some((file.to_string(), sess));
     }
     Ok(&mut cache.as_mut().expect("just set").1)
-}
-
-fn addr_arg(args: &Value, key: &str) -> Result<u64> {
-    let s = args
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("missing `{key}`"))?;
-    let h = s.trim().trim_start_matches("0x").trim_start_matches("0X");
-    u64::from_str_radix(h, 16).map_err(|_| anyhow::anyhow!("bad address '{s}'"))
-}
-
-fn parse_hex_bytes(s: &str) -> Result<Vec<u8>> {
-    let cleaned: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    if cleaned.is_empty() || !cleaned.len().is_multiple_of(2) {
-        anyhow::bail!("hex bytes must be a non-empty even-length hex string");
-    }
-    (0..cleaned.len())
-        .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&cleaned[i..i + 2], 16).map_err(|_| anyhow::anyhow!("bad hex byte"))
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -434,9 +447,21 @@ mod tests {
         );
 
         let tools = tool_list();
+        assert_eq!(tools.len(), 1 + crate::tools::catalog().len());
+        assert!(
+            tools.len() >= 59,
+            "agent surface unexpectedly shrank to {} tools",
+            tools.len()
+        );
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         for want in [
             "open",
+            "list_retained_results",
+            "get_retained_result",
+            "provider_status",
+            "yarax_validate_rules",
+            "yarax_scan",
+            "session_status",
             "list_functions",
             "disassemble",
             "decompile",
@@ -446,14 +471,22 @@ mod tests {
         ] {
             assert!(names.contains(&want), "missing tool {want}");
         }
-        // Every tool takes a file and, apart from `open`, none of them demands
-        // one: that is what lets a bound target stand in for the argument.
+        // Target operations accept an optional file, while platform-session
+        // operations do not pretend to need a binary.
         for t in &tools {
             let name = t["name"].as_str().unwrap();
             assert_eq!(t["inputSchema"]["type"], "object");
-            assert!(
+            let is_system = matches!(
+                name,
+                "provider_status"
+                    | "yarax_validate_rules"
+                    | "list_retained_results"
+                    | "get_retained_result"
+            );
+            assert_eq!(
                 t["inputSchema"]["properties"]["file"].is_object(),
-                "{name} does not accept a file"
+                !is_system,
+                "wrong target requirement for {name}"
             );
             let req = t["inputSchema"]["required"].as_array().unwrap();
             assert_eq!(
@@ -461,7 +494,17 @@ mod tests {
                 name == "open",
                 "{name} requires `file` when it should not, or the reverse"
             );
+            assert!(t["annotations"]["readOnlyHint"].is_boolean());
+            assert!(t["_meta"]["knife/access"].is_string());
+            if name != "open" {
+                assert!(t["_meta"]["knife/targetRequirement"].is_string());
+                assert!(t["_meta"]["knife/resultMode"].is_string());
+                assert!(t["_meta"]["knife/emitsEvidence"].is_boolean());
+            }
         }
+        let set_name = tools.iter().find(|t| t["name"] == "set_name").unwrap();
+        assert_eq!(set_name["annotations"]["readOnlyHint"], false);
+        assert_eq!(set_name["_meta"]["knife/access"], "project_write");
     }
 
     #[test]
@@ -469,27 +512,18 @@ mod tests {
         let msg = json!({ "params": { "name": "info", "arguments": {} } });
 
         // Nothing bound and nothing passed: the error has to say how to bind.
-        let mut srv = Server {
-            target: None,
-            cache: None,
-        };
+        let mut srv = Server::new(None);
         let e = call_tool(&msg, &mut srv).unwrap_err().to_string();
         assert!(e.contains("no target"), "unhelpful when unbound: {e}");
 
         // Bound: the same call reaches the file — and fails on the file, which
         // is the point, rather than refusing for want of an argument.
-        let mut srv = Server {
-            target: Some("/no/such/file.bin".into()),
-            cache: None,
-        };
+        let mut srv = Server::new(Some("/no/such/file.bin".into()));
         let e = call_tool(&msg, &mut srv).unwrap_err().to_string();
         assert!(!e.contains("no target"), "ignored the bound target: {e}");
 
         // Naming a file binds it, so the next call need not repeat it.
-        let mut srv = Server {
-            target: None,
-            cache: None,
-        };
+        let mut srv = Server::new(None);
         let named =
             json!({ "params": { "name": "info", "arguments": { "file": "/no/such/file.bin" } } });
         let _ = call_tool(&named, &mut srv);
@@ -517,13 +551,28 @@ mod tests {
     fn a_tool_error_is_reported_in_band() {
         // No cached session and a missing file: the call should fail cleanly with
         // an error result rather than panicking.
-        let mut srv = Server {
-            target: None,
-            cache: None,
-        };
+        let mut srv = Server::new(None);
         let msg = json!({
             "params": { "name": "info", "arguments": { "file": "/no/such/file.bin" } }
         });
         assert!(call_tool(&msg, &mut srv).is_err());
+    }
+
+    #[test]
+    fn retained_results_are_target_free_and_preserve_structured_content() {
+        let mut srv = Server::new(None);
+        let id = srv
+            .results
+            .insert("test", Some("abc"), json!({"answer": 42}))
+            .unwrap();
+        let msg = json!({
+            "params": {
+                "name": "get_retained_result",
+                "arguments": {"result_id": id.0}
+            }
+        });
+        let output = call_tool(&msg, &mut srv).unwrap();
+        assert_eq!(output.structured.as_ref().unwrap()["payload"]["answer"], 42);
+        assert!(output.result_id.is_none());
     }
 }

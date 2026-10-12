@@ -65,6 +65,13 @@ ratatui = "0.30"
 cpp_demangle = "0.5.1"
 msvc-demangler = "0.11.0"
 rustc-demangle = "0.1.28"
+yara-x = "=1.12.0"            # native Rust YARA engine; newest release supporting Rust 1.88
+# YARA-X 1.12 declared these companion crates with caret requirements even
+# though later releases changed their build/API contracts. Direct exact pins
+# keep fresh `cargo install` resolutions on one compatible release family.
+yara-x-macros = "=1.12.0"
+yara-x-parser = "=1.12.0"
+yara-x-proto = "=1.12.0"
 
 # Keep useful line tables for our code without full dependency debug symbols.
 [profile.dev]

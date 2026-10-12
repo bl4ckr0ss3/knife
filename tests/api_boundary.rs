@@ -84,6 +84,11 @@ fn target_identity_matches_the_existing_session_contract() {
 
     assert_eq!(identity.path, session.bin.path);
     assert_eq!(identity.sha256, session.db.sha256);
+    assert_eq!(
+        identity.workspace_sha256,
+        reknife::analysis::hashes::sha256_hex(&session.bytes)
+    );
+    assert_eq!(identity.staged_patch_bytes, session.db.patches.len());
     assert_eq!(identity.format, session.bin.format.label());
     assert_eq!(identity.architecture, session.bin.arch.label());
     assert_eq!(identity.image_base, session.bin.image_base);

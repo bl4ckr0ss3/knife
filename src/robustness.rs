@@ -11,8 +11,6 @@
 //! and a nightly toolchain is a fine second line, but a reproducible test that
 //! runs on every `cargo test` is what keeps a regression from ever landing.
 
-#![cfg(test)]
-
 use crate::analysis::{audit, driver, engine, hardening, ir, sinks};
 use crate::db::Db;
 use crate::listing;

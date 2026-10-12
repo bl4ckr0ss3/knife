@@ -1,0 +1,440 @@
+use reknife::api::evidence::{StatementKind, EVIDENCE_CONTRACT_VERSION};
+use reknife::api::operations::{OperationAccess, ResultMode, TargetRequirement};
+use reknife::api::results::ResultStore;
+use reknife::tools;
+use reknife::workspace::Session;
+use serde_json::json;
+
+fn fixture_session() -> (std::path::PathBuf, Session) {
+    let root = std::env::temp_dir().join(format!(
+        "knife-agent-baseline-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let target = root.join("fixture.exe");
+    let database = root.join("fixture.json");
+    std::fs::write(&target, reknife::formats::fixture::pe_with_driver()).unwrap();
+    let session = Session::open(
+        target.to_str().unwrap(),
+        database.to_str(),
+        200_000,
+        "agent baseline test",
+    )
+    .unwrap();
+    (root, session)
+}
+
+#[test]
+fn session_status_establishes_identity_coverage_and_limitations() {
+    let (root, session) = fixture_session();
+    let first = tools::dispatch(&session, "session_status", &json!({})).unwrap();
+    let second = tools::dispatch(&session, "session_status", &json!({})).unwrap();
+
+    assert_eq!(first["contract_version"], EVIDENCE_CONTRACT_VERSION);
+    assert_eq!(first["data"]["target"]["sha256"], session.db.sha256);
+    assert_eq!(
+        first["data"]["target"]["workspace_sha256"],
+        session.db.sha256
+    );
+    assert_eq!(first["data"]["target"]["staged_patch_bytes"], 0);
+    assert_eq!(first["data"]["target"]["format"], "PE");
+    assert_eq!(first["data"]["analysis_truncated"], false);
+    let operations = first["data"]["operations"].as_array().unwrap();
+    assert_eq!(operations.len(), tools::catalog().len());
+    assert!(operations.iter().any(|operation| {
+        operation["name"] == "session_status"
+            && operation["available"] == true
+            && operation["emits_evidence"] == true
+    }));
+    assert!(operations.iter().any(|operation| {
+        operation["name"] == "elf_structure"
+            && operation["available"] == false
+            && operation["unavailable_reason"] == "the active target is not ELF"
+    }));
+    assert_eq!(first["partial"], false);
+    assert_eq!(first["evidence"][0]["id"], second["evidence"][0]["id"]);
+    assert_eq!(first["evidence"][0]["kind"], "target_identity");
+    assert_eq!(
+        first["evidence"][0]["statements"][0]["kind"],
+        serde_json::to_value(StatementKind::Observation).unwrap()
+    );
+    assert!(first["evidence"][0]["limitations"]
+        .as_array()
+        .is_some_and(|limits| !limits.is_empty()));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn read_catalog_exposes_machine_readable_operation_policy() {
+    let catalog = tools::read_catalog();
+    let status = catalog
+        .iter()
+        .find(|operation| operation.name == "session_status")
+        .expect("session_status is discoverable");
+    assert_eq!(status.access, OperationAccess::ReadOnly);
+    assert_eq!(status.target, TargetRequirement::Active);
+    assert!(catalog
+        .iter()
+        .all(|operation| operation.access == OperationAccess::ReadOnly));
+    assert_eq!(
+        catalog
+            .iter()
+            .find(|operation| operation.name == "list_functions")
+            .unwrap()
+            .result_mode,
+        ResultMode::Paginated
+    );
+
+    let mutations = tools::mutation_catalog();
+    assert_eq!(mutations.len(), 4);
+    assert!(mutations
+        .iter()
+        .all(|operation| operation.access == OperationAccess::ProjectWrite));
+    assert_eq!(
+        tools::catalog().len(),
+        tools::system_catalog().len() + catalog.len() + mutations.len()
+    );
+}
+
+#[test]
+fn shared_mutation_dispatch_updates_the_project_without_touching_the_input() {
+    let (root, mut session) = fixture_session();
+    let original = std::fs::read(&session.bin.path).unwrap();
+    let function = session
+        .an
+        .functions
+        .first()
+        .expect("fixture has a function");
+    let address = function.addr;
+    let selector = function.name.clone();
+
+    let named = tools::dispatch_mut(
+        &mut session,
+        "set_name",
+        &json!({"address": format!("0x{address:x}"), "name": "agent_entry"}),
+    )
+    .unwrap();
+    assert_eq!(named["ok"], true);
+    assert!(session.db.names.values().any(|name| name == "agent_entry"));
+
+    let prototype = tools::dispatch_mut(
+        &mut session,
+        "set_prototype",
+        &json!({"function": selector, "returns": "int", "params": ["void *"]}),
+    )
+    .unwrap();
+    assert_eq!(prototype["ok"], true);
+
+    let patch = tools::dispatch_mut(
+        &mut session,
+        "stage_patch",
+        &json!({"offset": "0x0", "bytes": "7f"}),
+    )
+    .unwrap();
+    assert_eq!(patch["staged"], 1);
+    assert_eq!(std::fs::read(&session.bin.path).unwrap(), original);
+    assert_eq!(session.db.patches.len(), 1);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn function_pages_continue_without_repeating_rows() {
+    let (root, session) = fixture_session();
+    let first = tools::dispatch(&session, "list_functions", &json!({"limit": 1})).unwrap();
+    let cursor = first["next_cursor"]
+        .as_str()
+        .expect("fixture produces another page");
+    let second = tools::dispatch(
+        &session,
+        "list_functions",
+        &json!({"limit": 1, "cursor": cursor}),
+    )
+    .unwrap();
+    assert_eq!(first["returned"], 1);
+    assert_eq!(second["returned"], 1);
+    assert_ne!(
+        first["functions"][0]["addr"],
+        second["functions"][0]["addr"]
+    );
+    assert!(tools::dispatch(
+        &session,
+        "list_functions",
+        &json!({"filter": "different-query", "cursor": cursor}),
+    )
+    .is_err());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn address_context_preserves_static_and_file_locations_as_evidence() {
+    let (root, session) = fixture_session();
+    let function = session
+        .an
+        .functions
+        .first()
+        .expect("fixture has a function");
+    let address = function.addr;
+    let expected_offset = reknife::analysis::engine::va_to_off(
+        &session.bin,
+        reknife::analysis::engine::display_base(&session.bin),
+        address,
+    )
+    .expect("fixture function is file-backed");
+
+    let context = tools::dispatch(
+        &session,
+        "inspect_address_context",
+        &json!({"address": format!("0x{address:x}")}),
+    )
+    .unwrap();
+    assert_eq!(context["contract_version"], EVIDENCE_CONTRACT_VERSION);
+    assert_eq!(context["data"]["static_address"], format!("0x{address:x}"));
+    assert_eq!(
+        context["data"]["file_offset"],
+        format!("0x{expected_offset:x}")
+    );
+    assert_eq!(
+        context["data"]["containing_function"]["name"],
+        function.name
+    );
+    assert_eq!(
+        context["evidence"][0]["locations"][0]["static_address"],
+        address
+    );
+    assert_eq!(
+        context["evidence"][0]["locations"][0]["file_offset"],
+        expected_offset
+    );
+    assert!(context["evidence"][0]["statements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|statement| statement["kind"] == "observation"));
+    assert!(context["evidence"][0]["statements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|statement| statement["kind"] == "inference"));
+
+    let mapped = tools::dispatch(
+        &session,
+        "address_to_file_offset",
+        &json!({"address": format!("0x{address:x}")}),
+    )
+    .unwrap();
+    assert_eq!(
+        mapped["data"]["file_offset"],
+        format!("0x{expected_offset:x}")
+    );
+    let containing = tools::dispatch(
+        &session,
+        "resolve_containing_function",
+        &json!({"address": format!("0x{address:x}")}),
+    )
+    .unwrap();
+    assert_eq!(containing["data"]["name"], function.name);
+
+    let bytes = tools::dispatch(
+        &session,
+        "read_bytes",
+        &json!({"address": format!("0x{address:x}"), "length": 17}),
+    )
+    .unwrap();
+    assert_eq!(bytes.as_str().unwrap().lines().count(), 2);
+    assert!(tools::dispatch(
+        &session,
+        "read_bytes",
+        &json!({"address": format!("0x{address:x}"), "length": 4097}),
+    )
+    .is_err());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn instruction_pages_are_structured_scoped_and_continuable() {
+    let (root, session) = fixture_session();
+    let function = session
+        .an
+        .functions
+        .first()
+        .expect("fixture has a function");
+    let address = function.addr;
+    let first = tools::dispatch(
+        &session,
+        "read_function_instructions",
+        &json!({"address": format!("0x{address:x}"), "limit": 1}),
+    )
+    .unwrap();
+    assert_eq!(first["contract_version"], EVIDENCE_CONTRACT_VERSION);
+    assert_eq!(first["data"]["returned"], 1);
+    assert!(first["data"]["instructions"][0]["bytes"].is_string());
+    assert!(first["data"]["instructions"][0]["mnemonic"].is_string());
+
+    if let Some(cursor) = first["continuation"].as_str() {
+        assert_eq!(first["partial"], true);
+        assert_eq!(first["data"]["next_cursor"], cursor);
+        let second = tools::dispatch(
+            &session,
+            "read_function_instructions",
+            &json!({
+                "selector": format!("0x{address:x}"),
+                "limit": 1,
+                "cursor": cursor,
+            }),
+        )
+        .unwrap();
+        assert_ne!(
+            first["data"]["instructions"][0]["address"],
+            second["data"]["instructions"][0]["address"]
+        );
+        assert!(tools::dispatch(
+            &session,
+            "read_function_instructions",
+            &json!({
+                "selector": format!("0x{address:x}"),
+                "start_address": format!("0x{:x}", address + 1),
+                "cursor": cursor,
+            }),
+        )
+        .is_err());
+    } else {
+        assert_eq!(first["partial"], false);
+    }
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn external_provider_catalog_is_discoverable_and_bounded() {
+    let store = ResultStore::default();
+    let status = tools::dispatch_system(&store, "provider_status", &json!({})).unwrap();
+    let rizin = status["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == "rizin")
+        .expect("Rizin provider is registered even when not installed");
+    assert_eq!(rizin["target_execution"], false);
+    assert!(rizin["operations"].as_array().unwrap().len() >= 15);
+    let yarax = status["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|provider| provider["id"] == "yarax")
+        .expect("native YARA-X provider is registered");
+    assert_eq!(yarax["installed"], true);
+    assert_eq!(yarax["target_execution"], false);
+    assert_eq!(yarax["license"], "BSD-3-Clause; linked as a Rust library");
+
+    let catalog = tools::read_catalog();
+    let functions = catalog
+        .iter()
+        .find(|operation| operation.name == "rizin_functions")
+        .expect("Rizin functions are discoverable");
+    assert_eq!(functions.access, OperationAccess::ReadOnly);
+    assert_eq!(functions.result_mode, ResultMode::Paginated);
+    assert!(functions.emits_evidence);
+
+    if !rizin["installed"].as_bool().unwrap_or(false) {
+        return;
+    }
+    let (root, session) = fixture_session();
+    let info = tools::dispatch(&session, "rizin_info", &json!({})).unwrap();
+    assert_eq!(info["contract_version"], EVIDENCE_CONTRACT_VERSION);
+    assert_eq!(info["data"]["provider"], "rizin");
+    assert_eq!(info["partial"], false);
+    assert_eq!(info["evidence"][0]["producer"], "rizin_info");
+
+    let page = tools::dispatch(&session, "rizin_functions", &json!({"limit": 1})).unwrap();
+    assert_eq!(page["data"]["provider"], "rizin");
+    assert!(page["data"]["returned"].as_u64().unwrap() <= 1);
+    assert_eq!(page["evidence"][0]["statements"][0]["kind"], "inference");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn yarax_validates_and_scans_exact_workspace_locations() {
+    let store = ResultStore::default();
+    let rules = r#"
+        rule pe_header : fixture {
+            meta:
+                purpose = "agent provider test"
+            strings:
+                $mz = { 4d 5a }
+            condition:
+                $mz at 0
+        }
+    "#;
+    let validated = tools::dispatch_system(
+        &store,
+        "yarax_validate_rules",
+        &json!({"rules": rules, "limit": 1}),
+    )
+    .unwrap();
+    assert_eq!(validated["provider"], "yarax");
+    assert_eq!(validated["returned"], 1);
+    assert_eq!(validated["rules"][0]["identifier"], "pe_header");
+
+    let (root, session) = fixture_session();
+    let scanned = tools::dispatch(
+        &session,
+        "yarax_scan",
+        &json!({
+            "rules": rules,
+            "timeout_ms": 1_000,
+            "max_matches_per_pattern": 4,
+        }),
+    )
+    .unwrap();
+    assert_eq!(scanned["contract_version"], EVIDENCE_CONTRACT_VERSION);
+    assert_eq!(scanned["data"]["provider"], "yarax");
+    assert_eq!(scanned["data"]["matched"], 1);
+    assert_eq!(scanned["data"]["result_sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(scanned["data"]["match_limit_may_have_truncated"], false);
+    assert_eq!(
+        scanned["data"]["rules"][0]["patterns"][0]["matches"][0]["offset"],
+        "0x0"
+    );
+    assert_eq!(scanned["evidence"][0]["statements"][0]["kind"], "inference");
+    assert_eq!(scanned["evidence"][0]["locations"][0]["file_offset"], 0);
+
+    let function = session.an.functions.first().expect("fixture has code");
+    let offset = reknife::analysis::engine::va_to_off(
+        &session.bin,
+        reknife::analysis::engine::display_base(&session.bin),
+        function.addr,
+    )
+    .unwrap();
+    let signature = format!(
+        "{:02x} {:02x}",
+        session.bytes[offset],
+        session.bytes[offset + 1]
+    );
+    let range_rules =
+        format!("rule function_prefix {{ strings: $a = {{ {signature} }} condition: $a at 0 }}");
+    let ranged = tools::dispatch(
+        &session,
+        "yarax_scan_range",
+        &json!({
+            "rules": range_rules,
+            "address": format!("0x{:x}", function.addr),
+            "length": 16,
+        }),
+    )
+    .unwrap();
+    assert_eq!(ranged["data"]["matched"], 1);
+    assert_eq!(
+        ranged["data"]["rules"][0]["patterns"][0]["matches"][0]["static_address"],
+        format!("0x{:x}", function.addr)
+    );
+    assert_eq!(
+        ranged["evidence"][0]["locations"][0]["static_address"],
+        function.addr
+    );
+    let _ = std::fs::remove_dir_all(root);
+}

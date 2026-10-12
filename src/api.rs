@@ -11,14 +11,19 @@ pub mod binary_summary;
 pub mod bookmarks;
 pub mod driver_surface;
 pub mod edits;
+pub mod evidence;
+pub mod execution;
 pub mod facts;
 pub mod graphs;
 pub mod kernel_types;
 pub mod listing;
 pub mod navigation;
+pub mod operations;
+pub mod paging;
 pub mod patches;
 pub mod persistence;
 pub mod references;
+pub mod results;
 pub mod risk_signals;
 pub mod symbols;
 pub mod workspace;
@@ -26,7 +31,11 @@ pub mod workspace;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetIdentity {
     pub path: String,
+    /// Digest of the unmodified input used to select the analyst database.
     pub sha256: String,
+    /// Digest of the bytes actually analyzed after staged patches are applied.
+    pub workspace_sha256: String,
+    pub staged_patch_bytes: usize,
     pub format: String,
     pub architecture: String,
     pub bits: u32,
@@ -47,6 +56,8 @@ impl TargetIdentity {
         Self {
             path: session.bin.path.clone(),
             sha256: session.db.sha256.clone(),
+            workspace_sha256: crate::analysis::hashes::sha256_hex(&session.bytes),
+            staged_patch_bytes: session.db.patches.len(),
             format: session.bin.format.label().to_string(),
             architecture: session.bin.arch.label().to_string(),
             bits: session.bin.bits,
