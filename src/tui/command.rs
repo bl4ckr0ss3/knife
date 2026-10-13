@@ -2,6 +2,12 @@
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
+    Investigation,
+    Contradictions,
+    RefreshInvestigation,
+    Ask(String),
+    RunTool(String),
+    InterruptInvestigation,
     Goto(String),
     Function(String),
     Functions,
@@ -35,6 +41,12 @@ pub enum Command {
 }
 
 pub const NAMES: &[&str] = &[
+    "investigation",
+    "contradictions",
+    "investigation-reload",
+    "ask",
+    "run-tool",
+    "interrupt",
     "goto",
     "function",
     "functions",
@@ -86,6 +98,27 @@ impl super::App {
             }
         };
         match command {
+            Command::Investigation => {
+                self.investigation_open = true;
+                self.investigation_conflicts_only = false;
+            }
+            Command::Contradictions => {
+                self.investigation_open = true;
+                self.investigation_conflicts_only = true;
+            }
+            Command::RefreshInvestigation => self.refresh_investigation(),
+            Command::Ask(question) => self.investigation_question(question),
+            Command::RunTool(input) => self.run_investigation_tool(&input),
+            Command::InterruptInvestigation => {
+                if let Some(token) = self.investigation_cancellation.take() {
+                    token.cancel();
+                }
+                self.investigation_worker = None;
+                self.investigation_live_activity = None;
+                self.investigation_activity =
+                    "Interrupted: pending result discarded; provider cleanup may still be running"
+                        .into();
+            }
             Command::Goto(selector) => {
                 self.commit_with_context(Ask::Goto, 0, selector, None, None);
                 self.focus = Focus::Listing;
@@ -264,6 +297,12 @@ pub fn parse(input: &str) -> Result<Command, String> {
         }
     };
     match verb {
+        "investigation" => no_args(Command::Investigation),
+        "contradictions" => no_args(Command::Contradictions),
+        "investigation-reload" => no_args(Command::RefreshInvestigation),
+        "ask" => required().map(Command::Ask),
+        "run-tool" => required().map(Command::RunTool),
+        "interrupt" => no_args(Command::InterruptInvestigation),
         "goto" => required().map(Command::Goto),
         "function" => required().map(Command::Function),
         "rename" => required().map(Command::Rename),

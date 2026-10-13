@@ -9,6 +9,7 @@
 mod browser;
 mod command;
 pub mod explorer;
+mod investigation;
 mod layout;
 mod navigation;
 /// Deterministic demo recorder for the README animation. Dev-only, so it
@@ -407,6 +408,16 @@ pub struct ListingViewRef<'a> {
 }
 
 pub struct App {
+    pub investigation: crate::api::investigation::Investigation,
+    pub investigation_open: bool,
+    pub investigation_conflicts_only: bool,
+    pub investigation_selection: usize,
+    pub investigation_message_offset: usize,
+    pub investigation_message_scroll: u16,
+    pub investigation_worker: Option<std::sync::mpsc::Receiver<Result<serde_json::Value>>>,
+    pub investigation_activity: String,
+    pub investigation_live_activity: Option<std::sync::Arc<std::sync::Mutex<String>>>,
+    pub investigation_cancellation: Option<crate::api::execution::CancellationToken>,
     // ── the target ──
     pub bin: Binary,
     pub bytes: Vec<u8>,
@@ -530,7 +541,34 @@ impl App {
         title: String,
     ) -> App {
         let base = engine::display_base(&bin);
+        let investigation_path = db
+            .path()
+            .map(|path| path.with_extension("investigation.json"));
+        let investigation = investigation_path
+            .as_ref()
+            .map(|path| crate::api::investigation::Investigation::load(path, &db.sha256))
+            .transpose();
+        let (investigation, investigation_error) = match investigation {
+            Ok(value) => (
+                value.unwrap_or_else(|| crate::api::investigation::Investigation::new(&db.sha256)),
+                String::new(),
+            ),
+            Err(error) => (
+                crate::api::investigation::Investigation::new(&db.sha256),
+                format!("Investigation load failed: {error}"),
+            ),
+        };
         let mut app = App {
+            investigation,
+            investigation_open: false,
+            investigation_conflicts_only: false,
+            investigation_selection: 0,
+            investigation_message_offset: 0,
+            investigation_message_scroll: 0,
+            investigation_worker: None,
+            investigation_activity: String::new(),
+            investigation_live_activity: None,
+            investigation_cancellation: None,
             bin,
             bytes,
             db,
@@ -558,7 +596,7 @@ impl App {
             command_history: command::History::default(),
             history: Vec::new(),
             future: Vec::new(),
-            status: String::new(),
+            status: investigation_error,
             help: false,
             help_scroll: 0,
             quit: false,
@@ -2322,6 +2360,25 @@ impl App {
         self.bin = bin;
         self.bytes = bytes;
         self.db = db;
+        self.investigation_worker = None;
+        if let Some(token) = self.investigation_cancellation.take() {
+            token.cancel();
+        }
+        self.investigation_live_activity = None;
+        self.investigation_activity =
+            "Workspace reloaded; pending investigation work discarded".into();
+        self.investigation_selection = 0;
+        self.investigation = self
+            .db
+            .path()
+            .and_then(|path| {
+                crate::api::investigation::Investigation::load(
+                    &path.with_extension("investigation.json"),
+                    &self.db.sha256,
+                )
+                .ok()
+            })
+            .unwrap_or_else(|| crate::api::investigation::Investigation::new(&self.db.sha256));
         self.an = an;
         self.sinks = sinks;
         self.strings = strings;
@@ -2394,6 +2451,44 @@ impl App {
     pub fn on_key(&mut self, key: KeyEvent) {
         if key.kind != KeyEventKind::Press {
             return; // Windows reports releases too; acting on both double-fires
+        }
+        if self.investigation_open && self.prompt.is_none() {
+            match key.code {
+                KeyCode::PageUp => {
+                    self.investigation_message_offset = (self.investigation_message_offset + 1)
+                        .min(self.investigation.messages.len().saturating_sub(1));
+                    self.investigation_message_scroll = 0;
+                }
+                KeyCode::PageDown => {
+                    self.investigation_message_offset =
+                        self.investigation_message_offset.saturating_sub(1);
+                    self.investigation_message_scroll = 0;
+                }
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.investigation_message_scroll =
+                        self.investigation_message_scroll.saturating_sub(1)
+                }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.investigation_message_scroll =
+                        self.investigation_message_scroll.saturating_add(1)
+                }
+                KeyCode::Esc => self.investigation_open = false,
+                KeyCode::Up => {
+                    self.investigation_selection = self.investigation_selection.saturating_sub(1)
+                }
+                KeyCode::Down => {
+                    self.investigation_selection = (self.investigation_selection + 1)
+                        .min(self.investigation.evidence.len().saturating_sub(1))
+                }
+                KeyCode::Enter => self.follow_investigation_evidence(),
+                KeyCode::Char(':') => {
+                    self.investigation_open = false;
+                }
+                _ => return,
+            }
+            if key.code != KeyCode::Char(':') {
+                return;
+            }
         }
 
         // The splash swallows the first key so it cannot quit or navigate.
@@ -2936,6 +3031,9 @@ impl App {
     }
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
+        if self.investigation_open {
+            return;
+        }
         if self.help {
             let max = render::help_max_scroll(self.dims.0, self.dims.1);
             match m.kind {
@@ -3310,6 +3408,7 @@ pub fn run(source: TargetSource, bin: Binary, bytes: Vec<u8>, db: Db, title: Str
             break Err(e.into());
         }
         app.poll_reload();
+        app.poll_investigation();
         if app.is_reloading() {
             // A reload has a worker in flight: poll with a timeout so the
             // result is applied promptly instead of waiting for input.
@@ -4721,6 +4820,47 @@ mod tests {
             "command mode stays discoverable"
         );
         assert!(out.contains("? help"), "help stays discoverable");
+    }
+
+    #[test]
+    fn investigation_desk_renders_and_follows_evidence_into_listing() {
+        let mut app = two_functions();
+        let record = crate::api::evidence::EvidenceRecord::new(
+            "workspace",
+            "test",
+            crate::api::evidence::EvidenceKind::StaticAnalysis,
+            "Input comparison",
+            vec![crate::api::evidence::EvidenceLocation {
+                static_address: Some(crate::address::StaticVa(0x1000)),
+                ..Default::default()
+            }],
+            vec![],
+            vec![],
+        );
+        app.investigation.record(record).unwrap();
+        app.investigation
+            .append(
+                crate::api::investigation::Role::Analyst,
+                "Explain this comparison".into(),
+                vec![],
+            )
+            .unwrap();
+        app.investigation
+            .append(
+                crate::api::investigation::Role::Assistant,
+                "Observed comparison\nFollow both successors before concluding acceptance".into(),
+                vec![],
+            )
+            .unwrap();
+        app.execute_command("investigation");
+        assert!(rendered(&mut app, 110, 30).contains("Investigation desk"));
+        assert!(rendered(&mut app, 110, 30).contains("Follow both successors"));
+        app.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert_eq!(app.investigation_message_offset, 1);
+        assert!(rendered(&mut app, 110, 30).contains("Explain this comparison"));
+        app.follow_investigation_evidence();
+        assert!(!app.investigation_open);
+        assert_eq!(app.focus, Focus::Listing);
     }
 
     #[test]

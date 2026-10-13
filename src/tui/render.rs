@@ -150,9 +150,146 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
     footer(f, panes.footer, app);
 
+    if app.investigation_open {
+        investigation_desk(f, app);
+    }
+
     if app.help {
         help(f, f.area(), app);
     }
+}
+
+fn investigation_desk(f: &mut Frame, app: &App) {
+    let area = f.area();
+    let width = (area.width / 2).max(24).min(area.width);
+    let desk = Rect::new(
+        area.right().saturating_sub(width),
+        area.y.saturating_add(1),
+        width,
+        area.height.saturating_sub(2),
+    );
+    f.render_widget(Clear, desk);
+    let conversation_height = desk.height / 2;
+    let conversation_area = Rect::new(desk.x, desk.y, desk.width, conversation_height);
+    let message = app
+        .investigation
+        .messages
+        .iter()
+        .rev()
+        .nth(app.investigation_message_offset);
+    let conversation = message.map(|message|format!("{:?}\n{}",message.role,message.text)).unwrap_or_else(||"Use :ask <question> to begin.\nPgUp/PgDn: browse conversation\nCtrl+Up/Down: scroll message\nUp/Down: select evidence\nEnter: follow selected evidence".into());
+    f.render_widget(
+        Paragraph::new(conversation)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Investigation desk — conversation "),
+            )
+            .style(Style::default().fg(accent()).bg(panel()))
+            .wrap(Wrap { trim: false })
+            .scroll((app.investigation_message_scroll, 0)),
+        conversation_area,
+    );
+    let desk = Rect::new(
+        desk.x,
+        desk.y.saturating_add(conversation_height),
+        desk.width,
+        desk.height.saturating_sub(conversation_height),
+    );
+    let mut lines = vec![
+        TLine::from(" :ask <question> saves a lead; Esc closes"),
+        TLine::from(" Findings and activity"),
+    ];
+    lines.insert(
+        1,
+        TLine::from(format!(" Activity: {}", app.investigation_activity)),
+    );
+    lines.push(TLine::from(if app.investigation_conflicts_only {
+        " Conflicting evidence — review required"
+    } else {
+        " Questions and hypotheses"
+    }));
+    let hypotheses: Vec<_> = app
+        .investigation
+        .hypotheses
+        .iter()
+        .rev()
+        .filter(|hypothesis| {
+            !app.investigation_conflicts_only
+                || (!hypothesis.supports.is_empty() && !hypothesis.contradicts.is_empty())
+        })
+        .take(2)
+        .collect();
+    if app.investigation_conflicts_only && hypotheses.is_empty() {
+        lines.push(TLine::from(
+            " No conflicting links recorded; absence is not proof.",
+        ));
+    }
+    for hypothesis in hypotheses {
+        lines.push(TLine::from(format!(
+            " #{} {:?}: {}",
+            hypothesis.id,
+            hypothesis.status,
+            desk_preview(&hypothesis.question, usize::from(width.saturating_sub(25)))
+        )));
+        if app.investigation_conflicts_only {
+            lines.push(TLine::from(format!(" {} supporting / {} contradicting records (#{}); inspect via MCP investigation_conflicts",hypothesis.supports.len(),hypothesis.contradicts.len(),hypothesis.id)));
+        }
+    }
+    lines.push(TLine::from(" Evidence — Up/Down selects; Enter follows"));
+    let evidence_height = usize::from(desk.height.saturating_sub(2)).saturating_sub(lines.len());
+    let evidence_start = viewport_start(
+        app.investigation_selection,
+        app.investigation.evidence.len(),
+        evidence_height,
+    );
+    for (index, record) in app
+        .investigation
+        .evidence
+        .values()
+        .enumerate()
+        .skip(evidence_start)
+        .take(evidence_height)
+    {
+        lines.push(TLine::styled(
+            format!(
+                " {} {}",
+                if index == app.investigation_selection {
+                    ">"
+                } else {
+                    " "
+                },
+                desk_preview(&record.summary, usize::from(width.saturating_sub(6)))
+            ),
+            Style::default().fg(if index == app.investigation_selection {
+                accent()
+            } else {
+                muted()
+            }),
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Investigation desk "),
+            )
+            .style(Style::default().fg(accent()).bg(panel()))
+            .wrap(Wrap { trim: false }),
+        desk,
+    );
+}
+
+fn desk_preview(text: &str, limit: usize) -> String {
+    let mut characters = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch });
+    let mut result: String = characters.by_ref().take(limit.saturating_sub(1)).collect();
+    if characters.next().is_some() {
+        result.push('…');
+    }
+    result
 }
 
 fn header(f: &mut Frame, area: Rect, app: &App) {
