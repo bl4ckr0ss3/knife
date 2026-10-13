@@ -90,6 +90,7 @@ engine once.
 | `inspect_input_validation` | candidate comparisons, branches, validation API calls, and dangerous-argument provenance; completeness is not established |
 | `compare_engine_findings` | Knife/Rizin function boundaries and sizes, with agreement, disagreement and unknown fields |
 | `capa_capabilities` | optional standalone capa rules, ATT&CK/MBC metadata and typed match locations for PE/ELF targets |
+| `capa_rule_matches` | matched rule source and bounded supporting match trees, reusing the same cached report |
 | `investigation_status` | saved questions, hypotheses, recent conversation and evidence counts |
 | `investigation_conflicts` | hypotheses with opposing evidence links, including supporting/contradicting record summaries and locations |
 | `investigation_get_evidence` | exact saved evidence by ID |

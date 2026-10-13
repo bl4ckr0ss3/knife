@@ -73,7 +73,11 @@ including packaged-engine helpers that could otherwise keep output pipes open.
 Rule metadata includes ATT&CK
 and MBC fields; top-level match locations keep capa's declared address types.
 Live MCP validation is documented in [capa-field-validation.md](capa-field-validation.md).
-Deep match-tree navigation remains outstanding.
+`capa_rule_matches` exposes matched rule source and supporting trees from the
+same cached report. Match pages contain at most 20 entries, each bounded to 512
+nodes and depth 16, with explicit truncation markers. Native match locations
+can be followed through evidence navigation; managed tokens retain their own
+address kinds. Live validation of this deeper view remains outstanding.
 
 | provider | integration | value | policy |
 |---|---|---|---|

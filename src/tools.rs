@@ -117,6 +117,7 @@ pub fn read_catalog() -> Vec<OperationDescriptor> {
     ];
     operations.extend(crate::providers::rizin::catalog());
     operations.push(crate::providers::capa::descriptor());
+    operations.push(crate::providers::capa::matches_descriptor());
     operations.extend(crate::providers::yarax::catalog());
     operations
 }
@@ -270,11 +271,14 @@ pub fn dispatch(sess: &Session, name: &str, args: &Value) -> Result<Value> {
     }
     match name {
         "session_status" => session_status(sess),
-        "capa_capabilities" => {
+        "capa_capabilities" | "capa_rule_matches" => {
+            if name == "capa_rule_matches" && args.get("rule").and_then(Value::as_str).is_none() {
+                return Err(anyhow!("missing rule"));
+            }
             let data = crate::providers::capa::dispatch(sess, args)?;
             let partial = data["partial"].as_bool().unwrap_or(false);
             let cursor = data["next_cursor"].as_str().map(str::to_string);
-            evidence_result(sess,"capa_capabilities",format!("capa capability matches (result sha256 {})",data["result_sha256"].as_str().unwrap_or("unknown")),crate::providers::capa::evidence_locations(sess,&data),vec![EvidenceStatement{kind:StatementKind::Inference,text:"capa rules matched static features; capability names describe rule interpretations rather than demonstrated execution.".into(),confidence:Confidence::Medium}],vec!["capa match locations retain their declared address kinds. Packed or obfuscated code can make matches incomplete.".into(),"The provider uses a private workspace snapshot, a configurable 1–120-second deadline (30 seconds by default) and an 8 MiB output bound. Each rule reports at most 64 top-level locations. Continuation reuses a bounded cached report; an expired report requires restarting pagination.".into()],data,partial,cursor)
+            evidence_result(sess,name,format!("capa capability matches (result sha256 {})",data["result_sha256"].as_str().unwrap_or("unknown")),crate::providers::capa::evidence_locations(sess,&data),vec![EvidenceStatement{kind:StatementKind::Inference,text:"capa rules matched static features; capability names describe rule interpretations rather than demonstrated execution.".into(),confidence:Confidence::Medium}],vec!["capa match locations retain their declared address kinds. Packed or obfuscated code can make matches incomplete.".into(),"The provider uses a private workspace snapshot, a configurable 1–120-second deadline (30 seconds by default) and an 8 MiB output bound. Each rule reports at most 64 top-level locations. Continuation reuses a bounded cached report; an expired report requires restarting pagination.".into()],data,partial,cursor)
         }
         "discover_investigation_tools" => {
             let task = args
@@ -541,10 +545,12 @@ fn operation_availability(
     operation: &OperationDescriptor,
 ) -> OperationAvailability {
     let reason = match operation.name {
-        "capa_capabilities" if crate::providers::capa::executable().is_none() => {
+        "capa_capabilities" | "capa_rule_matches"
+            if crate::providers::capa::executable().is_none() =>
+        {
             Some("standalone capa is not installed; configure KNIFE_CAPA".into())
         }
-        "capa_capabilities"
+        "capa_capabilities" | "capa_rule_matches"
             if !matches!(
                 sess.bin.format,
                 crate::model::Format::Pe | crate::model::Format::Elf

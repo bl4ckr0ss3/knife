@@ -42,7 +42,7 @@ pub fn status() -> ProviderStatus {
         mode: "out_of_process_static",
         target_execution: false,
         license: "Apache-2.0; separately installed executable",
-        operations: vec!["capa_capabilities"],
+        operations: vec!["capa_capabilities", "capa_rule_matches"],
         limitation: executable
             .is_none()
             .then(|| "Install standalone capa or set KNIFE_CAPA to its executable".into()),
@@ -50,6 +50,9 @@ pub fn status() -> ProviderStatus {
 }
 pub fn descriptor() -> OperationDescriptor {
     OperationDescriptor::read("capa_capabilities","Independent capa capability rules, ATT&CK/MBC metadata and typed match locations from static workspace bytes.",json!({"limit":{"type":"integer","minimum":1,"maximum":400},"timeout_seconds":{"type":"integer","minimum":1,"maximum":120},"cursor":{"type":"string"}}),&[]).with_result_mode(ResultMode::Paginated).with_evidence()
+}
+pub fn matches_descriptor() -> OperationDescriptor {
+    OperationDescriptor::read("capa_rule_matches","Inspect a matched capa rule's source and bounded supporting match trees, preserving typed locations.",json!({"rule":{"type":"string","maxLength":256},"limit":{"type":"integer","minimum":1,"maximum":20},"cursor":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":120}}),&["rule"]).with_result_mode(ResultMode::Paginated).with_evidence()
 }
 pub fn dispatch(session: &Session, args: &Value) -> Result<Value> {
     let timeout = args
@@ -136,6 +139,36 @@ fn shape(raw: &Value, args: &Value) -> Result<Value> {
         .as_object()
         .ok_or_else(|| anyhow!("capa result has no rule inventory"))?;
     let digest = crate::analysis::hashes::sha256_hex(&serde_json::to_vec(raw)?);
+    if let Some(name) = args.get("rule").and_then(Value::as_str) {
+        let rule = rules
+            .get(name)
+            .ok_or_else(|| anyhow!("no matched capa rule named '{name}'"))?;
+        let matches = rule["matches"]
+            .as_array()
+            .ok_or_else(|| anyhow!("rule has no match array"))?;
+        let page = PageWindow::from_args(
+            args,
+            matches.len(),
+            5,
+            20,
+            &format!("capa_rule_matches:{digest}:{name}"),
+        )?;
+        let mut truncated = false;
+        let rows: Vec<_> = matches
+            .iter()
+            .skip(page.offset)
+            .take(page.limit)
+            .map(|matched| {
+                let mut budget = 512;
+                bounded_tree(matched, 0, &mut budget, &mut truncated)
+            })
+            .collect();
+        let source = rule["source"].as_str().unwrap_or("");
+        let source_truncated = source.chars().count() > 4096;
+        return Ok(
+            json!({"provider":"capa","engine_version":raw["meta"]["version"],"result_sha256":digest,"matched":page.total,"returned":rows.len(),"next_cursor":page.next_cursor,"partial":page.next_cursor.is_some()||truncated||source_truncated,"rules":[{"name":name,"metadata":rule["meta"],"source":source.chars().take(4096).collect::<String>(),"source_truncated":source_truncated,"matches":rows,"tree_truncated":truncated,"locations":matches.iter().skip(page.offset).take(page.limit).filter_map(|pair|pair.as_array().and_then(|pair|pair.first())).collect::<Vec<_>>()}]}),
+        );
+    }
     let page = PageWindow::from_args(
         args,
         rules.len(),
@@ -152,6 +185,46 @@ fn shape(raw: &Value, args: &Value) -> Result<Value> {
     Ok(
         json!({"provider":"capa","engine_version":raw["meta"]["version"],"analysis":raw["meta"]["analysis"],"sample":raw["meta"]["sample"],"result_sha256":digest,"matched":page.total,"returned":rows.len(),"next_cursor":page.next_cursor,"partial":page.next_cursor.is_some()||capped,"rules":rows}),
     )
+}
+
+fn bounded_tree(value: &Value, depth: usize, budget: &mut usize, truncated: &mut bool) -> Value {
+    if depth >= 16 || *budget == 0 {
+        *truncated = true;
+        return json!({"truncated":true});
+    }
+    *budget -= 1;
+    match value {
+        Value::Array(values) => {
+            *truncated |= values.len() > 64;
+            Value::Array(
+                values
+                    .iter()
+                    .take(64)
+                    .map(|value| bounded_tree(value, depth + 1, budget, truncated))
+                    .collect(),
+            )
+        }
+        Value::Object(values) => {
+            *truncated |= values.len() > 64;
+            Value::Object(
+                values
+                    .iter()
+                    .take(64)
+                    .map(|(key, value)| {
+                        (
+                            key.clone(),
+                            bounded_tree(value, depth + 1, budget, truncated),
+                        )
+                    })
+                    .collect(),
+            )
+        }
+        Value::String(text) if text.chars().count() > 2048 => {
+            *truncated = true;
+            json!({"text_preview":text.chars().take(2048).collect::<String>(),"truncated":true})
+        }
+        _ => value.clone(),
+    }
 }
 
 /// Correlate only known native address kinds. Managed tokens and unsupported
@@ -215,6 +288,14 @@ mod tests {
         assert_eq!(continued["rules"][0]["name"], "rule-b");
         assert!(continued["next_cursor"].is_null());
         assert_eq!(result["rules"][0]["locations"][0]["type"], "absolute");
+        let details = shape(&raw, &json!({"rule":"rule-a","limit":1})).unwrap();
+        assert_eq!(details["rules"][0]["matches"][0][1]["success"], true);
+        assert!(shape(&raw, &json!({"rule":"missing"})).is_err());
+        let mut budget = 3;
+        let mut truncated = false;
+        let bounded = bounded_tree(&json!([1, 2, 3, 4]), 0, &mut budget, &mut truncated);
+        assert!(truncated);
+        assert_eq!(bounded[2]["truncated"], true);
         assert!(shape(&json!({"meta":{"flavor":"dynamic"},"rules":{}}), &json!({})).is_err());
     }
 }
