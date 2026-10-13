@@ -74,3 +74,4 @@ impl TargetIdentity {
 }
 /// Format-specific header records shared by terminal and external consumers.
 pub use crate::formats::elf_headers;
+pub mod investigation;
