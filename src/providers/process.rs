@@ -143,7 +143,21 @@ pub(crate) fn run_process<I>(
 where
     I: IntoIterator<Item = OsString>,
 {
+    run_process_with_env(executable, args, deadline, output_limit, &[])
+}
+
+pub(crate) fn run_process_with_env<I>(
+    executable: &Path,
+    args: I,
+    deadline: Duration,
+    output_limit: usize,
+    environment: &[(&str, &str)],
+) -> Result<ProcessOutput>
+where
+    I: IntoIterator<Item = OsString>,
+{
     let mut command = Command::new(executable);
+    command.envs(environment.iter().copied());
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

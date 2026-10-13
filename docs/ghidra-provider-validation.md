@@ -68,6 +68,29 @@ or unmapped offsets remain unknown. This boundary is not yet an advertised MCP
 provider; process orchestration and end-to-end evidence integration remain open.
 Pseudocode truncation also avoids splitting a UTF-16 surrogate pair.
 
+## Process adapter under validation
+
+The Rust `export` entry point now materializes the compiled-in exporter into an
+exclusively created private project directory, imports exact workspace bytes,
+and uses the shared bounded process runner. It fixes the heap at 512 MiB and
+analysis CPU count at one, accepts only typed inventory/decompile requests,
+and attaches workspace SHA-256 plus `target_execution: false` to the report.
+The exporter reports Ghidra's imported executable SHA-256; the adapter rejects
+results unless it matches the workspace hash. The input snapshot also lives in
+the private disk-backed project, rather than the host's temporary filesystem.
+Project cleanup owns only the newly created directory. Unix deadlines terminate
+the process group; Windows descendant cleanup is still a shared-runner limitation.
+
+Configuration: `KNIFE_GHIDRA_HEADLESS` names the launcher;
+`KNIFE_GHIDRA_WORK_ROOT` names an existing disk-backed directory with no hidden
+path components. Java remains supplied through the launch environment.
+The ignored `live_isolated_function_export` test additionally requires
+`KNIFE_GHIDRA_TEST_TARGET`. It passed against `/usr/bin/true` through the actual
+Rust process adapter in 23.53 seconds, including imported sample identity and
+file-backed function checks. Four boundary/request regressions also passed.
+MCP registration, report caching, pagination and evidence envelopes are still
+outstanding; this is not yet an end-to-end agent investigation.
+
 Primary references:
 
 - https://github.com/NationalSecurityAgency/ghidra/releases/tag/Ghidra_12.1.4_build

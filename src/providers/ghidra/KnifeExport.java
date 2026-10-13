@@ -32,6 +32,7 @@ public class KnifeExport extends HeadlessScript {
         JsonObject result = new JsonObject();
         result.addProperty("schema", 1);
         result.addProperty("provider", "ghidra");
+        result.addProperty("sample_sha256", currentProgram.getExecutableSHA256());
         result.addProperty("language", currentProgram.getLanguageID().toString());
         result.addProperty("image_base", address(currentProgram.getImageBase().getOffset()));
         result.addProperty("analysis_timed_out", analysisTimeoutOccurred());
