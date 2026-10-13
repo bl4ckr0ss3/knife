@@ -143,7 +143,13 @@ pub(crate) fn run_process<I>(
 where
     I: IntoIterator<Item = OsString>,
 {
-    let mut child = Command::new(executable)
+    let mut command = Command::new(executable);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -166,6 +172,14 @@ where
             break status;
         }
         if started.elapsed() >= deadline {
+            #[cfg(unix)]
+            {
+                // The child leads its own process group; its packaged helper
+                // processes must not keep our stdout/stderr pipes open.
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+            }
             let _ = child.kill();
             let _ = child.wait();
             let _ = stdout_reader.join();
@@ -246,6 +260,19 @@ pub(super) fn executable_identity(executable: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn deadline_terminates_descendants_holding_output_pipes() {
+        let started = Instant::now();
+        let result = run_process(
+            Path::new("/bin/sh"),
+            [OsString::from("-c"), OsString::from("sleep 30 & wait")],
+            Duration::from_millis(100),
+            1024,
+        );
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
 
     #[test]
     fn output_reader_drains_while_retaining_only_the_bound() {

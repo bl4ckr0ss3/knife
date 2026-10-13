@@ -47,9 +47,19 @@ pub fn status() -> ProviderStatus {
     }
 }
 pub fn descriptor() -> OperationDescriptor {
-    OperationDescriptor::read("capa_capabilities","Independent capa capability rules, ATT&CK/MBC metadata and typed match locations from static workspace bytes.",json!({"limit":{"type":"integer","minimum":1,"maximum":400},"cursor":{"type":"string"}}),&[]).with_result_mode(ResultMode::Paginated).with_evidence()
+    OperationDescriptor::read("capa_capabilities","Independent capa capability rules, ATT&CK/MBC metadata and typed match locations from static workspace bytes.",json!({"limit":{"type":"integer","minimum":1,"maximum":400},"timeout_seconds":{"type":"integer","minimum":1,"maximum":120},"cursor":{"type":"string"}}),&[]).with_result_mode(ResultMode::Paginated).with_evidence()
 }
 pub fn dispatch(session: &Session, args: &Value) -> Result<Value> {
+    let timeout = args
+        .get("timeout_seconds")
+        .map(|value| {
+            value
+                .as_u64()
+                .filter(|value| (1..=120).contains(value))
+                .ok_or_else(|| anyhow!("timeout_seconds must be an integer between 1 and 120"))
+        })
+        .transpose()?
+        .unwrap_or(30);
     let path = executable()
         .ok_or_else(|| anyhow!("capa unavailable; install standalone capa or set KNIFE_CAPA"))?;
     let format = match session.bin.format {
@@ -84,7 +94,7 @@ pub fn dispatch(session: &Session, args: &Value) -> Result<Value> {
             OsString::from(format),
             snapshot.path().as_os_str().to_owned(),
         ],
-        Duration::from_secs(30),
+        Duration::from_secs(timeout),
         8 * 1024 * 1024,
     )?;
     if !output.status.success() || output.truncated {

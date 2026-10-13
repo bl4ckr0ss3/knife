@@ -2535,6 +2535,7 @@ dependencies = [
  "cpp_demangle",
  "goblin",
  "iced-x86",
+ "libc",
  "md-5",
  "msvc-demangler",
  "owo-colors",

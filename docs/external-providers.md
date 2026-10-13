@@ -67,9 +67,13 @@ The initial standalone capa adapter exposes `capa_capabilities` for PE/ELF.
 Set `KNIFE_CAPA` to its executable or install it on PATH. It uses fixed JSON
 arguments, verifies the report's sample SHA-256 against workspace bytes, and
 caches reports in an eight-item/32-MiB LRU for stable continuation. Each process
-has a 30-second deadline and 8-MiB output bound. Rule metadata includes ATT&CK
+has a default 30-second deadline (`timeout_seconds` accepts 1–120) and an
+8-MiB output bound. Unix provider deadlines terminate the process group,
+including packaged-engine helpers that could otherwise keep output pipes open.
+Rule metadata includes ATT&CK
 and MBC fields; top-level match locations keep capa's declared address types.
-Deep match-tree navigation and live-engine validation remain outstanding.
+Live MCP validation is documented in [capa-field-validation.md](capa-field-validation.md).
+Deep match-tree navigation remains outstanding.
 
 | provider | integration | value | policy |
 |---|---|---|---|
