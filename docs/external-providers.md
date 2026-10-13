@@ -77,6 +77,14 @@ live-tested on ELF and the PE crackme; see
 [ghidra-mcp-field-validation.md](ghidra-mcp-field-validation.md). Only ordinary
 `ram` addresses are correlated; overlay-space locations remain unknown.
 
+`compare_engine_findings` accepts `include_ghidra: true` to compare the selected
+Knife entry with Ghidra, using an exact source-entry `file_offset` query against
+the cached inventory. Missing or multiple matching entries remain unknown,
+not evidence that no function exists. Size differences may reflect different
+body models; agreement does not establish correctness. Omit the flag to retain
+the lightweight Knife/Rizin workflow. Use the same `timeout_seconds` as the
+inventory request to reuse its cached report.
+
 The initial standalone capa adapter exposes `capa_capabilities` for PE/ELF.
 Set `KNIFE_CAPA` to its executable or install it on PATH. It uses fixed JSON
 arguments, verifies the report's sample SHA-256 against workspace bytes, and

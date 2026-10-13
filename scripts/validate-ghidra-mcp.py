@@ -73,6 +73,17 @@ def main():
             "address": entry["knife_static_address"]
         })["structuredContent"]
         assert navigation["evidence"], "mapped entry must be navigable"
+        comparison = tool("compare_engine_findings", {
+            "address": entry["knife_static_address"],
+            "include_ghidra": True, "timeout_seconds": 120
+        })["structuredContent"]
+        ghidra_fields = [row for row in comparison["data"]["comparisons"]
+                         if row.get("provider") == "ghidra"]
+        assert len(ghidra_fields) == 2
+        # Ghidra may recover an entry that Knife did not; that stays unknown.
+        native = comparison["data"]["knife"]
+        assert ghidra_fields[0]["status"] == ("agreement" if native else "unknown"), comparison
+        assert any(e["producer"] == "ghidra_functions" for e in comparison["evidence"])
         decompiled = tool("ghidra_decompile", {
             "provider_static_address": entry["address"], "timeout_seconds": 120
         })["structuredContent"]
@@ -84,6 +95,8 @@ def main():
                           "first_page_seconds": round(first_seconds, 3),
                           "cached_page_seconds": round(second_seconds, 3),
                           "entry": entry, "decompile_partial": decompiled["partial"],
+                          "ghidra_comparison": ghidra_fields,
+                          "knife_comparison": native,
                           "pseudocode": decompiled["data"]["pseudocode"][:1000],
                           "evidence_locations": decompiled["evidence"][0]["locations"]}, indent=2))
     finally:

@@ -230,6 +230,25 @@ fn engine_comparison_preserves_disagreement_and_unknown_states() {
     .unwrap();
     assert_eq!(result["evidence"][0]["producer"], "compare_engine_findings");
     assert_eq!(result["data"]["comparisons"].as_array().unwrap().len(), 2);
+    assert!(result["data"]["ghidra"].is_null());
+    assert!(tools::dispatch(
+        &session,
+        "compare_engine_findings",
+        &json!({"address":format!("0x{address:x}"),"include_ghidra":"yes"})
+    )
+    .is_err());
+    if reknife::providers::ghidra::executable().is_none() {
+        let extended = tools::dispatch(
+            &session,
+            "compare_engine_findings",
+            &json!({"address":format!("0x{address:x}"),"include_ghidra":true}),
+        )
+        .unwrap();
+        assert_eq!(extended["data"]["comparisons"].as_array().unwrap().len(), 4);
+        assert_eq!(extended["data"]["comparisons"][2]["status"], "unknown");
+        assert_eq!(extended["data"]["comparisons"][3]["status"], "unknown");
+        assert_eq!(extended["partial"], true);
+    }
     for field in result["data"]["comparisons"].as_array().unwrap() {
         assert!(
             ["agreement", "disagreement", "unknown"].contains(&field["status"].as_str().unwrap())

@@ -30,7 +30,7 @@ pub fn status() -> super::ProviderStatus {
 
 pub fn catalog() -> Vec<OperationDescriptor> {
     vec![
-        OperationDescriptor::read("ghidra_functions", "Independent Ghidra static function inventory; preserves provider addresses and maps file-backed entry points to Knife locations.", json!({"limit":{"type":"integer","minimum":1,"maximum":400},"cursor":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":10,"maximum":300}}), &[]).with_result_mode(ResultMode::Paginated).with_evidence(),
+        OperationDescriptor::read("ghidra_functions", "Independent Ghidra static function inventory; optional exact entry file-offset filter; preserves provider addresses and file-backed Knife locations.", json!({"file_offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":400},"cursor":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":10,"maximum":300}}), &[]).with_result_mode(ResultMode::Paginated).with_evidence(),
         OperationDescriptor::read("ghidra_decompile", "Ghidra pseudocode at a Ghidra provider static address, not a Knife or runtime address. Results are inferred, not execution evidence.", json!({"provider_static_address":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":10,"maximum":300}}), &["provider_static_address"]).with_evidence(),
     ]
 }
@@ -51,6 +51,12 @@ pub fn dispatch(session: &Session, name: &str, args: &Value) -> Result<Value> {
         })
         .transpose()?
         .unwrap_or(90);
+    if args
+        .get("file_offset")
+        .is_some_and(|value| value.as_u64().is_none())
+    {
+        bail!("file_offset must be a nonnegative integer");
+    }
     if let Some(limit) = args.get("limit") {
         if !limit.as_u64().is_some_and(|n| (1..=400).contains(&n)) {
             bail!("limit must be an integer between 1 and 400");
@@ -110,21 +116,32 @@ fn shape(session: &Session, name: &str, args: &Value, raw: &Value) -> Result<Val
     data["result_sha256"] = digest.clone().into();
     let mut partial = raw["analysis_timed_out"].as_bool().unwrap_or(true);
     if name == "ghidra_functions" {
-        let rows = raw["functions"]
+        let all_rows = raw["functions"]
             .as_array()
             .context("Ghidra inventory missing")?;
+        let filter = args
+            .get("file_offset")
+            .map(|v| {
+                v.as_u64()
+                    .context("file_offset must be a nonnegative integer")
+            })
+            .transpose()?;
+        let rows = all_rows
+            .iter()
+            .filter(|row| filter.is_none() || row["file_offset"].as_u64() == filter)
+            .collect::<Vec<_>>();
         let page = crate::api::paging::PageWindow::from_args(
             args,
             rows.len(),
             100,
             400,
-            &format!("ghidra-functions:{digest}"),
+            &format!("ghidra-functions:{digest}:{filter:?}"),
         )?;
         let mut selected = rows
             .iter()
             .skip(page.offset)
             .take(page.limit)
-            .cloned()
+            .map(|row| (*row).clone())
             .collect::<Vec<_>>();
         for row in &mut selected {
             row["knife_static_address"] = static_address(session, row)
@@ -133,6 +150,7 @@ fn shape(session: &Session, name: &str, args: &Value, raw: &Value) -> Result<Val
         }
         data["functions"] = selected.into();
         data["available_rows"] = rows.len().into();
+        data["inventory_rows"] = all_rows.len().into();
         data["next_cursor"] = serde_json::to_value(&page.next_cursor)?;
         data["page"] = serde_json::to_value(page)?;
         partial |= raw["truncated"].as_bool().unwrap_or(true);
@@ -409,6 +427,37 @@ mod tests {
         assert_eq!(data["partial"], true);
         assert_eq!(data["error"], "failed");
         assert_eq!(evidence_locations(&session, &data)[0].static_address, None);
+    }
+    #[test]
+    fn entry_offset_filters_without_changing_report_identity() {
+        let session = fixture_session();
+        let raw = json!({"analysis_timed_out":false,"truncated":false,"total":3,"functions":[{"name":"a","file_offset":100},{"name":"b","file_offset":200},{"name":"alias","file_offset":200}]});
+        let all = shape(&session, "ghidra_functions", &json!({"limit":1}), &raw).unwrap();
+        let filtered = shape(
+            &session,
+            "ghidra_functions",
+            &json!({"file_offset":200,"limit":1}),
+            &raw,
+        )
+        .unwrap();
+        assert_eq!(filtered["available_rows"], 2);
+        assert_eq!(filtered["inventory_rows"], 3);
+        assert_eq!(filtered["functions"][0]["name"], "b");
+        assert_eq!(filtered["result_sha256"], all["result_sha256"]);
+        assert!(shape(
+            &session,
+            "ghidra_functions",
+            &json!({"file_offset":200,"cursor":all["next_cursor"]}),
+            &raw
+        )
+        .is_err());
+        assert!(shape(
+            &session,
+            "ghidra_functions",
+            &json!({"file_offset":-1}),
+            &raw
+        )
+        .is_err());
     }
     #[test]
     #[ignore = "requires a configured Ghidra installation, JDK, project root and test target"]

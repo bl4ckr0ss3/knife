@@ -61,7 +61,7 @@ pub fn read_catalog() -> Vec<OperationDescriptor> {
         tool("explain_function", "Collect evidence-backed function context, bounded instructions, callers, callees, and pseudocode for an explanation; recovered semantics remain inference.", selector_props(), &[]).with_any_required(&["selector", "address"]).with_evidence(),
         tool("trace_string_usage", "Follow matching string literals to recovered reference instructions and containing functions with bounded coverage and evidence.", json!({"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":20},"cursor":{"type":"string"}}), &["query"]).with_result_mode(ResultMode::Paginated).with_evidence(),
         tool("inspect_input_validation", "Inspect a function's comparison/conditional-branch sites, validation API calls, and dangerous-argument provenance; candidate checks are not proof of a complete validation path.", selector_props(), &[]).with_any_required(&["selector","address"]).with_evidence(),
-        tool("compare_engine_findings", "Compare Knife and optional Rizin function recovery at one address; report agreement, disagreement, and unavailable fields with independent evidence.", selector_props(), &[]).with_any_required(&["selector","address"]).with_evidence(),
+        tool("compare_engine_findings", "Compare Knife and Rizin function recovery; optionally include Ghidra with explicit include_ghidra. Report disagreements and unknowns with independent evidence.", { let mut props = selector_props(); props["include_ghidra"] = json!({"type":"boolean"}); props["timeout_seconds"] = json!({"type":"integer","minimum":10,"maximum":300}); props }, &[]).with_any_required(&["selector","address"]).with_evidence(),
         tool("info", "Format, architecture, entry point, sections, and function/import counts.", json!({}), &[]),
         tool("list_functions", "Recovered functions (address, name, incoming call count), optionally filtered by a name substring.",
              json!({"filter": {"type": "string"}, "limit": {"type": "integer", "minimum": 1}, "cursor": {"type": "string"}, "named_only": {"type": "boolean"}}), &[]).with_result_mode(ResultMode::Paginated),
@@ -896,6 +896,15 @@ fn inspect_input_validation(sess: &Session, args: &Value) -> Result<Value> {
 }
 
 fn compare_engine_findings(sess: &Session, args: &Value) -> Result<Value> {
+    let include_ghidra = args
+        .get("include_ghidra")
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| anyhow!("include_ghidra must be boolean"))
+        })
+        .transpose()?
+        .unwrap_or(false);
     let selector = sel(args)?;
     let address = crate::api::navigation::resolve_address_in(&sess.an, &selector)?.get();
     let native = sess.an.function_at(address);
@@ -926,6 +935,51 @@ fn compare_engine_findings(sess: &Session, args: &Value) -> Result<Value> {
         };
         comparisons.push(json!({"field":field,"knife":left,"rizin":right,"status":status}));
     }
+    let ghidra = if include_ghidra {
+        let file_offset = engine::va_to_off(&sess.bin, engine::display_base(&sess.bin), address);
+        let report = match file_offset {
+            Some(offset) => {
+                let mut query = json!({"file_offset":offset,"limit":400});
+                if let Some(timeout) = args.get("timeout_seconds") {
+                    query["timeout_seconds"] = timeout.clone();
+                }
+                match dispatch(sess, "ghidra_functions", &query) {
+                    Ok(value) => value,
+                    Err(error) => json!({"unavailable":error.to_string()}),
+                }
+            }
+            None => {
+                json!({"unavailable":"Knife address is not file-backed; Ghidra correlation unknown"})
+            }
+        };
+        let rows = report["data"]["functions"].as_array();
+        let candidates = rows
+            .into_iter()
+            .flatten()
+            .filter(|row| crate::providers::ghidra::static_address(sess, row) == Some(address))
+            .collect::<Vec<_>>();
+        // Multiple aliases/overlays must not silently select an arbitrary row.
+        let function = (candidates.len() == 1).then(|| candidates[0]);
+        for field in ["address", "size"] {
+            let left = native_data.as_ref().and_then(|value| value[field].as_u64());
+            let right = function.and_then(|row| {
+                if field == "address" {
+                    crate::providers::ghidra::static_address(sess, row)
+                } else {
+                    row["size"].as_u64()
+                }
+            });
+            let status = match (left, right) {
+                (Some(a), Some(b)) if a == b => "agreement",
+                (Some(_), Some(_)) => "disagreement",
+                _ => "unknown",
+            };
+            comparisons.push(json!({"provider":"ghidra","field":field,"knife":left,"ghidra":right,"status":status}));
+        }
+        Some(report)
+    } else {
+        None
+    };
     let disagreements = comparisons
         .iter()
         .filter(|row| row["status"] == "disagreement")
@@ -936,12 +990,17 @@ fn compare_engine_findings(sess: &Session, args: &Value) -> Result<Value> {
         .count();
     let mut result = evidence_result(sess,"compare_engine_findings",format!("Function recovery comparison at 0x{address:x}: {disagreements} disagreements, {unknowns} unknown fields"),vec![evidence_location(address,engine::va_to_off(&sess.bin,engine::display_base(&sess.bin),address).and_then(|value|u64::try_from(value).ok()),native.map(|function|function.name.clone()))],
         vec![EvidenceStatement{kind:StatementKind::Inference,text:"Different recovered function boundaries are engine disagreements requiring inspection; agreement does not establish correctness or runtime behavior.".into(),confidence:Confidence::Medium}],
-        vec!["This compares function entry addresses and reported sizes only. Engines may measure non-contiguous functions differently; a size disagreement is not automatically a bug.".into(),"Unavailable providers or fields remain unknown; neither engine is treated as authoritative.".into()],
-        json!({"address":format!("0x{address:x}"),"knife":native_data,"rizin":external,"comparisons":comparisons,"disagreements":disagreements,"unknown_fields":unknowns}),unknowns>0,None)?;
-    if let Some(evidence) = result["data"]["rizin"]["evidence"].as_array().cloned() {
-        if let Some(records) = result["evidence"].as_array_mut() {
-            records.extend(evidence);
+        vec!["This compares function entry addresses and reported sizes only. Engines may measure non-contiguous functions differently; a size disagreement is not automatically a bug.".into(),"Unavailable providers or fields remain unknown; neither engine is treated as authoritative.".into(),"When requested, Ghidra is matched by exact entry file offset and checked RAM-space correlation. Missing or ambiguous candidates remain unknown; incomplete inventories cannot establish absence. Address agreement reflects this correlation, not independent proof of semantics.".into()],
+        json!({"address":format!("0x{address:x}"),"knife":native_data,"rizin":external,"ghidra":ghidra,"comparisons":comparisons,"disagreements":disagreements,"unknown_fields":unknowns}),unknowns>0,None)?;
+    for provider in ["rizin", "ghidra"] {
+        if let Some(evidence) = result["data"][provider]["evidence"].as_array().cloned() {
+            if let Some(records) = result["evidence"].as_array_mut() {
+                records.extend(evidence);
+            }
         }
+    }
+    if result["data"]["ghidra"]["partial"].as_bool() == Some(true) {
+        result["partial"] = true.into();
     }
     Ok(result)
 }

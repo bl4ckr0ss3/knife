@@ -55,3 +55,20 @@ Source offsets alone do not prove address equivalence for overlay spaces that
 reuse the same bytes. Knife now only correlates the ordinary Ghidra `ram`
 address space to native static addresses; other spaces remain unknown while
 retaining their file-offset evidence. A regression covers this distinction.
+
+## Combined comparison workflow
+
+The live MCP script now requests `compare_engine_findings` with
+`include_ghidra: true`, reusing the same 120-second inventory cache key. Ghidra
+filters entries by exact source file offset, and the comparison includes its
+independent evidence record.
+
+The first validation assertion incorrectly required address agreement even
+when Knife had not recovered a corresponding entry. The corrected rerun passed
+on ELF: inventory 16.234 seconds, cached page 0.006 seconds. At file offset 8192,
+Ghidra reported mapped address 8192 and size 27; Knife's corresponding function
+address and size were both null. Both fields correctly remained `unknown`.
+This is a recovery-coverage difference, not a proved native-engine bug or
+evidence that the function is absent. Its decompilation still completed.
+
+Seven provider regressions and the updated agent comparison regression passed.
