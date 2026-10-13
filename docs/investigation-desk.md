@@ -57,6 +57,12 @@ may finish in the background under its existing deadline. Native engine work
 does not yet have a cancellation guarantee.
 
 The ledger stores explicit supporting and contradicting evidence links.
+External agents can save plans with `investigation_add_plan_step` and
+`investigation_update_plan_step`. Status values are pending, running, completed
+and blocked. Completion requires existing evidence links; recorded completion
+is still an agent/analyst assertion, not automatic verification of the step.
+The desk previews up to two unfinished steps; `investigation_status` returns a
+bounded plan inventory. Existing ledgers load with an empty plan.
 Opposing links leave a hypothesis unresolved. Linking evidence is not an
 automatic assertion that a hypothesis is true.
 

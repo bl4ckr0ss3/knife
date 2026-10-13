@@ -209,6 +209,20 @@ fn investigation_desk(f: &mut Frame, app: &App) {
     } else {
         " Questions and hypotheses"
     }));
+    for step in app
+        .investigation
+        .plan
+        .iter()
+        .filter(|step| step.status != crate::api::investigation::PlanStatus::Completed)
+        .take(2)
+    {
+        lines.push(TLine::from(format!(
+            " Plan #{} {:?}: {}",
+            step.id,
+            step.status,
+            desk_preview(&step.text, usize::from(width.saturating_sub(25)))
+        )));
+    }
     let hypotheses: Vec<_> = app
         .investigation
         .hypotheses

@@ -45,11 +45,29 @@ pub struct Hypothesis {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanStep {
+    pub id: u64,
+    pub text: String,
+    pub status: PlanStatus,
+    pub evidence: Vec<EvidenceId>,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStatus {
+    Pending,
+    Running,
+    Completed,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Investigation {
     schema: u32,
     pub target_sha256: String,
     pub messages: Vec<Message>,
     pub hypotheses: Vec<Hypothesis>,
+    #[serde(default)]
+    pub plan: Vec<PlanStep>,
     pub evidence: BTreeMap<String, EvidenceRecord>,
     #[serde(skip)]
     disk_revision: Option<String>,
@@ -62,6 +80,7 @@ impl Investigation {
             target_sha256: target_sha256.into(),
             messages: Vec::new(),
             hypotheses: Vec::new(),
+            plan: Vec::new(),
             evidence: BTreeMap::new(),
             disk_revision: None,
         }
@@ -92,6 +111,7 @@ impl Investigation {
 
     fn validate(&self) -> Result<()> {
         if self.messages.len() > MAX_ENTRIES
+            || self.plan.len() > MAX_ENTRIES
             || self.hypotheses.len() > MAX_ENTRIES
             || self.evidence.len() > MAX_ENTRIES
         {
@@ -100,6 +120,13 @@ impl Investigation {
         for message in &self.messages {
             check_text(&message.text)?;
             self.check_links(&message.evidence)?;
+        }
+        for step in &self.plan {
+            check_text(&step.text)?;
+            self.check_links(&step.evidence)?;
+            if step.status == PlanStatus::Completed && step.evidence.is_empty() {
+                return Err(anyhow!("completed plan steps require supporting evidence"));
+            }
         }
         for hypothesis in &self.hypotheses {
             check_text(&hypothesis.question)?;
@@ -156,6 +183,47 @@ impl Investigation {
             contradicts: Vec::new(),
         });
         Ok(id)
+    }
+
+    pub fn add_plan_step(&mut self, text: String) -> Result<u64> {
+        check_text(&text)?;
+        if self.plan.len() >= MAX_ENTRIES {
+            return Err(anyhow!("plan entry limit reached"));
+        }
+        let id = self
+            .plan
+            .iter()
+            .map(|step| step.id)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("plan ID exhausted"))?;
+        self.plan.push(PlanStep {
+            id,
+            text,
+            status: PlanStatus::Pending,
+            evidence: Vec::new(),
+        });
+        Ok(id)
+    }
+    pub fn update_plan_step(
+        &mut self,
+        id: u64,
+        status: PlanStatus,
+        evidence: Vec<EvidenceId>,
+    ) -> Result<()> {
+        self.check_links(&evidence)?;
+        if status == PlanStatus::Completed && evidence.is_empty() {
+            return Err(anyhow!("completed plan steps require supporting evidence"));
+        }
+        let step = self
+            .plan
+            .iter_mut()
+            .find(|step| step.id == id)
+            .ok_or_else(|| anyhow!("unknown plan step"))?;
+        step.status = status;
+        step.evidence = evidence;
+        Ok(())
     }
 
     pub fn record(&mut self, evidence: EvidenceRecord) -> Result<()> {

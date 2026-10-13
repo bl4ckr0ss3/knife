@@ -127,6 +127,8 @@ pub fn mutation_catalog() -> Vec<OperationDescriptor> {
     let addr = || json!({ "type": "string", "description": "static address (0x...)" });
     vec![
         mutation("investigation_ask", "Persist an analyst question in the active project's investigation ledger.", json!({"question":{"type":"string","maxLength":32768}}), &["question"]),
+        mutation("investigation_add_plan_step", "Add a pending investigation step to the shared project plan.",json!({"text":{"type":"string","maxLength":32768}}), &["text"]),
+        mutation("investigation_update_plan_step", "Update a recorded plan step; completion requires saved evidence links.",json!({"step_id":{"type":"integer","minimum":1},"status":{"type":"string","enum":["pending","running","completed","blocked"]},"evidence_ids":{"type":"array","items":{"type":"string"},"maxItems":64}}), &["step_id","status"]),
         mutation("investigation_append_message", "Persist an external agent's conversation or tool-activity entry with optional saved evidence links for the companion TUI.", json!({"role":{"type":"string","enum":["analyst","assistant","tool"]},"text":{"type":"string","maxLength":32768},"evidence_ids":{"type":"array","items":{"type":"string"},"maxItems":64}}), &["role","text"]),
         mutation("investigation_record_evidence", "Persist a content-addressed evidence record for the active target or staged workspace.", json!({"evidence":{"type":"object"}}), &["evidence"]),
         mutation("investigation_link_evidence", "Link saved evidence as supporting or contradicting a hypothesis; opposing links leave it unresolved.", json!({"hypothesis_id":{"type":"integer","minimum":1},"evidence_id":{"type":"string"},"contradicts":{"type":"boolean"}}), &["hypothesis_id","evidence_id","contradicts"]),
@@ -391,6 +393,8 @@ pub fn dispatch(sess: &Session, name: &str, args: &Value) -> Result<Value> {
 pub fn dispatch_mut(sess: &mut Session, name: &str, args: &Value) -> Result<Value> {
     match name {
         "investigation_ask"
+        | "investigation_add_plan_step"
+        | "investigation_update_plan_step"
         | "investigation_append_message"
         | "investigation_record_evidence"
         | "investigation_link_evidence" => investigation_write(sess, name, args),
@@ -655,8 +659,9 @@ fn investigation_status(sess: &Session) -> Result<Value> {
     )?;
     let hypotheses: Vec<_> = ledger.hypotheses.iter().rev().take(100).collect();
     let messages: Vec<_> = ledger.messages.iter().rev().take(20).collect();
+    let plan: Vec<_> = ledger.plan.iter().take(100).collect();
     Ok(
-        json!({"target_sha256":ledger.target_sha256,"hypotheses":hypotheses,"messages":messages,"evidence_count":ledger.evidence.len(),"hypothesis_count":ledger.hypotheses.len(),"message_count":ledger.messages.len(),"partial":ledger.hypotheses.len()>100 || ledger.messages.len()>20}),
+        json!({"target_sha256":ledger.target_sha256,"plan":plan,"plan_count":ledger.plan.len(),"hypotheses":hypotheses,"messages":messages,"evidence_count":ledger.evidence.len(),"hypothesis_count":ledger.hypotheses.len(),"message_count":ledger.messages.len(),"partial":ledger.hypotheses.len()>100 || ledger.messages.len()>20 || ledger.plan.len()>100}),
     )
 }
 
@@ -664,6 +669,35 @@ fn investigation_write(sess: &Session, name: &str, args: &Value) -> Result<Value
     let path = investigation_path(sess)?;
     let mut ledger = crate::api::investigation::Investigation::load(&path, &sess.db.sha256)?;
     let result = match name {
+        "investigation_add_plan_step" => {
+            let text = args
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("missing text"))?
+                .to_string();
+            json!({"step_id":ledger.add_plan_step(text)?})
+        }
+        "investigation_update_plan_step" => {
+            let id = args
+                .get("step_id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow!("missing step_id"))?;
+            let status: crate::api::investigation::PlanStatus = serde_json::from_value(
+                args.get("status")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("missing status"))?,
+            )?;
+            let evidence: Vec<crate::api::evidence::EvidenceId> = args
+                .get("evidence_ids")
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()?
+                .unwrap_or_default();
+            if evidence.len() > 64 {
+                return Err(anyhow!("at most 64 evidence links are allowed"));
+            }
+            ledger.update_plan_step(id, status, evidence)?;
+            json!({"step_id":id,"status":status})
+        }
         "investigation_append_message" => {
             let role: crate::api::investigation::Role = serde_json::from_value(
                 args.get("role")

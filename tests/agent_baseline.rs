@@ -89,6 +89,25 @@ fn agent_ledger_persists_questions_and_validates_evidence_links() {
     )
     .unwrap();
     assert_eq!(linked["result"]["status"], "supported");
+    let step = tools::dispatch_mut(
+        &mut session,
+        "investigation_add_plan_step",
+        &json!({"text":"Establish target identity"}),
+    )
+    .unwrap()["result"]["step_id"]
+        .clone();
+    assert!(tools::dispatch_mut(
+        &mut session,
+        "investigation_update_plan_step",
+        &json!({"step_id":step,"status":"completed"})
+    )
+    .is_err());
+    tools::dispatch_mut(
+        &mut session,
+        "investigation_update_plan_step",
+        &json!({"step_id":step,"status":"completed","evidence_ids":[evidence["id"]]}),
+    )
+    .unwrap();
     tools::dispatch_mut(&mut session,"investigation_append_message",&json!({"role":"assistant","text":"Observed target identity; behavior remains unresolved.","evidence_ids":[evidence["id"]]})).unwrap();
     assert!(tools::dispatch_mut(
         &mut session,
@@ -100,6 +119,8 @@ fn agent_ledger_persists_questions_and_validates_evidence_links() {
     assert_eq!(saved["message_count"], 2);
     assert_eq!(saved["messages"][0]["role"], "assistant");
     assert_eq!(saved["hypothesis_count"], 1);
+    assert_eq!(saved["plan_count"], 1);
+    assert_eq!(saved["plan"][0]["status"], "completed");
     assert_eq!(saved["evidence_count"], 1);
     assert_eq!(
         tools::dispatch(&session, "investigation_conflicts", &json!({})).unwrap()["matched"],
@@ -316,7 +337,7 @@ fn read_catalog_exposes_machine_readable_operation_policy() {
     );
 
     let mutations = tools::mutation_catalog();
-    assert_eq!(mutations.len(), 8);
+    assert_eq!(mutations.len(), 10);
     assert!(mutations
         .iter()
         .all(|operation| operation.access == OperationAccess::ProjectWrite));
