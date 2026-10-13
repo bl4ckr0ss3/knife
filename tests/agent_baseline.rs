@@ -89,7 +89,16 @@ fn agent_ledger_persists_questions_and_validates_evidence_links() {
     )
     .unwrap();
     assert_eq!(linked["result"]["status"], "supported");
+    tools::dispatch_mut(&mut session,"investigation_append_message",&json!({"role":"assistant","text":"Observed target identity; behavior remains unresolved.","evidence_ids":[evidence["id"]]})).unwrap();
+    assert!(tools::dispatch_mut(
+        &mut session,
+        "investigation_append_message",
+        &json!({"role":"assistant","text":"Unsupported claim","evidence_ids":["missing"]})
+    )
+    .is_err());
     let saved = tools::dispatch(&session, "investigation_status", &json!({})).unwrap();
+    assert_eq!(saved["message_count"], 2);
+    assert_eq!(saved["messages"][0]["role"], "assistant");
     assert_eq!(saved["hypothesis_count"], 1);
     assert_eq!(saved["evidence_count"], 1);
     assert_eq!(
@@ -291,7 +300,7 @@ fn read_catalog_exposes_machine_readable_operation_policy() {
     );
 
     let mutations = tools::mutation_catalog();
-    assert_eq!(mutations.len(), 7);
+    assert_eq!(mutations.len(), 8);
     assert!(mutations
         .iter()
         .all(|operation| operation.access == OperationAccess::ProjectWrite));

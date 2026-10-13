@@ -93,6 +93,7 @@ engine once.
 | `investigation_conflicts` | hypotheses with opposing evidence links, including supporting/contradicting record summaries and locations |
 | `investigation_get_evidence` | exact saved evidence by ID |
 | `investigation_ask` | persist a question in the project investigation |
+| `investigation_append_message` | save external-agent answers or tool activity with validated evidence links for the TUI |
 | `investigation_record_evidence` | save validated evidence belonging to the current target/workspace |
 | `investigation_link_evidence` | persist supporting or contradicting links to a saved hypothesis |
 | `info` | format, architecture, entry point, sections, function and import counts |

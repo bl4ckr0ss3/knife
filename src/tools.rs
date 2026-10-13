@@ -126,6 +126,7 @@ pub fn mutation_catalog() -> Vec<OperationDescriptor> {
     let addr = || json!({ "type": "string", "description": "static address (0x...)" });
     vec![
         mutation("investigation_ask", "Persist an analyst question in the active project's investigation ledger.", json!({"question":{"type":"string","maxLength":32768}}), &["question"]),
+        mutation("investigation_append_message", "Persist an external agent's conversation or tool-activity entry with optional saved evidence links for the companion TUI.", json!({"role":{"type":"string","enum":["analyst","assistant","tool"]},"text":{"type":"string","maxLength":32768},"evidence_ids":{"type":"array","items":{"type":"string"},"maxItems":64}}), &["role","text"]),
         mutation("investigation_record_evidence", "Persist a content-addressed evidence record for the active target or staged workspace.", json!({"evidence":{"type":"object"}}), &["evidence"]),
         mutation("investigation_link_evidence", "Link saved evidence as supporting or contradicting a hypothesis; opposing links leave it unresolved.", json!({"hypothesis_id":{"type":"integer","minimum":1},"evidence_id":{"type":"string"},"contradicts":{"type":"boolean"}}), &["hypothesis_id","evidence_id","contradicts"]),
         mutation(
@@ -382,9 +383,10 @@ pub fn dispatch(sess: &Session, name: &str, args: &Value) -> Result<Value> {
 /// every front end. The input binary is never modified.
 pub fn dispatch_mut(sess: &mut Session, name: &str, args: &Value) -> Result<Value> {
     match name {
-        "investigation_ask" | "investigation_record_evidence" | "investigation_link_evidence" => {
-            investigation_write(sess, name, args)
-        }
+        "investigation_ask"
+        | "investigation_append_message"
+        | "investigation_record_evidence"
+        | "investigation_link_evidence" => investigation_write(sess, name, args),
         "set_name" | "set_note" => {
             let address = crate::address::StaticVa(addr_arg(args, "address")?);
             let key = if name == "set_name" { "name" } else { "note" };
@@ -644,6 +646,27 @@ fn investigation_write(sess: &Session, name: &str, args: &Value) -> Result<Value
     let path = investigation_path(sess)?;
     let mut ledger = crate::api::investigation::Investigation::load(&path, &sess.db.sha256)?;
     let result = match name {
+        "investigation_append_message" => {
+            let role: crate::api::investigation::Role = serde_json::from_value(
+                args.get("role")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("missing role"))?,
+            )?;
+            let text = args
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("missing text"))?
+                .to_string();
+            let links: Vec<crate::api::evidence::EvidenceId> = match args.get("evidence_ids") {
+                Some(value) => serde_json::from_value(value.clone())?,
+                None => Vec::new(),
+            };
+            if links.len() > 64 {
+                return Err(anyhow!("at most 64 evidence links are allowed"));
+            }
+            ledger.append(role, text, links)?;
+            json!({"message_index":ledger.messages.len()-1})
+        }
         "investigation_ask" => {
             let question = args
                 .get("question")

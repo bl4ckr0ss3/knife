@@ -33,6 +33,9 @@ Give the external agent this investigation procedure:
 5. Preserve questions and supporting/contradicting evidence through the
    investigation ledger operations. Project-write tools are deliberate edits;
    ask the analyst before an unrequested rename, annotation or patch.
+   Use `investigation_append_message` to save the final answer or tool activity
+   with existing evidence IDs. Open `:investigation-reload` in the companion TUI
+   to inspect those messages and follow linked findings.
 6. Report observed bytes/instructions separately from inferred behavior and
    unknowns. Cite evidence IDs and addresses. Do not report an empty bounded
    search as proof that behavior is absent.
