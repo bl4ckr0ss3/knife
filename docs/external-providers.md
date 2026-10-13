@@ -63,6 +63,14 @@ Source and license: <https://github.com/VirusTotal/yara-x/tree/v1.12.0>
 
 ## Researched provider queue
 
+The initial standalone capa adapter exposes `capa_capabilities` for PE/ELF.
+Set `KNIFE_CAPA` to its executable or install it on PATH. It uses fixed JSON
+arguments, verifies the report's sample SHA-256 against workspace bytes, and
+caches reports in an eight-item/32-MiB LRU for stable continuation. Each process
+has a 30-second deadline and 8-MiB output bound. Rule metadata includes ATT&CK
+and MBC fields; top-level match locations keep capa's declared address types.
+Deep match-tree navigation and live-engine validation remain outstanding.
+
 | provider | integration | value | policy |
 |---|---|---|---|
 | capa | standalone JSON process first; Python library adapter later | capability rules for PE, ELF, .NET, shellcode, and sandbox reports | Apache-2.0; static/read-only; rules and engine versions recorded |

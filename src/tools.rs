@@ -116,6 +116,7 @@ pub fn read_catalog() -> Vec<OperationDescriptor> {
              json!({"address": {"type": "string"}, "length": {"type": "integer", "minimum": 1, "maximum": 4096}}), &["address"]),
     ];
     operations.extend(crate::providers::rizin::catalog());
+    operations.push(crate::providers::capa::descriptor());
     operations.extend(crate::providers::yarax::catalog());
     operations
 }
@@ -267,6 +268,12 @@ pub fn dispatch(sess: &Session, name: &str, args: &Value) -> Result<Value> {
     }
     match name {
         "session_status" => session_status(sess),
+        "capa_capabilities" => {
+            let data = crate::providers::capa::dispatch(sess, args)?;
+            let partial = data["partial"].as_bool().unwrap_or(false);
+            let cursor = data["next_cursor"].as_str().map(str::to_string);
+            evidence_result(sess,"capa_capabilities",format!("capa capability matches (result sha256 {})",data["result_sha256"].as_str().unwrap_or("unknown")),vec![],vec![EvidenceStatement{kind:StatementKind::Inference,text:"capa rules matched static features; capability names describe rule interpretations rather than demonstrated execution.".into(),confidence:Confidence::Medium}],vec!["capa match locations retain their declared address kinds. Packed or obfuscated code can make matches incomplete.".into(),"The provider uses a private workspace snapshot, a 30-second deadline and an 8 MiB output bound. Each rule reports at most 64 top-level locations. Continuation reuses a bounded cached report; an expired report requires restarting pagination.".into()],data,partial,cursor)
+        }
         "discover_investigation_tools" => {
             let task = args
                 .get("task")
@@ -291,7 +298,7 @@ pub fn dispatch(sess: &Session, name: &str, args: &Value) -> Result<Value> {
                 "strings" => ["strings","trace_string_usage","iocs","read_bytes","inspect_address_context"].contains(&operation.name),
                 "validation" => ["inspect_input_validation","explain_function","trace_taint","audit","paths_to","read_function_instructions"].contains(&operation.name),
                 "memory" => operation.name.starts_with("investigation_"),
-                "external" => operation.name.starts_with("rizin_") || operation.name.starts_with("yarax_"),
+                "external" => operation.name.starts_with("rizin_") || operation.name.starts_with("yarax_") || operation.name.starts_with("capa_"),
                 _ => true,
             }).map(|operation| json!({"operation":operation,"availability":operation_availability(sess,&operation)})).collect();
             Ok(json!({"task":task,"count":operations.len(),"tools":operations}))
@@ -530,6 +537,17 @@ fn operation_availability(
     operation: &OperationDescriptor,
 ) -> OperationAvailability {
     let reason = match operation.name {
+        "capa_capabilities" if crate::providers::capa::executable().is_none() => {
+            Some("standalone capa is not installed; configure KNIFE_CAPA".into())
+        }
+        "capa_capabilities"
+            if !matches!(
+                sess.bin.format,
+                crate::model::Format::Pe | crate::model::Format::Elf
+            ) =>
+        {
+            Some("capa provider currently supports PE and ELF".into())
+        }
         name if needs_code(name) && !sess.code_analyzed => Some(
             "this target has container metadata only; native code analysis is unavailable"
                 .to_string(),

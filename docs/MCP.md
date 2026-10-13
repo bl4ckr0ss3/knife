@@ -89,6 +89,7 @@ engine once.
 | `trace_string_usage` | matching literals with recovered reference sites, containing functions, instruction text, and coverage limits |
 | `inspect_input_validation` | candidate comparisons, branches, validation API calls, and dangerous-argument provenance; completeness is not established |
 | `compare_engine_findings` | Knife/Rizin function boundaries and sizes, with agreement, disagreement and unknown fields |
+| `capa_capabilities` | optional standalone capa rules, ATT&CK/MBC metadata and typed match locations for PE/ELF targets |
 | `investigation_status` | saved questions, hypotheses, recent conversation and evidence counts |
 | `investigation_conflicts` | hypotheses with opposing evidence links, including supporting/contradicting record summaries and locations |
 | `investigation_get_evidence` | exact saved evidence by ID |

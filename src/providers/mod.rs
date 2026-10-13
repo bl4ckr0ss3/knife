@@ -2,6 +2,7 @@
 //! boundary. Providers are never required to open a target, and their absence
 //! is reported explicitly instead of silently changing Knife's conclusions.
 
+pub mod capa;
 pub(crate) mod process;
 pub mod rizin;
 pub mod yarax;
@@ -23,5 +24,5 @@ pub struct ProviderStatus {
 }
 
 pub fn statuses() -> Vec<ProviderStatus> {
-    vec![rizin::status(), yarax::status()]
+    vec![rizin::status(), yarax::status(), capa::status()]
 }
