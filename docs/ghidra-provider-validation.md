@@ -52,6 +52,22 @@ heap, one analysis CPU and a 60-second analysis deadline:
 The Rust/MCP adapter, input snapshots, address correlation and report caching
 remain to be implemented. These runs validate the exporter, not end-to-end MCP.
 
+## File-backed correlation boundary
+
+The exporter now includes the address-space name and nullable source file
+offset for each function entry. A second live read-only export on `/usr/bin/true`
+returned `_DT_INIT` at provider address `0x102000`, address space `ram`, file
+offset 8192, and the next function at `0x102020` / file offset 8224. Analysis
+completed without a timeout and reported 134 functions.
+
+The Rust boundary parses the fixed logger record, validates schema/provider and
+timeout status, and rejects duplicate records or unexpected trailing content.
+It correlates source offsets with Knife's file-backed sections using checked
+arithmetic, rather than assuming loader image bases agree. Missing, out-of-file,
+or unmapped offsets remain unknown. This boundary is not yet an advertised MCP
+provider; process orchestration and end-to-end evidence integration remain open.
+Pseudocode truncation also avoids splitting a UTF-16 surrogate pair.
+
 Primary references:
 
 - https://github.com/NationalSecurityAgency/ghidra/releases/tag/Ghidra_12.1.4_build

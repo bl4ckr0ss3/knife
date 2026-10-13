@@ -3,6 +3,7 @@
 //! is reported explicitly instead of silently changing Knife's conclusions.
 
 pub mod capa;
+pub mod ghidra;
 pub(crate) mod process;
 pub mod rizin;
 pub mod yarax;

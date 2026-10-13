@@ -5,6 +5,7 @@ import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionIterator;
+import ghidra.program.database.mem.AddressSourceInfo;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonArray;
 
@@ -13,6 +14,13 @@ public class KnifeExport extends HeadlessScript {
     private JsonObject function(Function function) {
         JsonObject row = new JsonObject();
         row.addProperty("address", address(function.getEntryPoint().getOffset()));
+        row.addProperty("address_space", function.getEntryPoint().getAddressSpace().getName());
+        AddressSourceInfo source = currentProgram.getMemory().getAddressSourceInfo(function.getEntryPoint());
+        if (source != null && source.getFileOffset() >= 0) {
+            row.addProperty("file_offset", source.getFileOffset());
+        } else {
+            row.add("file_offset", com.google.gson.JsonNull.INSTANCE);
+        }
         row.addProperty("name", function.getName());
         row.addProperty("size", function.getBody().getNumAddresses());
         row.addProperty("signature", function.getSignature().toString());
@@ -52,8 +60,10 @@ public class KnifeExport extends HeadlessScript {
                 result.addProperty("error", output.getErrorMessage());
                 if (output.decompileCompleted() && output.getDecompiledFunction() != null) {
                     String text = output.getDecompiledFunction().getC();
-                    result.addProperty("pseudocode_truncated", text.length() > 65536);
-                    result.addProperty("pseudocode", text.substring(0, Math.min(text.length(), 65536)));
+                    int end = Math.min(text.length(), 65536);
+                    if (end < text.length() && end > 0 && Character.isHighSurrogate(text.charAt(end - 1))) end--;
+                    result.addProperty("pseudocode_truncated", end < text.length());
+                    result.addProperty("pseudocode", text.substring(0, end));
                 }
             } finally { decompiler.dispose(); }
         } else throw new IllegalArgumentException("unsupported export mode");
