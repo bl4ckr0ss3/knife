@@ -238,6 +238,22 @@ fn parsed_target_does_not_claim_zero_recovered_functions() {
 }
 
 #[test]
+fn capa_locations_preserve_native_file_and_managed_address_distinctions() {
+    let (root, session) = fixture_session();
+    let address = session.an.functions[0].addr;
+    let data = json!({"rules":[{"locations":[{"type":"absolute","value":address},{"type":"absolute","value":address},{"type":"file","value":0},{"type":"dn token","value":address},{"type":"file","value":u64::MAX}]}]});
+    let locations = reknife::providers::capa::evidence_locations(&session, &data);
+    assert_eq!(locations.len(), 2);
+    assert_eq!(locations[0].static_address.unwrap().get(), address);
+    assert!(locations[0].file_offset.is_some());
+    assert_eq!(locations[1].file_offset.unwrap().get(), 0);
+    assert!(locations
+        .iter()
+        .all(|location| location.runtime_address.is_none()));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn session_status_establishes_identity_coverage_and_limitations() {
     let (root, session) = fixture_session();
     let first = tools::dispatch(&session, "session_status", &json!({})).unwrap();

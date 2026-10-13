@@ -1,6 +1,8 @@
 //! Fixed-command adapter for standalone capa capability analysis.
 use super::process::{executable_identity, find_on_path, run_process, JsonCache, TargetSnapshot};
 use super::ProviderStatus;
+use crate::address::{FileOffset, StaticVa};
+use crate::api::evidence::EvidenceLocation;
 use crate::api::{operations::OperationDescriptor, operations::ResultMode, paging::PageWindow};
 use crate::workspace::Session;
 use anyhow::{anyhow, Result};
@@ -150,6 +152,55 @@ fn shape(raw: &Value, args: &Value) -> Result<Value> {
     Ok(
         json!({"provider":"capa","engine_version":raw["meta"]["version"],"analysis":raw["meta"]["analysis"],"sample":raw["meta"]["sample"],"result_sha256":digest,"matched":page.total,"returned":rows.len(),"next_cursor":page.next_cursor,"partial":page.next_cursor.is_some()||capped,"rules":rows}),
     )
+}
+
+/// Correlate only known native address kinds. Managed tokens and unsupported
+/// address kinds remain in provider JSON without fabricated native mappings.
+pub fn evidence_locations(session: &Session, data: &Value) -> Vec<EvidenceLocation> {
+    let mut locations = Vec::new();
+    for rule in data["rules"].as_array().into_iter().flatten() {
+        for location in rule["locations"].as_array().into_iter().flatten() {
+            let Some(value) = location["value"].as_u64() else {
+                continue;
+            };
+            let base = crate::analysis::engine::display_base(&session.bin);
+            let (address, offset) = match location["type"].as_str() {
+                Some("absolute") => (Some(value), None),
+                Some("file") if value < session.bytes.len() as u64 => (None, Some(value)),
+                _ => continue,
+            };
+            let offset = offset.or_else(|| {
+                address
+                    .and_then(|address| {
+                        crate::analysis::engine::va_to_off(&session.bin, base, address)
+                    })
+                    .and_then(|offset| u64::try_from(offset).ok())
+            });
+            let address = address.or_else(|| {
+                offset.and_then(|offset| {
+                    crate::analysis::engine::off_to_va(&session.bin, base, offset)
+                })
+            });
+            let record = EvidenceLocation {
+                static_address: address.map(StaticVa),
+                file_offset: offset.map(FileOffset),
+                runtime_address: None,
+                symbol: address.and_then(|address| {
+                    session
+                        .an
+                        .function_at(address)
+                        .map(|function| function.name.clone())
+                }),
+            };
+            if !locations.contains(&record) {
+                locations.push(record);
+            }
+            if locations.len() == 64 {
+                return locations;
+            }
+        }
+    }
+    locations
 }
 #[cfg(test)]
 mod tests {
