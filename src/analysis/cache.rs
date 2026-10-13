@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 //    being developed, so an engine change is invisible without this. It cost me
 //    an afternoon of measuring a cache instead of the code I had just written.
 // A cache written by an older build is simply recomputed.
-const SCHEMA: u32 = 3;
+// 4: ELF DT_INIT/DT_FINI seed otherwise unreachable lifecycle functions.
+const SCHEMA: u32 = 4;
 const MAGIC: &[u8; 8] = b"KNFANLYS";
 
 #[derive(Deserialize)]

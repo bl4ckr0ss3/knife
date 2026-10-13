@@ -194,12 +194,20 @@ pub fn build(path: &str, bytes: &[u8], elf: Elf) -> Binary {
     // The .eh_frame_hdr search table lists function starts the same way the PE
     // exception directory does, recovering code reached only through indirect
     // calls. Computed here so it can also feed the note below.
-    let func_hints = eh_frame_hdr_starts(&elf, bytes);
+    let mut func_hints = eh_frame_hdr_starts(&elf, bytes);
+    let unwind_count = func_hints.len();
+    let lifecycle = lifecycle_starts(&elf, bytes);
+    func_hints.extend(&lifecycle);
+    func_hints.sort_unstable();
+    func_hints.dedup();
 
     let mut notes = Vec::new();
     notes.push(format!("ELF{}", if elf.is_64 { "64" } else { "32" }));
-    if !func_hints.is_empty() {
-        notes.push(format!("{} eh_frame functions", func_hints.len()));
+    if unwind_count > 0 {
+        notes.push(format!("{unwind_count} eh_frame functions"));
+    }
+    if !lifecycle.is_empty() {
+        notes.push(format!("{} dynamic init/fini entries", lifecycle.len()));
     }
     notes.push(if elf.little_endian {
         "LE".into()
@@ -342,6 +350,51 @@ fn eh_frame_hdr_starts(elf: &Elf, bytes: &[u8]) -> Vec<u64> {
     out
 }
 
+/// Direct lifecycle addresses declared by the loader metadata. Only supported
+/// direct-code ABIs and file-backed executable sections are seeded. Arrays
+/// require relocation-aware pointer decoding and are not guessed here.
+fn lifecycle_starts(elf: &Elf, bytes: &[u8]) -> Vec<u64> {
+    if !matches!(elf.header.e_machine, 3 | 62 | 183) {
+        return Vec::new();
+    }
+    let Some(dynamic) = elf.dynamic.as_ref() else {
+        return Vec::new();
+    };
+    let mut entries = dynamic
+        .dyns
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.d_tag,
+                goblin::elf::dynamic::DT_INIT | goblin::elf::dynamic::DT_FINI
+            )
+        })
+        .map(|entry| entry.d_val)
+        .filter(|address| {
+            *address != 0
+                && elf.section_headers.iter().any(|section| {
+                    if section.sh_type == 8
+                        || section.sh_flags & (SHF_ALLOC | SHF_EXECINSTR)
+                            != (SHF_ALLOC | SHF_EXECINSTR)
+                    {
+                        return false;
+                    }
+                    let Some(delta) = address.checked_sub(section.sh_addr) else {
+                        return false;
+                    };
+                    delta < section.sh_size
+                        && section
+                            .sh_offset
+                            .checked_add(delta)
+                            .is_some_and(|offset| offset < bytes.len() as u64)
+                })
+        })
+        .collect::<Vec<_>>();
+    entries.sort_unstable();
+    entries.dedup();
+    entries
+}
+
 /// Byte width of a fixed-size DW_EH_PE encoding, or `None` for the variable and
 /// unsupported forms (leb128, absptr) that the fast path does not decode.
 fn enc_width(enc: u8) -> Option<usize> {
@@ -364,6 +417,34 @@ fn read_uint(b: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn lifecycle_metadata_seeds_unreachable_functions() {
+        let bytes = crate::formats::fixture::elf_with_init_fini();
+        let bin = crate::formats::analyze("lifecycle.elf", &bytes).unwrap();
+        assert_eq!(bin.func_hints, vec![0x1d8, 0x1dc]);
+        let analysis =
+            crate::analysis::engine::analyze(&bin, &bytes, 10000, &crate::db::Db::default());
+        assert!(analysis.function_at(0x1d8).is_some());
+        assert!(analysis.function_at(0x1dc).is_some());
+        assert!(bin
+            .notes
+            .iter()
+            .any(|note| note == "2 dynamic init/fini entries"));
+    }
+    #[test]
+    fn lifecycle_metadata_rejects_null_data_out_of_image_and_duplicates() {
+        for (init, fini, expected) in [
+            (0u64, 0x1e0u64, vec![]),
+            (u64::MAX, 0x600, vec![]),
+            (0x1d8, 0x1d8, vec![0x1d8]),
+        ] {
+            let mut bytes = crate::formats::fixture::elf_with_init_fini();
+            bytes[0x478..0x480].copy_from_slice(&init.to_le_bytes());
+            bytes[0x488..0x490].copy_from_slice(&fini.to_le_bytes());
+            let bin = crate::formats::analyze("lifecycle.elf", &bytes).unwrap();
+            assert_eq!(bin.func_hints, expected);
+        }
+    }
     #[test]
     fn eh_frame_hdr_recovers_function_starts() {
         // The synthetic ELF lists two function starts in its .eh_frame_hdr

@@ -72,3 +72,25 @@ This is a recovery-coverage difference, not a proved native-engine bug or
 evidence that the function is absent. Its decompilation still completed.
 
 Seven provider regressions and the updated agent comparison regression passed.
+
+## Lifecycle recovery follow-up
+
+`readelf -d /usr/bin/true` independently showed `DT_INIT = 0x2000` and
+`DT_FINI = 0x53b4`. Knife previously derived ELF metadata seeds only from the
+unwind search table. The parser now adds these direct lifecycle addresses for
+x86, x86-64 and AArch64 when they lie in file-backed allocated executable
+sections, rejecting null/out-of-image/data addresses and deduplicating seeds.
+Derived-analysis cache schema advanced to 4 so older recovery is recomputed.
+
+Four ELF tests passed, including actual recovery of unreachable lifecycle
+functions in a synthetic ELF and invalid-address rejection. Three cache
+regressions passed. The shared CLI resolved `0x2000` as `sub_2000`, size 27,
+with static/file evidence at 8192. The post-fix actual MCP rerun passed:
+inventory 18.201 seconds, cached page 0.007 seconds. Knife and Ghidra now both
+reported mapped entry 8192 and size 27, yielding agreement on both fields.
+This fixes the observed missing recovery seed; agreement still does not prove
+runtime semantics. Array-based constructors/destructors remain a
+separate relocation-aware work item; they are not claimed implemented here.
+
+Primary semantic reference:
+[ELF ABI dynamic linking](https://gabi.xinuos.com/v42/elf/08-dynamic.html).

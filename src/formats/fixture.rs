@@ -34,6 +34,22 @@ const SHSTR: &[u8] = b"\0.plt\0.text\0.got.plt\0.shstrtab\0";
 /// The interesting part is the chain: `.text` calls `.plt`, the stub jumps
 /// through a GOT slot, and a `R_X86_64_JUMP_SLOT` relocation binds that slot to
 /// the dynamic symbol `strcpy`. Resolving the call name requires every link.
+pub fn elf_with_init_fini() -> Vec<u8> {
+    let mut bytes = elf_with_plt_call();
+    let original_dynamic = bytes[P_DYNAMIC as usize..P_DYNAMIC as usize + 112].to_vec();
+    bytes.resize(0x600, 0);
+    bytes[0x400..0x470].copy_from_slice(&original_dynamic);
+    phdr(&mut bytes, EHDR, 1, 7, 0, 0, 0x600, 0x1000);
+    phdr(&mut bytes, EHDR + PHDR, 2, 6, 0x400, 0x400, 160, 8);
+    put64(&mut bytes, 0x470, 12); // DT_INIT
+    put64(&mut bytes, 0x478, P_TEXT + 8);
+    put64(&mut bytes, 0x480, 13); // DT_FINI
+    put64(&mut bytes, 0x488, P_TEXT + 12);
+    bytes[P_TEXT as usize + 8] = 0xc3;
+    bytes[P_TEXT as usize + 12] = 0xc3;
+    bytes
+}
+
 pub fn elf_with_plt_call() -> Vec<u8> {
     let mut f = vec![0u8; FILE_END as usize];
 
