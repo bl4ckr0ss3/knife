@@ -613,9 +613,10 @@ fn info(sess: &Session) -> Value {
         "bits": sess.bin.bits,
         "entry": format!("0x{:x}", sess.bin.entry),
         "sections": sess.bin.sections.len(),
-        "functions": an.functions.len(),
-        "named_functions": named,
-        "imports": an.imports.len(),
+        "functions": if sess.code_analyzed { Some(an.functions.len()) } else { None },
+        "named_functions": if sess.code_analyzed { Some(named) } else { None },
+        "code_analyzed": sess.code_analyzed,
+        "imports": sess.bin.all_imported_functions().count(),
     })
 }
 

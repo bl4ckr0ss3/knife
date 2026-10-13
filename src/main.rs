@@ -299,6 +299,14 @@ enum Command {
     Db { file: String },
     /// Interactive view (functions, listing, xrefs).
     Tui { file: Option<String> },
+    /// Run a registered analysis operation and emit its structured result.
+    Query {
+        file: String,
+        tool: String,
+        /// Operation arguments as a JSON object.
+        #[arg(long, default_value = "{}")]
+        args: String,
+    },
     /// Model Context Protocol server over stdio.
     Mcp {
         /// Bind a binary up front, so tool calls need not name a path.
@@ -617,6 +625,33 @@ fn real_main() -> Result<()> {
             None => cmd_explorer(cli.db.as_deref(), None),
         },
         Command::Mcp { file } => mcp::run(file),
+        Command::Query { file, tool, args } => {
+            if !reknife::tools::read_catalog()
+                .iter()
+                .any(|operation| operation.name == tool)
+            {
+                anyhow::bail!("query requires a registered analysis-read operation");
+            }
+            let args: serde_json::Value =
+                serde_json::from_str(&args).context("--args must be JSON")?;
+            if !args.is_object() {
+                anyhow::bail!("--args must be a JSON object");
+            }
+            let data = reknife::workspace::Session::open_data(&file, cli.db.as_deref())?;
+            let session = if reknife::analysis::disasm::supported(data.bin.arch) {
+                reknife::workspace::Session::open(
+                    &file,
+                    cli.db.as_deref(),
+                    reknife::ANALYSIS_BUDGET,
+                    "query",
+                )?
+            } else {
+                data
+            };
+            let result = reknife::tools::dispatch(&session, &tool, &args)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
         Command::Funcs { file, by_refs } => cmd_funcs(&file, by_refs, cli.json, cli.db.as_deref()),
         Command::Hex { file, off, len } => cmd_hex(&file, off, len),
         Command::Map { file, buckets } => cmd_map(&file, buckets, cli.json),

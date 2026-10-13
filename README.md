@@ -247,6 +247,19 @@ claude mcp add knife -- knife mcp
 
 Full tool table and per-client setup: **[docs/MCP.md](docs/MCP.md)**.
 
+Use your existing agent through MCP; Knife itself needs no model account.
+The [external-agent workflow](docs/agent-workflow.md) describes investigations
+with evidence and explicit unknowns. Reproduce analysis operations from a
+terminal with structured JSON:
+
+```bash
+knife query sample.exe trace_string_usage --args '{"query":"password","limit":5}'
+knife query sample.exe explain_function --args '{"selector":"main"}'
+```
+
+The optional [investigation desk](docs/investigation-desk.md) shows saved
+conversation, hypotheses and evidence alongside the listing.
+
 ## Kernel drivers & BYOVD
 
 `knife drv FILE` is the driver half of the audit. A `.sys` parses,

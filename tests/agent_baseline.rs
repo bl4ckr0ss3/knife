@@ -214,6 +214,21 @@ fn engine_comparison_preserves_disagreement_and_unknown_states() {
 }
 
 #[test]
+fn parsed_target_does_not_claim_zero_recovered_functions() {
+    let (root, session) = fixture_session();
+    let data = Session::open_data(
+        &session.bin.path,
+        session.db.path().and_then(|path| path.to_str()),
+    )
+    .unwrap();
+    let info = tools::dispatch(&data, "info", &json!({})).unwrap();
+    assert_eq!(info["code_analyzed"], false);
+    assert!(info["functions"].is_null());
+    assert!(info["imports"].as_u64().unwrap() > 0);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn session_status_establishes_identity_coverage_and_limitations() {
     let (root, session) = fixture_session();
     let first = tools::dispatch(&session, "session_status", &json!({})).unwrap();
