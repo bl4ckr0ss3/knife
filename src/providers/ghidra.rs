@@ -1,8 +1,176 @@
 //! Validated boundary for Knife's fixed Ghidra exporter.
-//! No provider operations are advertised until the process adapter is ready.
+//! Fixed process requests, bounded cached reports and typed file correlation.
+use super::process::{executable_identity, JsonCache};
+use crate::api::operations::{OperationDescriptor, ResultMode};
+use crate::workspace::Session;
 use anyhow::{bail, Context, Result};
+use serde_json::json;
 use serde_json::Value;
+use std::sync::{Mutex, OnceLock};
 use std::{ffi::OsString, path::PathBuf, time::Duration};
+static CACHE: OnceLock<Mutex<JsonCache>> = OnceLock::new();
+
+pub fn executable() -> Option<PathBuf> {
+    std::env::var_os("KNIFE_GHIDRA_HEADLESS")
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+}
+
+pub fn status() -> super::ProviderStatus {
+    let path = executable();
+    super::ProviderStatus {
+        id: "ghidra", name: "Ghidra", installed: path.is_some(),
+        executable: path.map(|p| p.display().to_string()), version: None,
+        mode: "out_of_process_static", target_execution: false,
+        license: "Apache-2.0; separately installed executable",
+        operations: vec!["ghidra_functions", "ghidra_decompile"],
+        limitation: Some("Requires JDK and KNIFE_GHIDRA_WORK_ROOT; inventory capped at 20,000 functions; engine version not probed".into()),
+    }
+}
+
+pub fn catalog() -> Vec<OperationDescriptor> {
+    vec![
+        OperationDescriptor::read("ghidra_functions", "Independent Ghidra static function inventory; preserves provider addresses and maps file-backed entry points to Knife locations.", json!({"limit":{"type":"integer","minimum":1,"maximum":400},"cursor":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":10,"maximum":300}}), &[]).with_result_mode(ResultMode::Paginated).with_evidence(),
+        OperationDescriptor::read("ghidra_decompile", "Ghidra pseudocode at a Ghidra provider static address, not a Knife or runtime address. Results are inferred, not execution evidence.", json!({"provider_static_address":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":10,"maximum":300}}), &["provider_static_address"]).with_evidence(),
+    ]
+}
+
+pub fn dispatch(session: &Session, name: &str, args: &Value) -> Result<Value> {
+    if !matches!(
+        session.bin.format,
+        crate::model::Format::Pe | crate::model::Format::Elf
+    ) {
+        bail!("Ghidra initial adapter supports PE and ELF only");
+    }
+    let timeout = args
+        .get("timeout_seconds")
+        .map(|v| {
+            v.as_u64()
+                .filter(|n| (10..=300).contains(n))
+                .context("timeout_seconds must be an integer between 10 and 300")
+        })
+        .transpose()?
+        .unwrap_or(90);
+    if let Some(limit) = args.get("limit") {
+        if !limit.as_u64().is_some_and(|n| (1..=400).contains(&n)) {
+            bail!("limit must be an integer between 1 and 400");
+        }
+    }
+    let request = match name {
+        "ghidra_functions" => ExportRequest::Functions { limit: 20000 },
+        "ghidra_decompile" => {
+            let raw = args["provider_static_address"]
+                .as_str()
+                .context("missing provider_static_address")?;
+            let address = u64::from_str_radix(
+                raw.strip_prefix("0x")
+                    .context("provider_static_address requires 0x hexadecimal")?,
+                16,
+            )?;
+            ExportRequest::Decompile {
+                provider_static_address: address,
+            }
+        }
+        _ => bail!("unknown Ghidra operation"),
+    };
+    let executable = executable().context("Ghidra unavailable; configure KNIFE_GHIDRA_HEADLESS")?;
+    let workspace = crate::analysis::hashes::sha256_hex(&session.bytes);
+    let key = format!(
+        "{workspace}:{timeout}:{}:{}:{}:{}",
+        executable_identity(&executable),
+        crate::analysis::hashes::sha256_hex(include_bytes!("ghidra/KnifeExport.java")),
+        name,
+        args["provider_static_address"]
+    );
+    let cache = CACHE.get_or_init(|| Mutex::new(JsonCache::new(8, 32 * 1024 * 1024)));
+    let cached = cache
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Ghidra cache poisoned"))?
+        .get(&key);
+    let raw = match cached {
+        Some(report) => report,
+        None => {
+            if args.get("cursor").is_some() {
+                bail!("Ghidra continuation report expired; restart pagination");
+            }
+            let report = export(&session.bytes, request, timeout)?;
+            cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Ghidra cache poisoned"))?
+                .insert(key, report.clone());
+            report
+        }
+    };
+    shape(session, name, args, &raw)
+}
+
+fn shape(session: &Session, name: &str, args: &Value, raw: &Value) -> Result<Value> {
+    let digest = crate::analysis::hashes::sha256_hex(&serde_json::to_vec(raw)?);
+    let mut data = raw.clone();
+    data["result_sha256"] = digest.clone().into();
+    let mut partial = raw["analysis_timed_out"].as_bool().unwrap_or(true);
+    if name == "ghidra_functions" {
+        let rows = raw["functions"]
+            .as_array()
+            .context("Ghidra inventory missing")?;
+        let page = crate::api::paging::PageWindow::from_args(
+            args,
+            rows.len(),
+            100,
+            400,
+            &format!("ghidra-functions:{digest}"),
+        )?;
+        let mut selected = rows
+            .iter()
+            .skip(page.offset)
+            .take(page.limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        for row in &mut selected {
+            row["knife_static_address"] = static_address(session, row)
+                .map(|a| json!(format!("0x{a:x}")))
+                .unwrap_or(Value::Null);
+        }
+        data["functions"] = selected.into();
+        data["available_rows"] = rows.len().into();
+        data["next_cursor"] = serde_json::to_value(&page.next_cursor)?;
+        data["page"] = serde_json::to_value(page)?;
+        partial |= raw["truncated"].as_bool().unwrap_or(true);
+    } else {
+        let row = data
+            .get_mut("function")
+            .context("Ghidra function missing")?;
+        row["knife_static_address"] = static_address(session, row)
+            .map(|a| json!(format!("0x{a:x}")))
+            .unwrap_or(Value::Null);
+        partial |= raw["decompile_completed"].as_bool() != Some(true)
+            || raw["pseudocode_truncated"].as_bool().unwrap_or(false);
+    }
+    data["partial"] = partial.into();
+    Ok(data)
+}
+
+pub fn evidence_locations(
+    session: &Session,
+    data: &Value,
+) -> Vec<crate::api::evidence::EvidenceLocation> {
+    let rows: Vec<&Value> = data["functions"]
+        .as_array()
+        .map(|r| r.iter().collect())
+        .unwrap_or_else(|| data.get("function").into_iter().collect());
+    rows.into_iter()
+        .take(400)
+        .map(|row| crate::api::evidence::EvidenceLocation {
+            static_address: static_address(session, row).map(crate::address::StaticVa),
+            runtime_address: None,
+            file_offset: row["file_offset"]
+                .as_u64()
+                .filter(|n| *n < session.bytes.len() as u64)
+                .map(crate::address::FileOffset),
+            symbol: row["name"].as_str().map(str::to_owned),
+        })
+        .collect()
+}
 
 /// Fixed exporter modes; callers cannot supply arbitrary scripts or switches.
 pub enum ExportRequest {
@@ -29,10 +197,10 @@ pub fn export(bytes: &[u8], request: ExportRequest, timeout_seconds: u64) -> Res
         bail!("Ghidra timeout must be 10–300 seconds");
     }
     let mode: Vec<OsString> = match request {
-        ExportRequest::Functions { limit } if (1..=400).contains(&limit) => {
+        ExportRequest::Functions { limit } if (1..=20000).contains(&limit) => {
             vec!["functions".into(), limit.to_string().into()]
         }
-        ExportRequest::Functions { .. } => bail!("Ghidra function limit must be 1–400"),
+        ExportRequest::Functions { .. } => bail!("Ghidra export limit must be 1–20000"),
         ExportRequest::Decompile {
             provider_static_address,
         } => vec![
@@ -201,6 +369,42 @@ fn correlate(bin: &crate::model::Binary, byte_len: usize, row: &Value) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fixture_session() -> Session {
+        let bytes = crate::formats::fixture::elf_with_plt_call();
+        let bin = crate::formats::analyze("fixture.elf", &bytes).unwrap();
+        let an = crate::analysis::engine::Analysis::empty(bin.arch);
+        Session {
+            bin,
+            bytes,
+            an,
+            db: crate::db::Db::default(),
+            code_analyzed: false,
+        }
+    }
+    #[test]
+    fn inventory_pages_are_report_scoped_and_timeouts_remain_partial() {
+        let session = fixture_session();
+        let raw = json!({"analysis_timed_out":true,"truncated":false,"total":3,"functions":[{"name":"a","file_offset":null},{"name":"b","file_offset":null},{"name":"c","file_offset":null}]});
+        let first = shape(&session, "ghidra_functions", &json!({"limit":1}), &raw).unwrap();
+        assert_eq!(first["functions"][0]["name"], "a");
+        assert_eq!(first["partial"], true);
+        assert_eq!(first["functions"][0]["knife_static_address"], Value::Null);
+        let next = json!({"limit":1,"cursor":first["next_cursor"]});
+        let second = shape(&session, "ghidra_functions", &next, &raw).unwrap();
+        assert_eq!(second["functions"][0]["name"], "b");
+        let mut changed = raw.clone();
+        changed["total"] = 4.into();
+        assert!(shape(&session, "ghidra_functions", &next, &changed).is_err());
+    }
+    #[test]
+    fn failed_decompilation_never_becomes_complete() {
+        let session = fixture_session();
+        let raw = json!({"analysis_timed_out":false,"function":{"name":"unknown","file_offset":null},"decompile_completed":false,"error":"failed"});
+        let data = shape(&session, "ghidra_decompile", &json!({}), &raw).unwrap();
+        assert_eq!(data["partial"], true);
+        assert_eq!(data["error"], "failed");
+        assert_eq!(evidence_locations(&session, &data)[0].static_address, None);
+    }
     #[test]
     #[ignore = "requires a configured Ghidra installation, JDK, project root and test target"]
     fn live_isolated_function_export() {
@@ -219,7 +423,7 @@ mod tests {
     #[test]
     fn rejects_invalid_export_requests_before_launch() {
         assert!(export(&[], ExportRequest::Functions { limit: 0 }, 30).is_err());
-        assert!(export(&[], ExportRequest::Functions { limit: 401 }, 30).is_err());
+        assert!(export(&[], ExportRequest::Functions { limit: 20001 }, 30).is_err());
         assert!(export(&[], ExportRequest::Functions { limit: 2 }, 301).is_err());
     }
     #[test]

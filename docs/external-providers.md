@@ -63,6 +63,18 @@ Source and license: <https://github.com/VirusTotal/yara-x/tree/v1.12.0>
 
 ## Researched provider queue
 
+Ghidra exposes `ghidra_functions` and `ghidra_decompile` for PE/ELF through shared
+CLI/MCP/TUI contracts. Configure `KNIFE_GHIDRA_HEADLESS`, a matching JDK, and
+`KNIFE_GHIDRA_WORK_ROOT` (an existing disk-backed non-hidden path). Inventory
+pages contain at most 400 rows; the cached inventory is capped at 20,000 entries
+and reports incomplete coverage explicitly. Decompilation requires the
+`provider_static_address` returned by Ghidra, not Knife's correlated address.
+Reports preserve file offsets, analysis timeouts, failures, workspace hashes
+and inferred pseudocode. Engine-version probing remains unfinished. Cached
+continuations require the same analysis timeout; expired reports must restart.
+The process adapter has been live-tested, but the newly registered MCP workflow
+still needs real-server dogfooding.
+
 The initial standalone capa adapter exposes `capa_capabilities` for PE/ELF.
 Set `KNIFE_CAPA` to its executable or install it on PATH. It uses fixed JSON
 arguments, verifies the report's sample SHA-256 against workspace bytes, and

@@ -38,7 +38,7 @@ public class KnifeExport extends HeadlessScript {
         result.addProperty("analysis_timed_out", analysisTimeoutOccurred());
         if (arguments[0].equals("functions")) {
             int limit = arguments.length > 1 ? Integer.parseInt(arguments[1]) : 200;
-            if (limit < 1 || limit > 400) throw new IllegalArgumentException("limit must be 1–400");
+            if (limit < 1 || limit > 20000) throw new IllegalArgumentException("limit must be 1–20000");
             JsonArray rows = new JsonArray();
             FunctionIterator iterator = currentProgram.getFunctionManager().getFunctions(true);
             while (iterator.hasNext() && rows.size() < limit) {

@@ -118,6 +118,7 @@ pub fn read_catalog() -> Vec<OperationDescriptor> {
     operations.extend(crate::providers::rizin::catalog());
     operations.push(crate::providers::capa::descriptor());
     operations.push(crate::providers::capa::matches_descriptor());
+    operations.extend(crate::providers::ghidra::catalog());
     operations.extend(crate::providers::yarax::catalog());
     operations
 }
@@ -271,6 +272,12 @@ pub fn dispatch(sess: &Session, name: &str, args: &Value) -> Result<Value> {
     }
     match name {
         "session_status" => session_status(sess),
+        "ghidra_functions" | "ghidra_decompile" => {
+            let data = crate::providers::ghidra::dispatch(sess, name, args)?;
+            let partial = data["partial"].as_bool().unwrap_or(true);
+            let cursor = data["next_cursor"].as_str().map(str::to_owned);
+            evidence_result(sess, name, format!("Ghidra static report {}", data["result_sha256"].as_str().unwrap_or("unknown")), crate::providers::ghidra::evidence_locations(sess, &data), vec![EvidenceStatement { kind: StatementKind::Inference, text: "Ghidra recovered functions or pseudocode from static bytes; this does not demonstrate runtime behavior.".into(), confidence: Confidence::Medium }], vec!["Provider addresses are Ghidra static addresses; only file-backed correlations become Knife navigation locations. No target code was executed.".into(), "Inventory export is capped at 20,000 entries and pseudocode at 65,536 UTF-16 units. Analysis timeouts and decompilation failures are explicit. Cache eviction requires restarting pagination. Engine version is not yet probed.".into()], data, partial, cursor)
+        }
         "capa_capabilities" | "capa_rule_matches" => {
             if name == "capa_rule_matches" && args.get("rule").and_then(Value::as_str).is_none() {
                 return Err(anyhow!("missing rule"));
@@ -300,11 +307,11 @@ pub fn dispatch(sess: &Session, name: &str, args: &Value) -> Result<Value> {
             }
             let operations: Vec<_> = read_catalog().into_iter().filter(|operation| match task {
                 "triage" => ["session_status","info","triage","hardening","hashes","entropy","signing","capabilities","signatures","imports","exports"].contains(&operation.name),
-                "code" => needs_code(operation.name) && operation.name != "trace_string_usage",
+                "code" => (needs_code(operation.name) && operation.name != "trace_string_usage") || operation.name.starts_with("ghidra_"),
                 "strings" => ["strings","trace_string_usage","iocs","read_bytes","inspect_address_context"].contains(&operation.name),
                 "validation" => ["inspect_input_validation","explain_function","trace_taint","audit","paths_to","read_function_instructions"].contains(&operation.name),
                 "memory" => operation.name.starts_with("investigation_"),
-                "external" => operation.name.starts_with("rizin_") || operation.name.starts_with("yarax_") || operation.name.starts_with("capa_"),
+                "external" => operation.name.starts_with("rizin_") || operation.name.starts_with("yarax_") || operation.name.starts_with("capa_") || operation.name.starts_with("ghidra_"),
                 _ => true,
             }).map(|operation| json!({"operation":operation,"availability":operation_availability(sess,&operation)})).collect();
             Ok(json!({"task":task,"count":operations.len(),"tools":operations}))
@@ -545,6 +552,24 @@ fn operation_availability(
     operation: &OperationDescriptor,
 ) -> OperationAvailability {
     let reason = match operation.name {
+        "ghidra_functions" | "ghidra_decompile"
+            if crate::providers::ghidra::executable().is_none() =>
+        {
+            Some("Ghidra is not configured; set KNIFE_GHIDRA_HEADLESS".into())
+        }
+        "ghidra_functions" | "ghidra_decompile"
+            if std::env::var_os("KNIFE_GHIDRA_WORK_ROOT").is_none() =>
+        {
+            Some("Ghidra requires KNIFE_GHIDRA_WORK_ROOT".into())
+        }
+        "ghidra_functions" | "ghidra_decompile"
+            if !matches!(
+                sess.bin.format,
+                crate::model::Format::Pe | crate::model::Format::Elf
+            ) =>
+        {
+            Some("Ghidra initial adapter supports PE and ELF".into())
+        }
         "capa_capabilities" | "capa_rule_matches"
             if crate::providers::capa::executable().is_none() =>
         {

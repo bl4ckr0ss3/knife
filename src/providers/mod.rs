@@ -25,5 +25,10 @@ pub struct ProviderStatus {
 }
 
 pub fn statuses() -> Vec<ProviderStatus> {
-    vec![rizin::status(), yarax::status(), capa::status()]
+    vec![
+        rizin::status(),
+        yarax::status(),
+        capa::status(),
+        ghidra::status(),
+    ]
 }

@@ -88,8 +88,22 @@ The ignored `live_isolated_function_export` test additionally requires
 `KNIFE_GHIDRA_TEST_TARGET`. It passed against `/usr/bin/true` through the actual
 Rust process adapter in 23.53 seconds, including imported sample identity and
 file-backed function checks. Four boundary/request regressions also passed.
-MCP registration, report caching, pagination and evidence envelopes are still
-outstanding; this is not yet an end-to-end agent investigation.
+At that checkpoint MCP registration, report caching, pagination and evidence
+envelopes were outstanding. The next section records their implementation;
+end-to-end agent investigation remains unverified.
+
+## Shared operation integration
+
+`ghidra_functions` and `ghidra_decompile` are now registered in the shared
+catalog, provider status and external/code discovery. Inventory reports are
+cached in an eight-item / 32-MiB cache keyed by workspace, launcher identity,
+exporter contents, operation, requested address and analysis deadline. Report
+digests scope cursors. Public pages are 1–400 rows; the underlying inventory cap
+is 20,000 functions and remains explicitly partial if exceeded. Decompilation
+requires a Ghidra provider static address. Evidence carries file offsets and
+only checked file-backed Knife addresses; failures and timeouts remain partial.
+Six provider regressions and five MCP contract tests passed. A live investigation
+through the actual MCP server is the next verification gate, not yet passed.
 
 Primary references:
 
