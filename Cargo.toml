@@ -62,6 +62,11 @@ bincode = { version = "2", features = ["serde"] }
 regex = "1"
 owo-colors = "4"
 anyhow = "1"
+semver = "1"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "6", default-features = false, features = ["deflate"] }
+self-replace = "1.5"
 ratatui = "0.30"
 cpp_demangle = "0.5.1"
 msvc-demangler = "0.11.0"

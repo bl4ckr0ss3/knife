@@ -67,6 +67,19 @@ If your shell cannot find `knife` after installing, `~/.cargo/bin` is not on
 your `PATH` yet: restart the shell (or `source ~/.cargo/env` on Unix), then
 `knife --version`.
 
+To update an installed release:
+
+```bash
+knife update --check   # check the latest stable GitHub release
+knife update           # verify, back up, and replace this executable
+```
+
+The updater requires `curl` and a writable installation directory. It verifies
+GitHub's SHA-256 asset digest, rejects downgrades, and prints the previous
+executable's backup path. Restart running Knife sessions after updating.
+`knife update --check --json` provides a machine-readable version check.
+Unsupported prebuilt platforms can use `cargo install reknife --locked --force`.
+
 ## The TUI
 
 `knife tui FILE` opens a monochrome debugger-style workspace: function list,

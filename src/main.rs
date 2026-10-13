@@ -45,6 +45,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Update this executable from the latest stable GitHub release.
+    Update {
+        /// Check for a newer release without downloading or replacing Knife.
+        #[arg(long)]
+        check: bool,
+    },
     /// Full triage report (default).
     Info { file: String },
     /// Sections and segments, with entropy.
@@ -398,6 +404,15 @@ fn real_main() -> Result<()> {
         return cmd_explorer(cli.db.as_deref(), None);
     };
     match cmd {
+        Command::Update { check } => {
+            let result = reknife::update::run(check)?;
+            confirm(cli.json, serde_json::to_value(&result)?, || {
+                println!("{}", result.message);
+                if let Some(backup) = &result.backup {
+                    println!("Previous executable: {backup}");
+                }
+            })
+        }
         // A directory handed to `info` (also the bare `knife <dir>` shorthand)
         // is an explorer session, not a triage target.
         Command::Info { file } if std::path::Path::new(&file).is_dir() => {

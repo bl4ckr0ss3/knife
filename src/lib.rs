@@ -18,6 +18,7 @@ pub mod providers;
 mod robustness;
 pub mod tools;
 pub mod tui;
+pub mod update;
 pub mod windows;
 pub mod workspace;
 
