@@ -178,13 +178,51 @@ fn investigation_desk(f: &mut Frame, app: &App) {
         .rev()
         .nth(app.investigation_message_offset);
     let conversation = message.map(|message|format!("{:?}\n{}",message.role,message.text)).unwrap_or_else(||"Use :ask <question> to begin.\nPgUp/PgDn: browse conversation\nCtrl+Up/Down: scroll message\nUp/Down: select evidence\nEnter: follow selected evidence".into());
+    let conversation = if app.investigation_evidence_detail {
+        app.investigation
+            .evidence
+            .values()
+            .nth(app.investigation_selection)
+            .map(|record| {
+                let mut text = format!(
+                    "{}\nProducer: {}\n{}\n",
+                    record.id.0, record.producer, record.summary
+                );
+                for location in &record.locations {
+                    if let Some(address) = location.static_address {
+                        text.push_str(&format!("Static: 0x{:x}\n", address.get()));
+                    }
+                    if let Some(offset) = location.file_offset {
+                        text.push_str(&format!("File: 0x{:x}\n", offset.get()));
+                    }
+                    if let Some(address) = location.runtime_address {
+                        text.push_str(&format!("Runtime: 0x{:x}\n", address.get()));
+                    }
+                }
+                for statement in &record.statements {
+                    text.push_str(&format!(
+                        "{:?} / {:?}: {}\n",
+                        statement.kind, statement.confidence, statement.text
+                    ));
+                }
+                for limitation in &record.limitations {
+                    text.push_str(&format!("Limitation: {limitation}\n"));
+                }
+                text
+            })
+            .unwrap_or_else(|| "No evidence selected. Press e to return to conversation.".into())
+    } else {
+        conversation
+    };
     f.render_widget(
         Paragraph::new(conversation)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Investigation desk — conversation "),
-            )
+            .block(Block::default().borders(Borders::ALL).title(
+                if app.investigation_evidence_detail {
+                    " Investigation desk — evidence "
+                } else {
+                    " Investigation desk — conversation "
+                },
+            ))
             .style(Style::default().fg(accent()).bg(panel()))
             .wrap(Wrap { trim: false })
             .scroll((app.investigation_message_scroll, 0)),
@@ -250,7 +288,9 @@ fn investigation_desk(f: &mut Frame, app: &App) {
             lines.push(TLine::from(format!(" {} supporting / {} contradicting records (#{}); inspect via MCP investigation_conflicts",hypothesis.supports.len(),hypothesis.contradicts.len(),hypothesis.id)));
         }
     }
-    lines.push(TLine::from(" Evidence — Up/Down selects; Enter follows"));
+    lines.push(TLine::from(
+        " Evidence — Up/Down; e inspects; Enter follows",
+    ));
     let evidence_height = usize::from(desk.height.saturating_sub(2)).saturating_sub(lines.len());
     let evidence_start = viewport_start(
         app.investigation_selection,

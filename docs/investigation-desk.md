@@ -50,6 +50,9 @@ an `.investigation.json` file. Up/Down selects evidence; Enter navigates to its
 first static location. Esc closes the desk; `:` returns to command input.
 The desk separates conversation from findings. PgUp/PgDn browse older/newer
 messages; Ctrl+Up/Down scroll the selected message, including saved tool output.
+Press `e` to inspect selected evidence in the upper panel: producer, typed hex
+locations, observation/inference/unknown statements, confidence and limitations.
+Ctrl+Up/Down scrolls these details; `e` returns to conversation.
 
 `:interrupt` discards the active worker result and stops the model loop before
 its next request or tool call. An in-flight model request or analysis operation

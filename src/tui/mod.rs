@@ -414,6 +414,7 @@ pub struct App {
     pub investigation_selection: usize,
     pub investigation_message_offset: usize,
     pub investigation_message_scroll: u16,
+    pub investigation_evidence_detail: bool,
     pub investigation_worker: Option<std::sync::mpsc::Receiver<Result<serde_json::Value>>>,
     pub investigation_activity: String,
     pub investigation_live_activity: Option<std::sync::Arc<std::sync::Mutex<String>>>,
@@ -565,6 +566,7 @@ impl App {
             investigation_selection: 0,
             investigation_message_offset: 0,
             investigation_message_scroll: 0,
+            investigation_evidence_detail: false,
             investigation_worker: None,
             investigation_activity: String::new(),
             investigation_live_activity: None,
@@ -2454,6 +2456,10 @@ impl App {
         }
         if self.investigation_open && self.prompt.is_none() {
             match key.code {
+                KeyCode::Char('e') => {
+                    self.investigation_evidence_detail = !self.investigation_evidence_detail;
+                    self.investigation_message_scroll = 0;
+                }
                 KeyCode::PageUp => {
                     self.investigation_message_offset = (self.investigation_message_offset + 1)
                         .min(self.investigation.messages.len().saturating_sub(1));
@@ -4858,6 +4864,9 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
         assert_eq!(app.investigation_message_offset, 1);
         assert!(rendered(&mut app, 110, 30).contains("Explain this comparison"));
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(app.investigation_evidence_detail);
+        assert!(rendered(&mut app, 110, 30).contains("Static: 0x1000"));
         app.follow_investigation_evidence();
         assert!(!app.investigation_open);
         assert_eq!(app.focus, Focus::Listing);
