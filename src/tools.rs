@@ -54,6 +54,14 @@ fn mutation(
 pub fn read_catalog() -> Vec<OperationDescriptor> {
     let mut operations = vec![
         tool("session_status", "Evidence-aware target identity, analysis coverage, and operation availability for agent workflows.", json!({}), &[]).with_evidence(),
+        tool("discover_investigation_tools", "Find tools by investigation task (triage, code, strings, validation, memory, external, all), with operation policy and target availability.", json!({"task":{"type":"string","enum":["triage","code","strings","validation","memory","external","all"]}}), &["task"]),
+        tool("investigation_status", "Read saved investigation questions, hypotheses, recent conversation, and evidence counts for the active project.", json!({}), &[]),
+        tool("investigation_conflicts", "Inspect hypotheses with supporting and contradicting evidence links; this reports recorded conflicts rather than automatically proving contradictions.", json!({}), &[]),
+        tool("investigation_get_evidence", "Retrieve one exact persisted evidence record by its ID from the active project investigation.", json!({"evidence_id":{"type":"string"}}), &["evidence_id"]),
+        tool("explain_function", "Collect evidence-backed function context, bounded instructions, callers, callees, and pseudocode for an explanation; recovered semantics remain inference.", selector_props(), &[]).with_any_required(&["selector", "address"]).with_evidence(),
+        tool("trace_string_usage", "Follow matching string literals to recovered reference instructions and containing functions with bounded coverage and evidence.", json!({"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":20},"cursor":{"type":"string"}}), &["query"]).with_result_mode(ResultMode::Paginated).with_evidence(),
+        tool("inspect_input_validation", "Inspect a function's comparison/conditional-branch sites, validation API calls, and dangerous-argument provenance; candidate checks are not proof of a complete validation path.", selector_props(), &[]).with_any_required(&["selector","address"]).with_evidence(),
+        tool("compare_engine_findings", "Compare Knife and optional Rizin function recovery at one address; report agreement, disagreement, and unavailable fields with independent evidence.", selector_props(), &[]).with_any_required(&["selector","address"]).with_evidence(),
         tool("info", "Format, architecture, entry point, sections, and function/import counts.", json!({}), &[]),
         tool("list_functions", "Recovered functions (address, name, incoming call count), optionally filtered by a name substring.",
              json!({"filter": {"type": "string"}, "limit": {"type": "integer", "minimum": 1}, "cursor": {"type": "string"}, "named_only": {"type": "boolean"}}), &[]).with_result_mode(ResultMode::Paginated),
@@ -117,6 +125,9 @@ pub fn read_catalog() -> Vec<OperationDescriptor> {
 pub fn mutation_catalog() -> Vec<OperationDescriptor> {
     let addr = || json!({ "type": "string", "description": "static address (0x...)" });
     vec![
+        mutation("investigation_ask", "Persist an analyst question in the active project's investigation ledger.", json!({"question":{"type":"string","maxLength":32768}}), &["question"]),
+        mutation("investigation_record_evidence", "Persist a content-addressed evidence record for the active target or staged workspace.", json!({"evidence":{"type":"object"}}), &["evidence"]),
+        mutation("investigation_link_evidence", "Link saved evidence as supporting or contradicting a hypothesis; opposing links leave it unresolved.", json!({"hypothesis_id":{"type":"integer","minimum":1},"evidence_id":{"type":"string"},"contradicts":{"type":"boolean"}}), &["hypothesis_id","evidence_id","contradicts"]),
         mutation(
             "set_name",
             "Persist an analyst name for the code at an address.",
@@ -215,6 +226,10 @@ pub fn needs_code(name: &str) -> bool {
     matches!(
         name,
         "disassemble"
+            | "explain_function"
+            | "trace_string_usage"
+            | "inspect_input_validation"
+            | "compare_engine_findings"
             | "inspect_address_context"
             | "resolve_containing_function"
             | "read_function_instructions"
@@ -251,6 +266,77 @@ pub fn dispatch(sess: &Session, name: &str, args: &Value) -> Result<Value> {
     }
     match name {
         "session_status" => session_status(sess),
+        "discover_investigation_tools" => {
+            let task = args
+                .get("task")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("missing task"))?;
+            if ![
+                "triage",
+                "code",
+                "strings",
+                "validation",
+                "memory",
+                "external",
+                "all",
+            ]
+            .contains(&task)
+            {
+                return Err(anyhow!("unknown investigation task"));
+            }
+            let operations: Vec<_> = read_catalog().into_iter().filter(|operation| match task {
+                "triage" => ["session_status","info","triage","hardening","hashes","entropy","signing","capabilities","signatures","imports","exports"].contains(&operation.name),
+                "code" => needs_code(operation.name) && operation.name != "trace_string_usage",
+                "strings" => ["strings","trace_string_usage","iocs","read_bytes","inspect_address_context"].contains(&operation.name),
+                "validation" => ["inspect_input_validation","explain_function","trace_taint","audit","paths_to","read_function_instructions"].contains(&operation.name),
+                "memory" => operation.name.starts_with("investigation_"),
+                "external" => operation.name.starts_with("rizin_") || operation.name.starts_with("yarax_"),
+                _ => true,
+            }).map(|operation| json!({"operation":operation,"availability":operation_availability(sess,&operation)})).collect();
+            Ok(json!({"task":task,"count":operations.len(),"tools":operations}))
+        }
+        "investigation_status" => investigation_status(sess),
+        "investigation_conflicts" => {
+            let ledger = crate::api::investigation::Investigation::load(
+                &investigation_path(sess)?,
+                &sess.db.sha256,
+            )?;
+            let conflicts: Vec<_> = ledger
+                .hypotheses
+                .iter()
+                .filter(|hypothesis| {
+                    !hypothesis.supports.is_empty() && !hypothesis.contradicts.is_empty()
+                })
+                .collect();
+            let rows: Vec<_> = conflicts.iter().take(100).map(|hypothesis| {
+                let linked = |ids: &[crate::api::evidence::EvidenceId]| ids.iter().take(64).filter_map(|id| ledger.evidence.get(&id.0)).map(|record|json!({"id":record.id,"summary":record.summary,"producer":record.producer,"locations":record.locations.iter().take(8).collect::<Vec<_>>()})).collect::<Vec<_>>();
+                json!({"hypothesis":hypothesis,"supporting_evidence":linked(&hypothesis.supports),"contradicting_evidence":linked(&hypothesis.contradicts)})
+            }).collect();
+            Ok(
+                json!({"matched":conflicts.len(),"returned":rows.len(),"conflicts":rows,"partial":conflicts.len()>100,"limitation":"These are explicit recorded evidence links. Conflicting interpretations require review; this does not establish that the underlying observations are logically inconsistent."}),
+            )
+        }
+        "investigation_get_evidence" => {
+            let id = args
+                .get("evidence_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("missing evidence_id"))?;
+            let ledger = crate::api::investigation::Investigation::load(
+                &investigation_path(sess)?,
+                &sess.db.sha256,
+            )?;
+            serde_json::to_value(
+                ledger
+                    .evidence
+                    .get(id)
+                    .ok_or_else(|| anyhow!("unknown saved evidence"))?,
+            )
+            .map_err(Into::into)
+        }
+        "explain_function" => explain_function(sess, args),
+        "trace_string_usage" => trace_string_usage(sess, args),
+        "inspect_input_validation" => inspect_input_validation(sess, args),
+        "compare_engine_findings" => compare_engine_findings(sess, args),
         "info" => Ok(info(sess)),
         "list_functions" => list_functions(sess, args),
         "inspect_address_context" => inspect_address_context(sess, args),
@@ -296,6 +382,9 @@ pub fn dispatch(sess: &Session, name: &str, args: &Value) -> Result<Value> {
 /// every front end. The input binary is never modified.
 pub fn dispatch_mut(sess: &mut Session, name: &str, args: &Value) -> Result<Value> {
     match name {
+        "investigation_ask" | "investigation_record_evidence" | "investigation_link_evidence" => {
+            investigation_write(sess, name, args)
+        }
         "set_name" | "set_note" => {
             let address = crate::address::StaticVa(addr_arg(args, "address")?);
             let key = if name == "set_name" { "name" } else { "note" };
@@ -528,6 +617,226 @@ fn info(sess: &Session) -> Value {
         "named_functions": named,
         "imports": an.imports.len(),
     })
+}
+
+fn investigation_path(sess: &Session) -> Result<std::path::PathBuf> {
+    Ok(sess
+        .db
+        .path()
+        .ok_or_else(|| anyhow!("this session has no persistent project"))?
+        .with_extension("investigation.json"))
+}
+
+fn investigation_status(sess: &Session) -> Result<Value> {
+    let ledger = crate::api::investigation::Investigation::load(
+        &investigation_path(sess)?,
+        &sess.db.sha256,
+    )?;
+    let hypotheses: Vec<_> = ledger.hypotheses.iter().rev().take(100).collect();
+    let messages: Vec<_> = ledger.messages.iter().rev().take(20).collect();
+    Ok(
+        json!({"target_sha256":ledger.target_sha256,"hypotheses":hypotheses,"messages":messages,"evidence_count":ledger.evidence.len(),"hypothesis_count":ledger.hypotheses.len(),"message_count":ledger.messages.len(),"partial":ledger.hypotheses.len()>100 || ledger.messages.len()>20}),
+    )
+}
+
+fn investigation_write(sess: &Session, name: &str, args: &Value) -> Result<Value> {
+    let path = investigation_path(sess)?;
+    let mut ledger = crate::api::investigation::Investigation::load(&path, &sess.db.sha256)?;
+    let result = match name {
+        "investigation_ask" => {
+            let question = args
+                .get("question")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("missing question"))?
+                .to_string();
+            let id = ledger.ask(question.clone())?;
+            ledger.append(crate::api::investigation::Role::Analyst, question, vec![])?;
+            json!({"hypothesis_id":id})
+        }
+        "investigation_record_evidence" => {
+            let record: EvidenceRecord = serde_json::from_value(
+                args.get("evidence")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("missing evidence"))?,
+            )?;
+            let rebuilt = EvidenceRecord::new(
+                &record.target_sha256,
+                &record.producer,
+                record.kind,
+                &record.summary,
+                record.locations.clone(),
+                record.statements.clone(),
+                record.limitations.clone(),
+            );
+            if record.id != rebuilt.id {
+                return Err(anyhow!("evidence content does not match its ID"));
+            }
+            if record.target_sha256 != sess.db.sha256
+                && record.target_sha256 != hashes::sha256_hex(&sess.bytes)
+            {
+                return Err(anyhow!("evidence belongs to another target or workspace"));
+            }
+            let id = record.id.clone();
+            ledger.record(record)?;
+            json!({"evidence_id":id})
+        }
+        "investigation_link_evidence" => {
+            let hypothesis = args
+                .get("hypothesis_id")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow!("missing hypothesis_id"))?;
+            let evidence = args
+                .get("evidence_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("missing evidence_id"))?;
+            let contradicts = args
+                .get("contradicts")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| anyhow!("missing contradicts"))?;
+            ledger.link(
+                hypothesis,
+                crate::api::evidence::EvidenceId(evidence.into()),
+                contradicts,
+            )?;
+            json!({"hypothesis_id":hypothesis,"status":ledger.hypotheses.iter().find(|h| h.id==hypothesis).map(|h| h.status)})
+        }
+        _ => return Err(anyhow!("unknown investigation operation")),
+    };
+    ledger.save(&path)?;
+    Ok(json!({"ok":true,"result":result}))
+}
+
+fn explain_function(sess: &Session, args: &Value) -> Result<Value> {
+    let selector = sel(args)?;
+    let function =
+        resolve(&sess.an, &selector).ok_or_else(|| anyhow!("no function '{selector}'"))?;
+    let function_selector = format!("0x{:x}", function.addr);
+    let instructions =
+        read_function_instructions(sess, &json!({"selector":function_selector,"limit":40}))?;
+    let pseudocode = match decompile(sess, &function_selector) {
+        Ok(value) => {
+            json!({"text":value.chars().take(16_000).collect::<String>(),"preview_truncated":value.chars().count() > 16_000})
+        }
+        Err(error) => json!({"unavailable":error.to_string()}),
+    };
+    let offset = engine::va_to_off(&sess.bin, engine::display_base(&sess.bin), function.addr)
+        .and_then(|value| u64::try_from(value).ok());
+    let partial = instructions
+        .get("partial")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || pseudocode["preview_truncated"].as_bool().unwrap_or(false);
+    let continuation = instructions
+        .get("continuation")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    evidence_result(sess, "explain_function", format!("Explanation inputs for {} at {function_selector}",function.name), vec![evidence_location(function.addr,offset,Some(function.name.clone()))],
+        vec![EvidenceStatement { kind:StatementKind::Inference, text:"Function boundaries, references, and pseudocode are recovered static-analysis facts supporting an explanation; they do not establish execution or complete semantics.".into(), confidence:Confidence::Medium }],
+        vec!["Instruction coverage is capped at 40 rows; continue with read_function_instructions using its nested continuation cursor.".into(),"Pseudocode is experimental and may leave instructions unmodeled. Callers and callees are bounded by the shared catalog limits.".into()],
+        json!({"function":function.name,"address":function_selector,"context":inspect_address_context(sess,&json!({"selector":function_selector}))?,"instructions":instructions,"callers":callers(sess,&function_selector)?,"callees":callees(sess,&function_selector)?,"pseudocode":pseudocode,"explanation_guidance":"Explain the function using cited instructions and references. Label behavior inferred from those observations and explicitly state unresolved indirect flow or incomplete coverage."}), partial, continuation)
+}
+
+fn inspect_input_validation(sess: &Session, args: &Value) -> Result<Value> {
+    let selector = sel(args)?;
+    let function =
+        resolve(&sess.an, &selector).ok_or_else(|| anyhow!("no function '{selector}'"))?;
+    let mut locations = Vec::new();
+    let mut candidates = Vec::new();
+    let mut inspected = 0usize;
+    let mut partial = false;
+    for instruction in function.blocks.iter().flat_map(|block| block.insns.iter()) {
+        if inspected == 20_000 {
+            partial = true;
+            break;
+        }
+        inspected += 1;
+        let text = instruction.text(sess.bin.bits, sess.bin.arch);
+        let mnemonic = text.split_whitespace().next().unwrap_or("");
+        let target = instruction.target_name.as_deref().unwrap_or("");
+        let validation_api = [
+            "strcmp", "strncmp", "memcmp", "wcscmp", "wcsncmp", "strtol", "strtoul", "sscanf",
+        ]
+        .iter()
+        .any(|name| target.to_lowercase().contains(name));
+        let comparison = matches!(mnemonic, "cmp" | "test" | "cmn" | "tst" | "ccmp");
+        let branch = instruction.flow == iced_x86::FlowControl::ConditionalBranch;
+        if !(validation_api || comparison || branch) {
+            continue;
+        }
+        if candidates.len() == 64 {
+            partial = true;
+            continue;
+        }
+        let offset =
+            engine::va_to_off(&sess.bin, engine::display_base(&sess.bin), instruction.addr)
+                .and_then(|v| u64::try_from(v).ok());
+        locations.push(evidence_location(
+            instruction.addr,
+            offset,
+            Some(function.name.clone()),
+        ));
+        candidates.push(json!({"address":format!("0x{:x}",instruction.addr),"instruction":text,"comparison":comparison,"conditional_branch":branch,"validation_api_candidate":validation_api,"target_name":instruction.target_name,"target":instruction.target.map(|address|format!("0x{address:x}"))}));
+    }
+    let provenance = if sess.bin.arch.is_x86() {
+        trace_taint(sess, &format!("0x{:x}", function.addr))?
+    } else {
+        json!({"unavailable":"argument provenance currently supports x86 and x86-64"})
+    };
+    evidence_result(sess,"inspect_input_validation",format!("Input-validation candidates in {}",function.name),locations,
+        vec![EvidenceStatement {kind:StatementKind::Inference,text:"Comparison, branch, and known API sites are candidates for validation. Their relation to caller-controlled input and error/success paths requires further analysis.".into(),confidence:Confidence::Low}],
+        vec!["This workflow does not prove that input is accepted, rejected, fully validated, or safe; comparisons may serve unrelated purposes.".into(),"At most 20,000 instructions and 64 candidate sites are inspected/returned. Indirect calls and unrecovered control flow can hide additional checks.".into()],
+        json!({"function":function.name,"address":format!("0x{:x}",function.addr),"instructions_inspected":inspected,"candidate_sites":candidates,"argument_provenance":provenance,"callers":callers(sess,&format!("0x{:x}",function.addr))?,"next_steps":["Trace the input-producing calls into each comparison operand","Follow both branch successors to acceptance and rejection paths","Check error handling, truncation and length arithmetic"]}),partial,None)
+}
+
+fn compare_engine_findings(sess: &Session, args: &Value) -> Result<Value> {
+    let selector = sel(args)?;
+    let address = crate::api::navigation::resolve_address_in(&sess.an, &selector)?.get();
+    let native = sess.an.function_at(address);
+    let native_data = native
+        .map(|function| json!({"address":function.addr,"size":function.size,"name":function.name}));
+    let external = if crate::providers::rizin::unavailable_reason().is_none() {
+        match rizin_tool(
+            sess,
+            "rizin_function_info",
+            &json!({"address":format!("0x{address:x}")}),
+        ) {
+            Ok(value) => value,
+            Err(error) => json!({"unavailable":error.to_string()}),
+        }
+    } else {
+        json!({"unavailable":crate::providers::rizin::unavailable_reason()})
+    };
+    let raw = &external["data"]["result"];
+    let external_function = raw.as_array().and_then(|rows| rows.first()).unwrap_or(raw);
+    let mut comparisons = Vec::new();
+    for (field, key) in [("address", "offset"), ("size", "size")] {
+        let left = native_data.as_ref().and_then(|value| value[field].as_u64());
+        let right = external_function[key].as_u64();
+        let status = match (left, right) {
+            (Some(a), Some(b)) if a == b => "agreement",
+            (Some(_), Some(_)) => "disagreement",
+            _ => "unknown",
+        };
+        comparisons.push(json!({"field":field,"knife":left,"rizin":right,"status":status}));
+    }
+    let disagreements = comparisons
+        .iter()
+        .filter(|row| row["status"] == "disagreement")
+        .count();
+    let unknowns = comparisons
+        .iter()
+        .filter(|row| row["status"] == "unknown")
+        .count();
+    let mut result = evidence_result(sess,"compare_engine_findings",format!("Function recovery comparison at 0x{address:x}: {disagreements} disagreements, {unknowns} unknown fields"),vec![evidence_location(address,engine::va_to_off(&sess.bin,engine::display_base(&sess.bin),address).and_then(|value|u64::try_from(value).ok()),native.map(|function|function.name.clone()))],
+        vec![EvidenceStatement{kind:StatementKind::Inference,text:"Different recovered function boundaries are engine disagreements requiring inspection; agreement does not establish correctness or runtime behavior.".into(),confidence:Confidence::Medium}],
+        vec!["This compares function entry addresses and reported sizes only. Engines may measure non-contiguous functions differently; a size disagreement is not automatically a bug.".into(),"Unavailable providers or fields remain unknown; neither engine is treated as authoritative.".into()],
+        json!({"address":format!("0x{address:x}"),"knife":native_data,"rizin":external,"comparisons":comparisons,"disagreements":disagreements,"unknown_fields":unknowns}),unknowns>0,None)?;
+    if let Some(evidence) = result["data"]["rizin"]["evidence"].as_array().cloned() {
+        if let Some(records) = result["evidence"].as_array_mut() {
+            records.extend(evidence);
+        }
+    }
+    Ok(result)
 }
 
 fn list_functions(sess: &Session, args: &Value) -> Result<Value> {
@@ -1254,6 +1563,48 @@ fn strings_tool(sess: &Session, args: &Value) -> Result<Value> {
         "next_cursor": page.next_cursor,
         "strings": rows,
     }))
+}
+
+fn trace_string_usage(sess: &Session, args: &Value) -> Result<Value> {
+    let query = args
+        .get("query")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing query"))?
+        .to_lowercase();
+    let map = listing::string_map(&sess.bin, &sess.bytes, engine::display_base(&sess.bin));
+    let matched: Vec<_> = map
+        .iter()
+        .filter(|(_, string)| string.text.to_lowercase().contains(&query))
+        .collect();
+    let page = PageWindow::from_args(
+        args,
+        matched.len(),
+        10,
+        20,
+        &format!("trace_string_usage:{query}"),
+    )?;
+    let mut locations = Vec::new();
+    let mut reference_truncated = false;
+    let rows: Vec<_> = matched.into_iter().skip(page.offset).take(page.limit).map(|(address,string)| {
+        let offset = engine::va_to_off(&sess.bin,engine::display_base(&sess.bin),*address).and_then(|v|u64::try_from(v).ok());
+        locations.push(evidence_location(*address,offset,None));
+        let references = sess.an.xrefs_to.get(address).map(Vec::as_slice).unwrap_or(&[]);
+        reference_truncated |= references.len() > 32;
+        let sites: Vec<_> = references.iter().take(32).map(|reference| {
+            let function = sess.an.function_at(reference.from);
+            if locations.len() < 64 {
+                let offset = engine::va_to_off(&sess.bin,engine::display_base(&sess.bin),reference.from).and_then(|v|u64::try_from(v).ok());
+                locations.push(evidence_location(reference.from,offset,function.map(|f|f.name.clone())));
+            }
+            json!({"address":format!("0x{:x}",reference.from),"kind":reference.kind.label(),"function":function.map(|f|json!({"address":format!("0x{:x}",f.addr),"name":f.name})),"instruction":function.and_then(|f|f.blocks.iter().flat_map(|block|block.insns.iter()).find(|instruction|instruction.addr==reference.from)).map(|instruction|instruction.text(sess.bin.bits,sess.bin.arch))})
+        }).collect();
+        json!({"address":format!("0x{address:x}"),"text":string.text,"reference_count":references.len(),"references":sites,"references_truncated":references.len()>32})
+    }).collect();
+    let continuation = page.next_cursor.clone();
+    evidence_result(sess,"trace_string_usage",format!("String usage for query {query:?}"),locations,
+        vec![EvidenceStatement { kind:StatementKind::Inference,text:"Recovered static cross-references associate these literals with instructions and functions; they do not establish that a path executes or that all uses were recovered.".into(),confidence:Confidence::Medium }],
+        vec!["Indirect references, dynamically constructed strings, and unrecovered code can hide additional uses. Zero references is not proof of non-use.".into(),"Each string returns at most 32 reference sites; string pages contain at most 20 literals.".into()],
+        json!({"query":query,"matched":page.total,"returned":rows.len(),"next_cursor":page.next_cursor,"strings":rows}), continuation.is_some()||reference_truncated,continuation)
 }
 
 fn iocs(sess: &Session) -> Value {

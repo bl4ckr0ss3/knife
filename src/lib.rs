@@ -4,6 +4,7 @@
 //! modules instead of maintaining separate analysis paths.
 
 pub mod address;
+pub mod agent;
 pub mod analysis;
 pub mod api;
 pub mod db;

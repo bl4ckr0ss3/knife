@@ -2,7 +2,7 @@
 //! boundary. Providers are never required to open a target, and their absence
 //! is reported explicitly instead of silently changing Knife's conclusions.
 
-mod process;
+pub(crate) mod process;
 pub mod rizin;
 pub mod yarax;
 

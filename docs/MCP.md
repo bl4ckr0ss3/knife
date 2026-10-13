@@ -74,7 +74,7 @@ engine once.
 
 ## Tools
 
-`open` first, then the read tools, then the four that write.
+`open` first, then the read tools, then explicit project-write operations.
 
 | tool | what it answers |
 |---|---|
@@ -84,6 +84,17 @@ engine once.
 | `list_retained_results` | bounded results currently retained by this server process |
 | `get_retained_result` | exact structured payload for a returned result reference |
 | `session_status` | content identity, analysis coverage, per-target tool availability, limitations, and versioned evidence |
+| `discover_investigation_tools` | tools grouped by investigation task, with operation policy and current availability |
+| `explain_function` | evidence-linked function context, bounded instructions, callers, callees, and experimental pseudocode for an explanation |
+| `trace_string_usage` | matching literals with recovered reference sites, containing functions, instruction text, and coverage limits |
+| `inspect_input_validation` | candidate comparisons, branches, validation API calls, and dangerous-argument provenance; completeness is not established |
+| `compare_engine_findings` | Knife/Rizin function boundaries and sizes, with agreement, disagreement and unknown fields |
+| `investigation_status` | saved questions, hypotheses, recent conversation and evidence counts |
+| `investigation_conflicts` | hypotheses with opposing evidence links, including supporting/contradicting record summaries and locations |
+| `investigation_get_evidence` | exact saved evidence by ID |
+| `investigation_ask` | persist a question in the project investigation |
+| `investigation_record_evidence` | save validated evidence belonging to the current target/workspace |
+| `investigation_link_evidence` | persist supporting or contradicting links to a saved hypothesis |
 | `info` | format, architecture, entry point, sections, function and import counts |
 | `triage` | malware-triage verdict and the signals behind it |
 | `hashes` | md5/sha1/sha256 and imphash |

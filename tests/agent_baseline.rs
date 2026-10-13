@@ -45,6 +45,175 @@ fn wasm_container_functions_remain_paginated_without_native_analysis() {
 }
 
 #[test]
+fn function_explanation_links_its_inputs_to_evidence() {
+    let (root, session) = fixture_session();
+    let address = session.an.functions[0].addr;
+    let result = tools::dispatch(
+        &session,
+        "explain_function",
+        &json!({"selector":format!("0x{address:x}")}),
+    )
+    .unwrap();
+    assert_eq!(result["evidence"][0]["producer"], "explain_function");
+    assert_eq!(
+        result["evidence"][0]["locations"][0]["static_address"],
+        address
+    );
+    assert!(result["data"]["instructions"]["data"].is_object());
+    assert!(result["data"]["pseudocode"].is_object());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn agent_ledger_persists_questions_and_validates_evidence_links() {
+    let (root, mut session) = fixture_session();
+    let asked = tools::dispatch_mut(
+        &mut session,
+        "investigation_ask",
+        &json!({"question":"Is this an input validator?"}),
+    )
+    .unwrap();
+    let id = asked["result"]["hypothesis_id"].as_u64().unwrap();
+    let status = tools::dispatch(&session, "session_status", &json!({})).unwrap();
+    let evidence = status["evidence"][0].clone();
+    tools::dispatch_mut(
+        &mut session,
+        "investigation_record_evidence",
+        &json!({"evidence":evidence}),
+    )
+    .unwrap();
+    let linked = tools::dispatch_mut(
+        &mut session,
+        "investigation_link_evidence",
+        &json!({"hypothesis_id":id,"evidence_id":evidence["id"],"contradicts":false}),
+    )
+    .unwrap();
+    assert_eq!(linked["result"]["status"], "supported");
+    let saved = tools::dispatch(&session, "investigation_status", &json!({})).unwrap();
+    assert_eq!(saved["hypothesis_count"], 1);
+    assert_eq!(saved["evidence_count"], 1);
+    assert_eq!(
+        tools::dispatch(&session, "investigation_conflicts", &json!({})).unwrap()["matched"],
+        0
+    );
+    tools::dispatch_mut(
+        &mut session,
+        "investigation_link_evidence",
+        &json!({"hypothesis_id":id,"evidence_id":evidence["id"],"contradicts":true}),
+    )
+    .unwrap();
+    let conflicts = tools::dispatch(&session, "investigation_conflicts", &json!({})).unwrap();
+    assert_eq!(conflicts["matched"], 1);
+    assert_eq!(
+        conflicts["conflicts"][0]["hypothesis"]["status"],
+        "unresolved"
+    );
+    assert_eq!(
+        conflicts["conflicts"][0]["supporting_evidence"][0]["id"],
+        evidence["id"]
+    );
+    assert_eq!(
+        tools::dispatch(
+            &session,
+            "investigation_get_evidence",
+            &json!({"evidence_id":evidence["id"]})
+        )
+        .unwrap(),
+        evidence
+    );
+    let mut tampered = evidence.clone();
+    tampered["summary"] = json!("Changed claim");
+    assert!(tools::dispatch_mut(
+        &mut session,
+        "investigation_record_evidence",
+        &json!({"evidence":tampered})
+    )
+    .is_err());
+    assert!(tools::dispatch_mut(
+        &mut session,
+        "investigation_link_evidence",
+        &json!({"hypothesis_id":id,"evidence_id":"unknown","contradicts":true})
+    )
+    .is_err());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn string_usage_returns_bounded_references_and_no_absence_claim() {
+    let (root, session) = fixture_session();
+    let result = tools::dispatch(
+        &session,
+        "trace_string_usage",
+        &json!({"query":"","limit":1}),
+    )
+    .unwrap();
+    assert!(result["data"]["returned"].as_u64().unwrap() <= 1);
+    assert_eq!(result["evidence"][0]["producer"], "trace_string_usage");
+    let empty = tools::dispatch(
+        &session,
+        "trace_string_usage",
+        &json!({"query":"impossible_fixture_string_123456"}),
+    )
+    .unwrap();
+    assert_eq!(empty["data"]["matched"], 0);
+    assert!(empty["evidence"][0]["limitations"][0]
+        .as_str()
+        .unwrap()
+        .contains("not proof"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn input_validation_workflow_preserves_candidate_status_and_bounds() {
+    let (root, session) = fixture_session();
+    let address = session.an.functions[0].addr;
+    let result = tools::dispatch(
+        &session,
+        "inspect_input_validation",
+        &json!({"address":format!("0x{address:x}")}),
+    )
+    .unwrap();
+    assert_eq!(
+        result["evidence"][0]["producer"],
+        "inspect_input_validation"
+    );
+    assert_eq!(result["evidence"][0]["statements"][0]["kind"], "inference");
+    assert!(result["data"]["instructions_inspected"].as_u64().unwrap() > 0);
+    assert!(result["data"]["candidate_sites"].as_array().unwrap().len() <= 64);
+    assert!(result["data"]["argument_provenance"].is_object());
+    assert!(result["evidence"][0]["limitations"][0]
+        .as_str()
+        .unwrap()
+        .contains("does not prove"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn engine_comparison_preserves_disagreement_and_unknown_states() {
+    let (root, session) = fixture_session();
+    let address = session.an.functions[0].addr;
+    let result = tools::dispatch(
+        &session,
+        "compare_engine_findings",
+        &json!({"address":format!("0x{address:x}")}),
+    )
+    .unwrap();
+    assert_eq!(result["evidence"][0]["producer"], "compare_engine_findings");
+    assert_eq!(result["data"]["comparisons"].as_array().unwrap().len(), 2);
+    for field in result["data"]["comparisons"].as_array().unwrap() {
+        assert!(
+            ["agreement", "disagreement", "unknown"].contains(&field["status"].as_str().unwrap())
+        );
+    }
+    if result["data"]["rizin"]["unavailable"].is_string() {
+        assert_eq!(result["data"]["unknown_fields"], 2);
+    } else {
+        assert!(result["evidence"].as_array().unwrap().len() >= 2);
+    }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn session_status_establishes_identity_coverage_and_limitations() {
     let (root, session) = fixture_session();
     let first = tools::dispatch(&session, "session_status", &json!({})).unwrap();
@@ -107,7 +276,7 @@ fn read_catalog_exposes_machine_readable_operation_policy() {
     );
 
     let mutations = tools::mutation_catalog();
-    assert_eq!(mutations.len(), 4);
+    assert_eq!(mutations.len(), 7);
     assert!(mutations
         .iter()
         .all(|operation| operation.access == OperationAccess::ProjectWrite));

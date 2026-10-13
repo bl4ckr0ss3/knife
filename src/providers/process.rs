@@ -15,7 +15,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 static SNAPSHOT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug)]
-pub(super) struct ProcessOutput {
+pub(crate) struct ProcessOutput {
     pub status: std::process::ExitStatus,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
@@ -134,7 +134,7 @@ impl Drop for TargetSnapshot {
     }
 }
 
-pub(super) fn run_process<I>(
+pub(crate) fn run_process<I>(
     executable: &Path,
     args: I,
     deadline: Duration,
@@ -211,7 +211,7 @@ pub(super) fn read_bounded(
     Ok((kept, truncated))
 }
 
-pub(super) fn find_on_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path).find_map(|directory| {
         let candidate = directory.join(name);
