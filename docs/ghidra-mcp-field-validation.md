@@ -1,0 +1,57 @@
+# Ghidra MCP field validation
+
+The actual `target/debug/knife mcp` stdio server was driven by
+`scripts/validate-ghidra-mcp.py`, using the portable Ghidra 12.1.4 and JDK 21
+recorded in `ghidra-provider-validation.md`. No target code was executed.
+
+## ELF observed results
+
+Target: `/usr/bin/true`, workspace SHA-256
+`913a39cd38f353497086bcf317b12f91f93c23b51869cea763b8340b4f84cfd3`.
+
+- Initialize and tool discovery exposed both Ghidra operations.
+- Open and session status succeeded before provider requests.
+- Inventory recovered 134 functions with `partial: false`; the first two-row
+  page took 22.811 seconds.
+- The second page took 0.007 seconds and retained the same report digest.
+- `_DT_INIT` was at Ghidra static address `0x102000`, address space `ram`, file
+  offset 8192, and Knife static address `0x2000`.
+- Decompilation completed and was not partial. Its output conditionally calls
+  the imported `__gmon_start__` pointer. This describes inferred pseudocode,
+  not demonstrated behavior.
+- The evidence location was static address 8192, file offset 8192 and symbol
+  `_DT_INIT`, with no runtime address. Imported SHA-256 matched workspace SHA-256.
+
+This validates the ELF inventory/pagination/decompilation path through MCP.
+It does not prove all architectures, packed targets, or runtime debugging.
+## PE observed results
+
+Target: `/home/chixin/Desktop/Crackme/CrackGothGirlsMedium.exe`, workspace SHA-256
+`7937ca87a6b7f9fb4ffa25f8bbe7193ae501bd4c381a11360812aa3b4ae5a99e`.
+
+- Inventory recovered 869 functions, `partial: false`; the first page took
+  57.418 seconds. The cached second page took 0.034 seconds with the same digest.
+- `FUN_140001000` had Ghidra/Knife static address `0x140001000`, file offset
+  1024, and reported size 2466 bytes. Its decompilation completed, untruncated
+  and not partial. Ghidra emitted an overlapping-global-symbol warning in the
+  pseudocode; this warning is retained, not suppressed.
+- Evidence carried static address 5368713216 and file offset 1024, no runtime
+  address; the imported sample hash matched workspace bytes.
+- Private projects were removed after both ELF and PE runs.
+
+Knife's earlier native recovery found 786 functions on this target. The count
+difference is an observed cross-engine disagreement, not proof that either
+engine is correct. Function-level correlation and boundary inspection are
+needed before attributing a cause.
+
+The initial runs covered inventory, paging and decompilation. The reusable
+script now additionally checks exact retained-result retrieval and native
+navigation at the mapped entry. The extended ELF rerun passed: first page
+18.867 seconds, cached second page 0.007 seconds, same 134-function inventory.
+
+## Boundary hardening
+
+Source offsets alone do not prove address equivalence for overlay spaces that
+reuse the same bytes. Knife now only correlates the ordinary Ghidra `ram`
+address space to native static addresses; other spaces remain unknown while
+retaining their file-offset evidence. A regression covers this distinction.

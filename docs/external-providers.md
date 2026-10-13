@@ -72,8 +72,10 @@ and reports incomplete coverage explicitly. Decompilation requires the
 Reports preserve file offsets, analysis timeouts, failures, workspace hashes
 and inferred pseudocode. Engine-version probing remains unfinished. Cached
 continuations require the same analysis timeout; expired reports must restart.
-The process adapter has been live-tested, but the newly registered MCP workflow
-still needs real-server dogfooding.
+The registered MCP inventory/pagination/decompilation workflow has been
+live-tested on ELF and the PE crackme; see
+[ghidra-mcp-field-validation.md](ghidra-mcp-field-validation.md). Only ordinary
+`ram` addresses are correlated; overlay-space locations remain unknown.
 
 The initial standalone capa adapter exposes `capa_capabilities` for PE/ELF.
 Set `KNIFE_CAPA` to its executable or install it on PATH. It uses fixed JSON

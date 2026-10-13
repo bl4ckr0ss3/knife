@@ -351,6 +351,11 @@ pub fn static_address(session: &crate::workspace::Session, row: &Value) -> Optio
 }
 
 fn correlate(bin: &crate::model::Binary, byte_len: usize, row: &Value) -> Option<u64> {
+    // Overlay/non-memory spaces can reuse source bytes at distinct locations.
+    // The initial native provider only correlates its ordinary RAM space.
+    if row["address_space"].as_str() != Some("ram") {
+        return None;
+    }
     let offset = row["file_offset"].as_u64()?;
     if offset >= byte_len as u64 {
         return None;
@@ -437,8 +442,11 @@ mod tests {
             .unwrap();
         let offset = section.file_off;
         let expected = section.vaddr;
-        let row = serde_json::json!({"address":"0xdeadbeef", "file_offset":offset});
+        let row = serde_json::json!({"address":"0xdeadbeef", "address_space":"ram", "file_offset":offset});
         assert_eq!(correlate(&bin, bytes.len(), &row), Some(expected));
+        let mut overlay = row.clone();
+        overlay["address_space"] = "overlay".into();
+        assert_eq!(correlate(&bin, bytes.len(), &overlay), None);
         bin.format = crate::model::Format::Pe;
         bin.image_base = 0x140000000;
         assert_eq!(
