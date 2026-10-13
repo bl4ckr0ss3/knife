@@ -32,6 +32,26 @@ not hold the Ghidra distribution or its project files. Headless 12.1.4 supports
 
 These prerequisite checks do not establish a working Knife Ghidra provider.
 
+## Exporter validation
+
+Knife's `src/providers/ghidra/KnifeExport.java` compiled through Ghidra's script
+loader and ran against `/usr/bin/true` in read-only import mode. With a 512-MiB
+heap, one analysis CPU and a 60-second analysis deadline:
+
+- Function export returned total 134, a requested five-row inventory, and
+  explicit `truncated: true` / `analysis_timed_out: false`.
+- Decompilation at Ghidra address `0x102000` returned `_DT_INIT`, size 27,
+  `decompile_completed: true`, and untruncated pseudocode.
+- Ghidra discarded the imported file because `-readOnly` was requested.
+- The first project location under `.cache` was rejected: Ghidra project paths
+  cannot contain a component beginning with `.`. The validated project root was
+  `/home/chixin/Desktop/Tools/knife-ghidra-project.yJhxwN`.
+- Ghidra loaded this ELF at image base `0x100000`. Provider addresses must be
+  preserved and explicitly correlated with Knife's image before navigation.
+
+The Rust/MCP adapter, input snapshots, address correlation and report caching
+remain to be implemented. These runs validate the exporter, not end-to-end MCP.
+
 Primary references:
 
 - https://github.com/NationalSecurityAgency/ghidra/releases/tag/Ghidra_12.1.4_build
