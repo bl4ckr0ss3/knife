@@ -35,13 +35,15 @@ impl App {
                     .into();
             return;
         }
-        let mut provider = match crate::agent::Ollama::from_environment() {
+        let mut provider = match crate::agent::ConfiguredProvider::from_environment() {
             Ok(provider) => provider,
             Err(error) => {
                 self.investigation_activity = error.to_string();
+                self.investigation_open = true;
                 return;
             }
         };
+        self.investigation_activity = format!("Connecting to {}", provider.label());
         let path = self.bin.path.clone();
         let database = self
             .db
@@ -241,9 +243,7 @@ impl App {
                 self.investigation_open = true;
                 self.investigation_focused = true;
                 self.status = format!("Saved investigation question #{id}");
-                if std::env::var_os("KNIFE_AGENT_MODEL").is_some() {
-                    self.start_investigation_agent();
-                }
+                self.start_investigation_agent();
             }
             Err(error) => self.status = format!("Cannot save question: {error}"),
         }

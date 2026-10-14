@@ -280,8 +280,11 @@ knife query sample.exe trace_string_usage --args '{"query":"password","limit":5}
 knife query sample.exe explain_function --args '{"selector":"main"}'
 ```
 
-The optional [investigation desk](docs/investigation-desk.md) shows saved
-conversation, hypotheses and evidence alongside the listing.
+The built-in [investigation desk](docs/investigation-desk.md) opens beside the
+listing. Press `i` to chat through local Ollama, OpenRouter, OpenAI, or another
+OpenAI-compatible endpoint; the agent can call Knife's bounded analysis tools
+and save its evidence into the project ledger. No provider is contacted until
+you configure one and submit a message.
 
 ## Kernel drivers & BYOVD
 

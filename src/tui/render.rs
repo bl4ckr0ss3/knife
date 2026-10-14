@@ -171,7 +171,7 @@ fn investigation_desk(f: &mut Frame, app: &App) {
         .iter()
         .rev()
         .nth(app.investigation_message_offset);
-    let conversation = message.map(|message|format!("{:?}\n{}",message.role,message.text)).unwrap_or_else(||"Press i to speak to the agent.\nPgUp/PgDn: conversation history\nCtrl+Up/Down: scroll message\nEnter: follow selected evidence\nCtrl+Tab: switch workspace/chat\nf: toggle live following\nCtrl+C: interrupt agent\nSet KNIFE_AGENT_MODEL for local Ollama; external agents use MCP.".into());
+    let conversation = message.map(|message|format!("{:?}\n{}",message.role,message.text)).unwrap_or_else(||format!("{}\n\nPress i anywhere to speak to the agent.\nPgUp/PgDn: conversation history\nCtrl+Up/Down: scroll message\nEnter: follow selected evidence\nCtrl+Tab: switch workspace/chat\nf: toggle live following\nCtrl+C: interrupt agent", crate::agent::provider_status()));
     let conversation = if app.investigation_evidence_detail {
         app.investigation
             .evidence
@@ -1441,6 +1441,7 @@ fn footer_hints(focus: Focus, width: u16) -> String {
         Focus::Xrefs => " | Enter jump",
     };
     for hint in [
+        " | i agent chat",
         " | Tab/S-Tab panes",
         " | +/- size",
         " | z zoom",

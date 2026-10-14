@@ -1,10 +1,14 @@
 # Investigation desk
 
-The investigation desk is docked alongside the existing listing on wide
-terminals and uses the analysis area on narrow terminals. Open it with
-`:investigation` (or `:agent`). `:ask <question>` persists an analyst question
-and conversation entry. When `KNIFE_AGENT_MODEL` is configured, it also starts
-a background conversation with a local Ollama model.
+The investigation desk opens alongside the listing on wide terminals and uses
+the analysis area on narrow terminals. Press `i` anywhere to compose a message;
+`:investigation` (or `:agent`) focuses the dock. `:ask <question>` does the same
+from command mode. Every submitted question is persisted and, when a provider
+is configured, starts a background tool-using conversation.
+
+## Model providers
+
+Ollama remains the no-account local default:
 
 ```sh
 export KNIFE_AGENT_MODEL=qwen3
@@ -14,9 +18,26 @@ knife tui ./sample.exe
 
 Install and serve the model with Ollama before opening Knife. The adapter uses
 Ollama's documented `/api/chat` tool-call protocol and requires `curl` on PATH.
-There is no default model or account requirement. This first transport accepts
-localhost HTTP only. Each request has a 60-second timeout, the loop allows eight
-model rounds and 24 tool calls, and serialized context is capped at 96 KiB.
+The Ollama transport accepts localhost HTTP only. OpenRouter uses its
+OpenAI-compatible tool-call endpoint:
+
+```sh
+export KNIFE_AGENT_PROVIDER=openrouter
+export KNIFE_AGENT_MODEL=anthropic/claude-sonnet-4
+export OPENROUTER_API_KEY='...'
+knife tui ./sample.exe
+```
+
+Knife also accepts `KNIFE_AGENT_PROVIDER=openai` with `OPENAI_API_KEY`, or
+`KNIFE_AGENT_PROVIDER=compatible` with `KNIFE_AGENT_BASE_URL` and
+`KNIFE_AGENT_API_KEY`. Compatible endpoints must use HTTPS, except localhost
+HTTP. API keys are never saved in the investigation ledger or placed on the
+`curl` command line. The request still sends the recent conversation and tool
+results to the configured service, so use Ollama for targets that must remain
+local. There is no default hosted model or account requirement.
+
+Each request has a 60-second timeout, the loop allows eight model rounds and 24
+tool calls, and serialized context is capped at 96 KiB.
 
 The model can invoke registered analysis reads. Tool activity appears while it
 works; the resulting answer, tool-response previews, and evidence records are
@@ -25,6 +46,11 @@ IDs, and static addresses. Model compliance with those instructions still needs
 to be assessed by the analyst. Project mutation and target execution are not
 available to this initial loop. Responses currently arrive after each complete
 model request; token streaming is outstanding.
+
+The complete embedded investigator prompt is intentionally auditable at
+[`src/agent_system_prompt.md`](../src/agent_system_prompt.md). Repository-level
+instructions for coding agents live in [`AGENTS.md`](../AGENTS.md); that file is
+not sent to model providers or loaded from an analyzed target's directory.
 
 The model begins with a small investigation tool set. Calling
 `discover_investigation_tools` adds schemas for the selected task on its next
@@ -93,7 +119,8 @@ conflict; this refuses while a worker is active. A crash may leave an
 
 ## Implementation scope still outstanding
 
-- Additional model transports (including GLM), token streaming and context management.
+- Native GLM transport, token streaming and richer context management. GLM and
+  other services already work when they expose an OpenAI-compatible endpoint.
 - Approval interaction for model-requested project mutations.
 - In-flight engine cancellation, activity history, and complete result navigation.
 - CLI ledger operations and import/export.

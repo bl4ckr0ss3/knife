@@ -2624,6 +2624,11 @@ impl App {
                 self.help_scroll = 0;
                 self.help = true;
             }
+            KeyCode::Char('i') => {
+                self.investigation_open = true;
+                self.investigation_focused = true;
+                self.ask(Ask::AgentQuestion);
+            }
             KeyCode::Char('b') => self.execute_command("bookmark"),
             KeyCode::Char('+') | KeyCode::Char('=') => self.resize_pane(4),
             KeyCode::Char('-') => self.resize_pane(-4),
@@ -3456,6 +3461,10 @@ pub fn run(source: TargetSource, bin: Binary, bytes: Vec<u8>, db: Db, title: Str
     // opens on its mapped bytes and the catalogs stay available.
     let mut app = App::new(bin, bytes, db, an, sinks, strings, driver, title);
     app.source = Some(source);
+    // Knife is an agent workstation: keep the conversation dock visible on
+    // startup, while leaving keyboard focus in the analysis workspace.
+    app.investigation_open = true;
+    app.investigation_focused = false;
     let res = loop {
         if let Ok(area) = term.size() {
             app.dims = (area.width, area.height);

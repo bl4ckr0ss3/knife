@@ -146,6 +146,86 @@ where
     run_process_with_env(executable, args, deadline, output_limit, &[])
 }
 
+/// Run a bounded provider process with an exact stdin payload. This keeps
+/// request bodies (and, for transports that accept configuration on stdin,
+/// credentials) out of the child command line.
+pub(crate) fn run_process_with_input<I>(
+    executable: &Path,
+    args: I,
+    input: Vec<u8>,
+    deadline: Duration,
+    output_limit: usize,
+) -> Result<ProcessOutput>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut command = Command::new(executable);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start {}", executable.display()))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("missing child stdin"))?;
+    let stdin_writer = thread::spawn(move || stdin.write_all(&input));
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("missing child stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("missing child stderr"))?;
+    let stdout_reader = thread::spawn(move || read_bounded(stdout, output_limit));
+    let stderr_reader = thread::spawn(move || read_bounded(stderr, output_limit));
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= deadline {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdin_writer.join();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(anyhow!(
+                "external provider exceeded its {} second deadline",
+                deadline.as_secs()
+            ));
+        }
+        thread::sleep(POLL_INTERVAL);
+    };
+    stdin_writer
+        .join()
+        .map_err(|_| anyhow!("provider stdin writer panicked"))??;
+    let (stdout, stdout_truncated) = stdout_reader
+        .join()
+        .map_err(|_| anyhow!("provider stdout reader panicked"))??;
+    let (stderr, stderr_truncated) = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("provider stderr reader panicked"))??;
+    Ok(ProcessOutput {
+        status,
+        stdout,
+        stderr,
+        truncated: stdout_truncated || stderr_truncated,
+    })
+}
+
 pub(crate) fn run_process_with_env<I>(
     executable: &Path,
     args: I,

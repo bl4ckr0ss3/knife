@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- The TUI now opens with its investigation desk visible, and `i` starts an
+  agent message from anywhere in the workspace. Provider readiness is shown in
+  the chat pane.
+- The embedded tool-using agent supports OpenRouter, OpenAI, and custom
+  OpenAI-compatible chat-completions endpoints in addition to local Ollama.
+  Hosted API credentials remain environment-only and are kept out of child
+  process command lines and saved investigation data.
+
 ## v1.8.3
 
 - **WAT listing for WebAssembly functions** (`knife wat`, MCP `wat` tool).
