@@ -160,14 +160,8 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn investigation_desk(f: &mut Frame, app: &App) {
-    let area = f.area();
-    let width = (area.width / 2).max(24).min(area.width);
-    let desk = Rect::new(
-        area.right().saturating_sub(width),
-        area.y.saturating_add(1),
-        width,
-        area.height.saturating_sub(2),
-    );
+    let desk = app.panes(f.area()).agent;
+    let width = desk.width;
     f.render_widget(Clear, desk);
     let conversation_height = desk.height / 2;
     let conversation_area = Rect::new(desk.x, desk.y, desk.width, conversation_height);
@@ -177,7 +171,7 @@ fn investigation_desk(f: &mut Frame, app: &App) {
         .iter()
         .rev()
         .nth(app.investigation_message_offset);
-    let conversation = message.map(|message|format!("{:?}\n{}",message.role,message.text)).unwrap_or_else(||"Use :ask <question> to begin.\nPgUp/PgDn: browse conversation\nCtrl+Up/Down: scroll message\nUp/Down: select evidence\nEnter: follow selected evidence".into());
+    let conversation = message.map(|message|format!("{:?}\n{}",message.role,message.text)).unwrap_or_else(||"Press i to speak to the agent.\nPgUp/PgDn: conversation history\nCtrl+Up/Down: scroll message\nEnter: follow selected evidence\nCtrl+Tab: switch workspace/chat\nf: toggle live following\nCtrl+C: interrupt agent\nSet KNIFE_AGENT_MODEL for local Ollama; external agents use MCP.".into());
     let conversation = if app.investigation_evidence_detail {
         app.investigation
             .evidence
@@ -220,7 +214,7 @@ fn investigation_desk(f: &mut Frame, app: &App) {
                 if app.investigation_evidence_detail {
                     " Investigation desk — evidence "
                 } else {
-                    " Investigation desk — conversation "
+                    " Investigation desk — Agent chat "
                 },
             ))
             .style(Style::default().fg(accent()).bg(panel()))
@@ -235,7 +229,19 @@ fn investigation_desk(f: &mut Frame, app: &App) {
         desk.height.saturating_sub(conversation_height),
     );
     let mut lines = vec![
-        TLine::from(" :ask <question> saves a lead; Esc closes"),
+        TLine::from(format!(
+            " i: chat  f: follow {}  Ctrl+Tab: {}",
+            if app.investigation_follow {
+                "ON"
+            } else {
+                "OFF"
+            },
+            if app.investigation_focused {
+                "workspace"
+            } else {
+                "chat"
+            }
+        )),
         TLine::from(" Findings and activity"),
     ];
     lines.insert(

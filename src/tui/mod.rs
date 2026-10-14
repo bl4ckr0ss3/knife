@@ -223,6 +223,7 @@ pub struct TyRow {
 /// What a prompt at the bottom of the screen is collecting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ask {
+    AgentQuestion,
     Command,
     Filter,
     Name,
@@ -251,6 +252,7 @@ pub enum Ask {
 impl Ask {
     fn label(self) -> &'static str {
         match self {
+            Ask::AgentQuestion => "agent message",
             Ask::Command => ":",
             Ask::Filter => "filter",
             Ask::Name => "name",
@@ -410,6 +412,9 @@ pub struct ListingViewRef<'a> {
 pub struct App {
     pub investigation: crate::api::investigation::Investigation,
     pub investigation_open: bool,
+    pub investigation_focused: bool,
+    pub investigation_follow: bool,
+    pub investigation_agent_events: Option<std::sync::mpsc::Receiver<crate::agent::AgentEvent>>,
     pub investigation_conflicts_only: bool,
     pub investigation_selection: usize,
     pub investigation_message_offset: usize,
@@ -562,6 +567,9 @@ impl App {
         let mut app = App {
             investigation,
             investigation_open: false,
+            investigation_focused: true,
+            investigation_follow: true,
+            investigation_agent_events: None,
             investigation_conflicts_only: false,
             investigation_selection: 0,
             investigation_message_offset: 0,
@@ -1972,6 +1980,7 @@ impl App {
     ) {
         let stored = at.wrapping_sub(self.base);
         match ask {
+            Ask::AgentQuestion => self.investigation_question(text),
             Ask::Command => {
                 self.command_history.record(&text);
                 self.execute_command(&text);
@@ -2363,6 +2372,7 @@ impl App {
         self.bytes = bytes;
         self.db = db;
         self.investigation_worker = None;
+        self.investigation_agent_events = None;
         if let Some(token) = self.investigation_cancellation.take() {
             token.cancel();
         }
@@ -2454,8 +2464,28 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return; // Windows reports releases too; acting on both double-fires
         }
-        if self.investigation_open && self.prompt.is_none() {
+        if self.investigation_open
+            && self.prompt.is_none()
+            && key.code == KeyCode::Tab
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.investigation_focused = !self.investigation_focused;
+            if !self.investigation_focused {
+                self.investigation_follow = false;
+            }
+            return;
+        }
+        if self.investigation_open && self.investigation_focused && self.prompt.is_none() {
             match key.code {
+                KeyCode::Char('i') => self.ask(Ask::AgentQuestion),
+                KeyCode::Char('f') => self.investigation_follow = !self.investigation_follow,
+                KeyCode::Tab => {
+                    self.investigation_focused = false;
+                    self.investigation_follow = false;
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.execute_command("interrupt")
+                }
                 KeyCode::Char('e') => {
                     self.investigation_evidence_detail = !self.investigation_evidence_detail;
                     self.investigation_message_scroll = 0;
@@ -2478,7 +2508,10 @@ impl App {
                     self.investigation_message_scroll =
                         self.investigation_message_scroll.saturating_add(1)
                 }
-                KeyCode::Esc => self.investigation_open = false,
+                KeyCode::Esc => {
+                    self.investigation_open = false;
+                    self.investigation_follow = false;
+                }
                 KeyCode::Up => {
                     self.investigation_selection = self.investigation_selection.saturating_sub(1)
                 }
@@ -2487,9 +2520,7 @@ impl App {
                         .min(self.investigation.evidence.len().saturating_sub(1))
                 }
                 KeyCode::Enter => self.follow_investigation_evidence(),
-                KeyCode::Char(':') => {
-                    self.investigation_open = false;
-                }
+                KeyCode::Char(':') => {}
                 _ => return,
             }
             if key.code != KeyCode::Char(':') {
@@ -2883,7 +2914,7 @@ impl App {
             return;
         }
         let input = match ask {
-            Ask::Command => String::new(),
+            Ask::Command | Ask::AgentQuestion => String::new(),
             Ask::Filter if self.browser.is_some() => self.browser.as_ref().unwrap().filter.clone(),
             Ask::Filter => match self.left {
                 LeftView::Driver => self.dsrch.clone(),
@@ -3038,7 +3069,26 @@ impl App {
 
     pub fn on_mouse(&mut self, m: MouseEvent) {
         if self.investigation_open {
-            return;
+            let pane = self
+                .panes(ratatui::layout::Rect::new(0, 0, self.dims.0, self.dims.1))
+                .agent;
+            if pane.contains(ratatui::layout::Position::new(m.column, m.row)) {
+                self.investigation_focused = true;
+                match m.kind {
+                    MouseEventKind::ScrollUp => {
+                        self.investigation_message_scroll =
+                            self.investigation_message_scroll.saturating_sub(3)
+                    }
+                    MouseEventKind::ScrollDown => {
+                        self.investigation_message_scroll =
+                            self.investigation_message_scroll.saturating_add(3)
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            self.investigation_focused = false;
+            self.investigation_follow = false;
         }
         if self.help {
             let max = render::help_max_scroll(self.dims.0, self.dims.1);
@@ -4868,8 +4918,38 @@ mod tests {
         assert!(app.investigation_evidence_detail);
         assert!(rendered(&mut app, 110, 30).contains("Static: 0x1000"));
         app.follow_investigation_evidence();
-        assert!(!app.investigation_open);
+        assert!(app.investigation_open);
+        assert!(!app.investigation_focused);
         assert_eq!(app.focus, Focus::Listing);
+    }
+
+    #[test]
+    fn agent_dock_preserves_analysis_and_follows_live_evidence() {
+        let mut app = two_functions();
+        app.splash = false;
+        app.execute_command("agent");
+        let panes = app.panes(ratatui::layout::Rect::new(0, 0, 160, 40));
+        assert!(panes.agent.width >= 36);
+        assert!(panes.listing.width > 0);
+        assert!(panes.listing.right() <= panes.agent.x);
+        app.investigation_follow = true;
+        app.apply_agent_event(crate::agent::AgentEvent::ToolCompleted {
+            name: "explain_function".into(),
+            static_address: Some(0x100b),
+        });
+        assert_eq!(app.cursor_addr(), Some(0x100b));
+        assert!(app.investigation_open);
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
+        assert!(!app.investigation_follow);
+        app.apply_agent_event(crate::agent::AgentEvent::ToolCompleted {
+            name: "explain_function".into(),
+            static_address: Some(0x1000),
+        });
+        assert_eq!(app.cursor_addr(), Some(0x100b));
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert_eq!(app.prompt.as_ref().unwrap().ask, Ask::AgentQuestion);
+        assert!(rendered(&mut app, 160, 40).contains("Agent chat"));
     }
 
     #[test]

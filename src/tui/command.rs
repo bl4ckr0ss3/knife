@@ -100,6 +100,7 @@ impl super::App {
         match command {
             Command::Investigation => {
                 self.investigation_open = true;
+                self.investigation_focused = true;
                 self.investigation_conflicts_only = false;
             }
             Command::Contradictions => {
@@ -114,6 +115,7 @@ impl super::App {
                     token.cancel();
                 }
                 self.investigation_worker = None;
+                self.investigation_agent_events = None;
                 self.investigation_live_activity = None;
                 self.investigation_activity =
                     "Interrupted: pending result discarded; provider cleanup may still be running"
@@ -297,7 +299,7 @@ pub fn parse(input: &str) -> Result<Command, String> {
         }
     };
     match verb {
-        "investigation" => no_args(Command::Investigation),
+        "investigation" | "agent" => no_args(Command::Investigation),
         "contradictions" => no_args(Command::Contradictions),
         "investigation-reload" => no_args(Command::RefreshInvestigation),
         "ask" => required().map(Command::Ask),

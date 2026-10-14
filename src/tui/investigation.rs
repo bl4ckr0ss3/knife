@@ -54,6 +54,8 @@ impl App {
         let cancellation = crate::api::execution::CancellationToken::default();
         self.investigation_cancellation = Some(cancellation.clone());
         let (sender, receiver) = std::sync::mpsc::channel();
+        let (progress_sender, progress_receiver) = std::sync::mpsc::channel();
+        self.investigation_agent_events = Some(progress_receiver);
         std::thread::spawn(move || {
             let result = (|| {
                 let session = crate::workspace::Session::open(
@@ -65,15 +67,18 @@ impl App {
                 if crate::analysis::hashes::sha256_hex(&session.bytes) != expected {
                     anyhow::bail!("workspace changed; reload before starting the agent");
                 }
-                crate::agent::converse_cancellable(
+                crate::agent::converse_with_events(
                     &mut provider,
                     &session,
                     &ledger,
                     &cancellation,
-                    |message| {
-                        if let Ok(mut current) = activity.lock() {
-                            *current = message.into();
+                    |event| {
+                        if let crate::agent::AgentEvent::Activity(message) = &event {
+                            if let Ok(mut current) = activity.lock() {
+                                *current = message.clone();
+                            }
                         }
+                        let _ = progress_sender.send(event);
                     },
                 )
             })();
@@ -132,6 +137,14 @@ impl App {
     }
 
     pub fn poll_investigation(&mut self) {
+        let events = self
+            .investigation_agent_events
+            .as_ref()
+            .map(|receiver| receiver.try_iter().take(96).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for event in events {
+            self.apply_agent_event(event);
+        }
         if let Some(activity) = &self.investigation_live_activity {
             if let Ok(activity) = activity.lock() {
                 self.investigation_activity = activity.clone();
@@ -146,6 +159,7 @@ impl App {
             Err(_) => Err(anyhow::anyhow!("investigation worker disconnected")),
         };
         self.investigation_worker = None;
+        self.investigation_agent_events = None;
         self.investigation_cancellation = None;
         self.investigation_live_activity = None;
         match result {
@@ -225,6 +239,7 @@ impl App {
             Ok(id) => {
                 self.investigation = next;
                 self.investigation_open = true;
+                self.investigation_focused = true;
                 self.status = format!("Saved investigation question #{id}");
                 if std::env::var_os("KNIFE_AGENT_MODEL").is_some() {
                     self.start_investigation_agent();
@@ -247,10 +262,28 @@ impl App {
                     .find_map(|location| location.static_address)
             });
         if let Some(address) = location {
-            self.investigation_open = false;
             self.execute_command(&format!("goto 0x{:x}", address.get()));
+            self.investigation_focused = false;
+            self.investigation_follow = false;
         } else {
             self.status = "This evidence has no static code location".into();
+        }
+    }
+
+    pub fn apply_agent_event(&mut self, event: crate::agent::AgentEvent) {
+        match event {
+            crate::agent::AgentEvent::Activity(message) => self.investigation_activity = message,
+            crate::agent::AgentEvent::ToolCompleted {
+                name,
+                static_address,
+            } => {
+                self.investigation_activity = format!("Completed {name}");
+                if self.investigation_open && self.investigation_follow {
+                    if let Some(address) = static_address {
+                        self.execute_command(&format!("goto 0x{address:x}"));
+                    }
+                }
+            }
         }
     }
 }

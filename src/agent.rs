@@ -11,6 +11,15 @@ const MAX_ROUNDS: usize = 8;
 const MAX_CALLS: usize = 24;
 const MAX_CONTEXT: usize = 96 * 1024;
 
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    Activity(String),
+    ToolCompleted {
+        name: String,
+        static_address: Option<u64>,
+    },
+}
+
 pub trait ChatProvider {
     fn complete(&mut self, messages: &[Value], tools: &[Value]) -> Result<Value>;
 }
@@ -123,6 +132,21 @@ pub fn converse_cancellable(
     cancellation: &crate::api::execution::CancellationToken,
     mut activity: impl FnMut(&str),
 ) -> Result<Value> {
+    converse_with_events(provider, session, ledger, cancellation, |event| {
+        if let AgentEvent::Activity(message) = event {
+            activity(&message);
+        }
+    })
+}
+
+pub fn converse_with_events(
+    provider: &mut impl ChatProvider,
+    session: &Session,
+    ledger: &Investigation,
+    cancellation: &crate::api::execution::CancellationToken,
+    mut events: impl FnMut(AgentEvent),
+) -> Result<Value> {
+    let expected_target = crate::analysis::hashes::sha256_hex(&session.bytes);
     let catalog = crate::tools::read_catalog();
     let mut active: std::collections::BTreeSet<String> = [
         "discover_investigation_tools",
@@ -170,7 +194,10 @@ pub fn converse_cancellable(
         if cancellation.is_cancelled() {
             return Err(anyhow!("investigation cancelled"));
         }
-        activity(&format!("Waiting for model (round {})", round + 1));
+        events(AgentEvent::Activity(format!(
+            "Waiting for model (round {})",
+            round + 1
+        )));
         let schemas: Vec<_> = catalog.iter().filter(|operation|active.contains(operation.name)).map(|operation|json!({"type":"function","function":{"name":operation.name,"description":operation.description,"parameters":operation.params}})).collect();
         let response = provider.complete(&messages, &schemas)?;
         if cancellation.is_cancelled() {
@@ -211,15 +238,18 @@ pub fn converse_cancellable(
             {
                 json!({"error":"tool is unavailable or arguments are not an object"})
             } else {
-                activity(&format!("Running {name}"));
+                events(AgentEvent::Activity(format!("Running {name}")));
                 match crate::tools::dispatch(session, name, args) {
                     Ok(value) => value,
                     Err(error) => json!({"error": error.to_string()}),
                 }
             };
-            if let Some(records) = result.get("evidence").and_then(Value::as_array) {
-                evidence.extend(records.iter().cloned());
-            }
+            let (matching_evidence, static_address) = matching_evidence(&result, &expected_target);
+            evidence.extend(matching_evidence);
+            events(AgentEvent::ToolCompleted {
+                name: name.into(),
+                static_address,
+            });
             if name == "discover_investigation_tools" {
                 if let Some(tools) = result.get("tools").and_then(Value::as_array) {
                     for tool in tools {
@@ -241,6 +271,29 @@ pub fn converse_cancellable(
         }
     }
     Err(anyhow!("agent reached the 8-round investigation limit"))
+}
+
+fn matching_evidence(result: &Value, expected_target: &str) -> (Vec<Value>, Option<u64>) {
+    let records = result
+        .get("evidence")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|value| {
+            serde_json::from_value::<crate::api::evidence::EvidenceRecord>(value.clone())
+                .ok()
+                .filter(|record| record.target_sha256 == expected_target)
+                .map(|record| (value.clone(), record))
+        })
+        .collect::<Vec<_>>();
+    let static_address = records
+        .iter()
+        .flat_map(|(_, record)| &record.locations)
+        .find_map(|location| location.static_address.map(|address| address.get()));
+    (
+        records.into_iter().map(|(value, _)| value).collect(),
+        static_address,
+    )
 }
 
 #[cfg(test)]
@@ -316,5 +369,27 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("unavailable"));
+    }
+
+    #[test]
+    fn live_navigation_ignores_evidence_for_another_target() {
+        use crate::address::StaticVa;
+        use crate::api::evidence::{EvidenceKind, EvidenceLocation, EvidenceRecord};
+
+        let wrong = EvidenceRecord::new(
+            "wrong-target",
+            "test",
+            EvidenceKind::StaticAnalysis,
+            "foreign location",
+            vec![EvidenceLocation {
+                static_address: Some(StaticVa(0x41414141)),
+                ..EvidenceLocation::default()
+            }],
+            vec![],
+            vec![],
+        );
+        let (records, address) = matching_evidence(&json!({"evidence": [wrong]}), "current-target");
+        assert!(records.is_empty());
+        assert_eq!(address, None);
     }
 }

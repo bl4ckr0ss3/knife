@@ -32,6 +32,7 @@ pub struct Panes {
     pub listing_right: Rect,
     pub references: Rect,
     pub detail: Rect,
+    pub agent: Rect,
 }
 
 impl App {
@@ -44,12 +45,26 @@ impl App {
                 Constraint::Length(1),
             ])
             .split(area);
+        let (content, agent) = if self.investigation_open {
+            if area.width >= 100 {
+                let width = (area.width * 2 / 5).clamp(36, 60);
+                let columns = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Min(1), Constraint::Length(width)])
+                    .split(rows[1]);
+                (columns[0], columns[1])
+            } else {
+                (Rect::default(), rows[1])
+            }
+        } else {
+            (rows[1], Rect::default())
+        };
         if self.pane_settings.zoom.is_some() {
             // Focus changes while zoomed (Tab, mouse, or :focus) switch the
             // maximized pane instead of leaving focus on an invisible pane.
             let zoom = self.focus;
-            let content = rows[1];
             return Panes {
+                agent,
                 header: rows[0],
                 footer: rows[2],
                 functions: if zoom == Focus::Functions {
@@ -78,7 +93,9 @@ impl App {
             _ => 0,
         };
         let left_width = if left {
-            self.pane_settings.left_width.min(area.width / 2)
+            self.pane_settings
+                .left_width
+                .min(content.width / if self.investigation_open { 3 } else { 2 })
         } else {
             0
         };
@@ -92,12 +109,13 @@ impl App {
                     Constraint::Min(1),
                     Constraint::Min(1),
                 ])
-                .split(rows[1]);
+                .split(content);
             let center = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(1), Constraint::Length(detail_height)])
                 .split(cols[1]);
             return Panes {
+                agent,
                 header: rows[0],
                 footer: rows[2],
                 functions: cols[0],
@@ -111,7 +129,7 @@ impl App {
         // Keep it collapsed until it has rows or the user focuses it.
         let refs = (self.pane_settings.references && !self.xref_rows().is_empty())
             || self.focus == Focus::Xrefs;
-        let wide = area.width >= 132;
+        let wide = content.width >= 132;
         let cols = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
@@ -123,7 +141,7 @@ impl App {
                     0
                 }),
             ])
-            .split(rows[1]);
+            .split(content);
         let center = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -133,6 +151,7 @@ impl App {
             ])
             .split(cols[1]);
         Panes {
+            agent,
             header: rows[0],
             footer: rows[2],
             functions: cols[0],

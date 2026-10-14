@@ -1,7 +1,8 @@
 # Investigation desk
 
-The investigation desk is being developed alongside the existing listing.
-Open it with `:investigation`. `:ask <question>` persists an analyst question
+The investigation desk is docked alongside the existing listing on wide
+terminals and uses the analysis area on narrow terminals. Open it with
+`:investigation` (or `:agent`). `:ask <question>` persists an analyst question
 and conversation entry. When `KNIFE_AGENT_MODEL` is configured, it also starts
 a background conversation with a local Ollama model.
 
@@ -46,15 +47,20 @@ Run an existing analysis operation with:
 The worker reopens the saved project and checks that its workspace bytes match
 the TUI before collecting results. Navigation remains responsive. Evidence
 records and bounded tool responses are saved beside the annotation database in
-an `.investigation.json` file. Up/Down selects evidence; Enter navigates to its
-first static location. Esc closes the desk; `:` returns to command input.
+an `.investigation.json` file. Press `i` to compose an agent message in the
+ordinary command input, and Ctrl+Tab to move focus between the dock and the
+listing. While follow mode is enabled, completed agent tools move the listing
+to their first static evidence address. Manual focus on the listing pauses that
+behavior; `f` toggles it explicitly. Up/Down selects evidence; Enter navigates
+to its first static location without closing the desk. Esc closes the desk;
+`:` opens command input while leaving it visible.
 The desk separates conversation from findings. PgUp/PgDn browse older/newer
 messages; Ctrl+Up/Down scroll the selected message, including saved tool output.
 Press `e` to inspect selected evidence in the upper panel: producer, typed hex
 locations, observation/inference/unknown statements, confidence and limitations.
 Ctrl+Up/Down scrolls these details; `e` returns to conversation.
 
-`:interrupt` discards the active worker result and stops the model loop before
+`:interrupt` or Ctrl+C discards the active worker result and stops the model loop before
 its next request or tool call. An in-flight model request or analysis operation
 may finish in the background under its existing deadline. Native engine work
 does not yet have a cancellation guarantee.
@@ -89,12 +95,14 @@ conflict; this refuses while a worker is active. A crash may leave an
 
 - Additional model transports (including GLM), token streaming and context management.
 - Approval interaction for model-requested project mutations.
-- Engine cancellation, activity history, and complete result navigation.
+- In-flight engine cancellation, activity history, and complete result navigation.
 - CLI ledger operations and import/export.
 - Deeper input-validation proofs, function explanations and string tracing.
 - Cross-engine comparison and a dedicated contradiction view.
-- capa, Ghidra and runtime debugger provider integrations.
-- Tool discovery by investigation task and verified expansion toward 100–120 tools.
+- Persistent live-event ingestion from external MCP clients (embedded agent
+  tool completion already drives follow navigation).
+- A complete runtime-debugger launch/session surface beyond the validated GDB
+  capture foundation.
 
 The initial desk and ledger are a foundation for these requirements, not a
 claim that the conversational agent is complete.
