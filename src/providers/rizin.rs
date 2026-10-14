@@ -39,6 +39,7 @@ pub const OPERATION_NAMES: &[&str] = &[
     "rizin_classes",
     "rizin_functions",
     "rizin_function_info",
+    "rizin_callees",
     "rizin_disassemble",
     "rizin_xrefs_to",
     "rizin_xrefs_from",
@@ -108,6 +109,7 @@ pub fn catalog() -> Vec<OperationDescriptor> {
         descriptor("rizin_classes", "Classes and methods recovered by Rizin from language metadata.", page_props(), &[], true),
         descriptor("rizin_functions", "Functions recovered after Rizin automatic analysis, including signatures, complexity, references, variables, and bounds.", page_props(), &[], true),
         descriptor("rizin_function_info", "Rizin's targeted local recovery of metadata, signature, outgoing references, variables, and bounds for one function.", address_props(), &[], false).with_any_required(&["selector", "address"]),
+        descriptor("rizin_callees", "Direct call sites and symbol-resolved targets recovered by Rizin's targeted local analysis of one function.", selector_props(), &[], true).with_any_required(&["selector", "address"]),
         descriptor("rizin_disassemble", "Rizin targeted local function recovery and structured disassembly with opcode bytes, ESIL, flow type, references, and annotations.", selector_props(), &[], true).with_any_required(&["selector", "address"]),
         descriptor("rizin_xrefs_to", "Cross-references Rizin recovered to one static address.", selector_props(), &[], true).with_any_required(&["selector", "address"]),
         descriptor("rizin_xrefs_from", "Cross-references Rizin recovered from one static address after targeted local function recovery.", selector_props(), &[], true).with_any_required(&["selector", "address"]),
@@ -159,34 +161,40 @@ pub fn dispatch(session: &Session, name: &str, args: &Value) -> Result<ProviderR
         anyhow!("Rizin provider is unavailable; install Rizin or set KNIFE_RIZIN to its executable")
     })?;
     let (command, address) = command_for(session, name, args)?;
-    let cache_key = cache_key(session, &executable, &command);
+    let cache_key = cache_key(session, &executable, name, &command);
     if let Some(raw) = raw_cache()
         .lock()
         .map_err(|_| anyhow!("Rizin provider cache is poisoned"))?
         .get(&cache_key)
     {
-        return shape_result(name, args, address, raw);
+        return shape_result(session, name, args, address, raw);
     }
     // Analyze the exact immutable workspace bytes Knife identified, not a path
     // that could have changed after the session opened. This also makes staged
     // patch evidence honest without modifying the original target.
     let snapshot = TargetSnapshot::create("rizin", &session.bytes)?;
-    let raw = run_json(&executable, snapshot.path(), &command)?;
+    let mut raw = run_json(&executable, snapshot.path(), &command)?;
+    if name == "rizin_callees" {
+        let imports = run_json(&executable, snapshot.path(), "iij")?;
+        raw.as_object_mut()
+            .ok_or_else(|| anyhow!("Rizin disassembly result is not an object"))?
+            .insert("knife_imports".into(), imports);
+    }
     raw_cache()
         .lock()
         .map_err(|_| anyhow!("Rizin provider cache is poisoned"))?
         .insert(cache_key, raw.clone());
-    shape_result(name, args, address, raw)
+    shape_result(session, name, args, address, raw)
 }
 
 fn raw_cache() -> &'static Mutex<JsonCache> {
     RAW_CACHE.get_or_init(|| Mutex::new(JsonCache::new(CACHE_ITEMS, CACHE_BYTES)))
 }
 
-fn cache_key(session: &Session, executable: &Path, command: &str) -> String {
+fn cache_key(session: &Session, executable: &Path, operation: &str, command: &str) -> String {
     let workspace_sha256 = crate::analysis::hashes::sha256_hex(&session.bytes);
     let provider_identity = executable_identity(executable);
-    format!("{workspace_sha256}:{provider_identity}:{command}")
+    format!("{workspace_sha256}:{provider_identity}:{operation}:{command}")
 }
 
 fn command_for(session: &Session, name: &str, args: &Value) -> Result<(String, Option<u64>)> {
@@ -215,6 +223,7 @@ fn command_for(session: &Session, name: &str, args: &Value) -> Result<(String, O
         // query pay for whole-program `aaa`; incoming xrefs and global graphs
         // retain whole-program analysis because their contract requires it.
         "rizin_function_info" => format!("af @ 0x{address:x};afij @ 0x{address:x}"),
+        "rizin_callees" => format!("af @ 0x{address:x};pdfj @ 0x{address:x}"),
         "rizin_disassemble" => format!("af @ 0x{address:x};pdfj @ 0x{address:x}"),
         "rizin_xrefs_to" => format!("aaa;axtj @ 0x{address:x}"),
         "rizin_xrefs_from" => format!("af @ 0x{address:x};axfj @ 0x{address:x}"),
@@ -234,6 +243,7 @@ fn resolve_address(session: &Session, args: &Value) -> Result<u64> {
 }
 
 fn shape_result(
+    session: &Session,
     name: &str,
     args: &Value,
     address: Option<u64>,
@@ -243,6 +253,7 @@ fn shape_result(
         name,
         "rizin_functions"
             | "rizin_function_info"
+            | "rizin_callees"
             | "rizin_disassemble"
             | "rizin_xrefs_to"
             | "rizin_xrefs_from"
@@ -257,6 +268,12 @@ fn shape_result(
         "rizin_info" | "rizin_function_info" => {
             (json!({"provider": "rizin", "result": raw}), false, None)
         }
+        "rizin_callees" => page_array(
+            args,
+            shape_callees(session, &raw)?,
+            "rows",
+            &scope(name, address),
+        )?,
         "rizin_disassemble" => page_object_array(args, raw, "ops", &scope(name, address))?,
         "rizin_cfg" | "rizin_call_graph" => {
             page_object_array(args, raw, "nodes", &scope(name, address))?
@@ -271,6 +288,64 @@ fn shape_result(
         continuation,
         inferred,
     })
+}
+
+fn shape_callees(session: &Session, raw: &Value) -> Result<Value> {
+    let operations = raw
+        .get("ops")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("Rizin disassembly result has no `ops` array"))?;
+    let base = crate::analysis::engine::display_base(&session.bin);
+    let imports = raw
+        .get("knife_imports")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let rows = operations
+        .iter()
+        .filter(|operation| operation.get("type").and_then(Value::as_str) == Some("call"))
+        .filter_map(|operation| {
+            let call_site = operation.get("offset")?.as_u64()?;
+            let target = operation.get("jump").and_then(Value::as_u64);
+            let target_name = target.and_then(|target| {
+                session
+                    .an
+                    .functions
+                    .iter()
+                    .find(|function| function.addr == target)
+                    .map(|function| function.name.clone())
+                    .or_else(|| {
+                        session.bin.symbols.iter().find_map(|symbol| {
+                            symbol
+                                .addr
+                                .checked_add(base)
+                                .filter(|address| *address == target)
+                                .map(|_| symbol.name.clone())
+                        })
+                    })
+                    .or_else(|| {
+                        imports.iter().find_map(|import| {
+                            if import.get("plt").and_then(Value::as_u64) == Some(target) {
+                                import
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                            } else {
+                                None
+                            }
+                        })
+                    })
+            });
+            Some(json!({
+                "call_site": call_site,
+                "target": target,
+                "target_name": target_name,
+                "opcode": operation.get("opcode").cloned().unwrap_or(Value::Null),
+                "direct": target.is_some(),
+            }))
+        })
+        .collect::<Vec<_>>();
+    Ok(Value::Array(rows))
 }
 
 fn scope(name: &str, address: Option<u64>) -> String {
@@ -428,5 +503,44 @@ mod tests {
             assert!(operation.name.starts_with("rizin_"));
             assert!(operation.emits_evidence);
         }
+    }
+
+    #[test]
+    fn scoped_callees_resolve_rizin_plt_import_targets() {
+        let root = std::env::temp_dir().join(format!("knife-rizin-callees-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("fixture.elf");
+        let database = root.join("fixture.json");
+        std::fs::write(&target, crate::formats::fixture::elf_with_plt_call()).unwrap();
+        let session =
+            Session::open_data(target.to_str().unwrap(), Some(database.to_str().unwrap())).unwrap();
+        let base = crate::analysis::engine::display_base(&session.bin);
+        let symbol = session
+            .bin
+            .symbols
+            .iter()
+            .find(|symbol| crate::analysis::thunks::bare_name(&symbol.name) == "strcpy")
+            .unwrap();
+        // Use a provider-reported PLT address distinct from the container
+        // symbol so the import join, rather than the first lookup, is tested.
+        let target_address = symbol.addr + base + 0x44;
+        let raw = json!({
+            "knife_imports": [{"name": "strcpy", "plt": target_address}],
+            "ops": [
+                {"offset": 0x1010, "type": "call", "jump": target_address, "opcode": "call 0x1020"},
+                {"offset": 0x1015, "type": "mov", "opcode": "mov eax, eax"}
+            ]
+        });
+
+        let rows = shape_callees(&session, &raw).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["call_site"], 0x1010);
+        assert_eq!(rows[0]["target"], target_address);
+        assert_eq!(
+            crate::analysis::thunks::bare_name(rows[0]["target_name"].as_str().unwrap()),
+            "strcpy"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

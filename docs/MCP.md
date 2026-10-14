@@ -130,7 +130,7 @@ engine once.
 | `capabilities` | behaviour inferred from imports and exports, by category |
 | `driver_report` | Windows-driver / BYOVD surface: devices, IRP dispatch, decoded IOCTLs |
 | `read_bytes` | an exact-length bounded hex+ascii dump at a static virtual address |
-| `rizin_*` | independent Rizin metadata, symbols, functions, disassembly, xrefs, CFG, and call-graph evidence |
+| `rizin_*` | independent Rizin metadata, symbols, functions, scoped symbol-resolved callees, disassembly, xrefs, CFG, and call-graph evidence |
 | `yarax_scan` / `yarax_scan_range` | native YARA-X matching over the exact workspace or a mapped static-address range |
 | `set_name` | persist an analyst name for the code at an address |
 | `set_note` | attach an analyst note to an address |
