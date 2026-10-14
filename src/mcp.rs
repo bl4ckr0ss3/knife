@@ -29,7 +29,14 @@ const INSTRUCTIONS: &str = concat!(
     "the bytes on disk and never executes the target, so it is safe to point at\n",
     "malware.\n",
     "\n",
-    "Call `open` with the path first: it binds the target, and every later call may\n",
+    "For firmware bundles and archives, call `artifact_inventory` with an absolute\n",
+    "path before extraction. It is target-free, paginated, read-only, and reports\n",
+    "provider metadata rather than claiming member contents were verified.\n",
+    "Use `intel_hex_inventory` to validate an Intel HEX file and recover its load\n",
+    "regions and encoded entry points without executing it.\n",
+    "\n",
+    "For PE, ELF and Mach-O targets, call `open` with the path first: it binds the\n",
+    "target, and every later call may\n",
     "then omit `file`. Call `session_status` next to establish target identity,\n",
     "analysis coverage, limitations, and an evidence record before drawing conclusions.\n",
     "Successful calls include a bounded `knife/resultId`; use `get_retained_result`\n",
@@ -319,6 +326,16 @@ fn call_tool(msg: &Value, srv: &mut Server) -> Result<ToolCallOutput> {
     // result ledger.
     if tools::system_catalog().iter().any(|tool| tool.name == name) {
         let value = tools::dispatch_system(&srv.results, &name, &args)?;
+        if matches!(name.as_str(), "artifact_inventory" | "intel_hex_inventory") {
+            let target_sha256 = value
+                .get("evidence")
+                .and_then(Value::as_array)
+                .and_then(|records| records.first())
+                .and_then(|record| record.get("target_sha256"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            return Ok(retain_output(srv, &name, target_sha256.as_deref(), value));
+        }
         return Ok(output(value, None));
     }
 
@@ -507,7 +524,9 @@ mod tests {
             assert_eq!(t["inputSchema"]["type"], "object");
             let is_system = matches!(
                 name,
-                "provider_status"
+                "artifact_inventory"
+                    | "intel_hex_inventory"
+                    | "provider_status"
                     | "yarax_validate_rules"
                     | "list_retained_results"
                     | "get_retained_result"

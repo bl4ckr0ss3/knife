@@ -2,7 +2,7 @@
 
 use crate::address::StaticVa;
 use crate::analysis::engine;
-use crate::model::SymKind;
+use crate::model::{Binary, SymKind};
 use crate::workspace::Session;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -60,7 +60,47 @@ pub fn resolve_function(session: &Session, selector: &str) -> Option<FunctionSum
 }
 
 pub fn resolve_address(session: &Session, selector: &str) -> Option<StaticVa> {
-    resolve_address_in(&session.an, selector).ok()
+    resolve_address_in_session(session, selector).ok()
+}
+
+/// Resolve a selector against recovered analysis first, then fall back to the
+/// container symbol table.  The fallback matters for architectures Knife can
+/// parse but cannot lift: external providers still need a numeric address and
+/// should not force an agent to manually translate a perfectly good ELF or PE
+/// symbol before every call.
+pub fn resolve_address_in_session(session: &Session, selector: &str) -> Result<StaticVa> {
+    resolve_address_with_symbols(&session.an, &session.bin, selector)
+}
+
+fn resolve_address_with_symbols(
+    analysis: &engine::Analysis,
+    binary: &Binary,
+    selector: &str,
+) -> Result<StaticVa> {
+    let selector = selector.trim();
+    let mut matches = analysis.resolve(selector, None);
+    if matches.is_empty() {
+        let base = engine::display_base(binary);
+        for symbol in &binary.symbols {
+            let exact = symbol.name == selector;
+            let bare_import = matches!(symbol.kind, SymKind::Import | SymKind::Thunk)
+                && crate::analysis::thunks::bare_name(&symbol.name).eq_ignore_ascii_case(selector);
+            if exact || bare_import {
+                if let Some(address) = symbol.addr.checked_add(base) {
+                    if !matches.contains(&address) {
+                        matches.push(address);
+                    }
+                }
+            }
+        }
+    }
+    match matches.as_slice() {
+        [address] => Ok(StaticVa(*address)),
+        [] => parse_address(selector).map(StaticVa).map_err(|_| {
+            anyhow!("no symbol or address matches {selector:?}; use a hexadecimal static VA")
+        }),
+        _ => Err(anyhow!("ambiguous symbol {selector:?}; use a static VA")),
+    }
 }
 
 /// Adjacent recovered entry in static-address order; never wraps at the ends.
@@ -94,6 +134,55 @@ pub fn resolve_address_in(analysis: &engine::Analysis, selector: &str) -> Result
             anyhow!("no symbol or address matches {selector:?}; use a hexadecimal static VA")
         }),
         _ => Err(anyhow!("ambiguous symbol {selector:?}; use a static VA")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Arch, Format, Symbol};
+
+    #[test]
+    fn container_symbols_resolve_without_a_supported_lifter() {
+        let mut binary = Binary::stub(Format::Elf, Arch::Arm);
+        binary.symbols.push(Symbol {
+            addr: 0x14e40,
+            name: "create_session_token".into(),
+            kind: SymKind::Func,
+            size: Some(0x1f8),
+        });
+        let analysis = engine::Analysis::empty(Arch::Arm);
+
+        assert_eq!(
+            resolve_address_with_symbols(&analysis, &binary, "create_session_token").unwrap(),
+            StaticVa(0x14e40)
+        );
+    }
+
+    #[test]
+    fn ambiguous_container_symbols_still_require_an_address() {
+        let mut binary = Binary::stub(Format::Elf, Arch::Arm);
+        binary.symbols.extend([
+            Symbol {
+                addr: 0x1000,
+                name: "duplicate".into(),
+                kind: SymKind::Func,
+                size: None,
+            },
+            Symbol {
+                addr: 0x2000,
+                name: "duplicate".into(),
+                kind: SymKind::Func,
+                size: None,
+            },
+        ]);
+        let error = resolve_address_with_symbols(
+            &engine::Analysis::empty(binary.arch),
+            &binary,
+            "duplicate",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("ambiguous symbol"));
     }
 }
 

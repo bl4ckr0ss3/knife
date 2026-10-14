@@ -79,6 +79,8 @@ engine once.
 | tool | what it answers |
 |---|---|
 | `open` | analyse a binary and make it the session target |
+| `artifact_inventory` | bounded, evidence-linked 7-Zip/firmware member inventory without extraction or target execution |
+| `intel_hex_inventory` | validate Intel HEX checksums and report evidence-linked firmware load regions and entry points |
 | `provider_status` | optional external engines, versions, safety mode, licenses, limitations, and operations |
 | `yarax_validate_rules` | compile bounded inline YARA rules and inspect their diagnostics/inventory without a target |
 | `list_retained_results` | bounded results currently retained by this server process |

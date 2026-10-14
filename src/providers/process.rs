@@ -77,7 +77,7 @@ impl JsonCache {
     }
 }
 
-pub(super) struct TargetSnapshot {
+pub(crate) struct TargetSnapshot {
     path: PathBuf,
 }
 
@@ -257,7 +257,7 @@ pub(crate) fn find_on_path(name: &str) -> Option<PathBuf> {
     })
 }
 
-pub(super) fn executable_identity(executable: &Path) -> String {
+pub(crate) fn executable_identity(executable: &Path) -> String {
     std::fs::metadata(executable)
         .ok()
         .map(|metadata| {

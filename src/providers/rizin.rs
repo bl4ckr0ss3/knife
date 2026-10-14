@@ -107,11 +107,11 @@ pub fn catalog() -> Vec<OperationDescriptor> {
         descriptor("rizin_relocations", "Relocations reported by Rizin with types and physical/virtual addresses.", page_props(), &[], true),
         descriptor("rizin_classes", "Classes and methods recovered by Rizin from language metadata.", page_props(), &[], true),
         descriptor("rizin_functions", "Functions recovered after Rizin automatic analysis, including signatures, complexity, references, variables, and bounds.", page_props(), &[], true),
-        descriptor("rizin_function_info", "Rizin's recovered metadata, signature, references, variables, and bounds for one function.", address_props(), &[], false).with_any_required(&["selector", "address"]),
-        descriptor("rizin_disassemble", "Rizin structured function disassembly with opcode bytes, ESIL, flow type, references, and annotations.", selector_props(), &[], true).with_any_required(&["selector", "address"]),
+        descriptor("rizin_function_info", "Rizin's targeted local recovery of metadata, signature, outgoing references, variables, and bounds for one function.", address_props(), &[], false).with_any_required(&["selector", "address"]),
+        descriptor("rizin_disassemble", "Rizin targeted local function recovery and structured disassembly with opcode bytes, ESIL, flow type, references, and annotations.", selector_props(), &[], true).with_any_required(&["selector", "address"]),
         descriptor("rizin_xrefs_to", "Cross-references Rizin recovered to one static address.", selector_props(), &[], true).with_any_required(&["selector", "address"]),
-        descriptor("rizin_xrefs_from", "Cross-references Rizin recovered from one static address.", selector_props(), &[], true).with_any_required(&["selector", "address"]),
-        descriptor("rizin_cfg", "Rizin control-flow graph nodes for one recovered function.", selector_props(), &[], true).with_any_required(&["selector", "address"]),
+        descriptor("rizin_xrefs_from", "Cross-references Rizin recovered from one static address after targeted local function recovery.", selector_props(), &[], true).with_any_required(&["selector", "address"]),
+        descriptor("rizin_cfg", "Rizin control-flow graph nodes after targeted local recovery of one function.", selector_props(), &[], true).with_any_required(&["selector", "address"]),
         descriptor("rizin_call_graph", "Rizin global call graph after automatic analysis.", page_props(), &[], true),
     ]
 }
@@ -210,11 +210,15 @@ fn command_for(session: &Session, name: &str, args: &Value) -> Result<(String, O
     }
     let address = resolve_address(session, args)?;
     let command = match name {
-        "rizin_function_info" => format!("aaa;afij @ 0x{address:x}"),
-        "rizin_disassemble" => format!("aaa;pdfj @ 0x{address:x}"),
+        // Function-scoped operations must remain useful on large firmware ELFs.
+        // Defining and analyzing only the selected function avoids making every
+        // query pay for whole-program `aaa`; incoming xrefs and global graphs
+        // retain whole-program analysis because their contract requires it.
+        "rizin_function_info" => format!("af @ 0x{address:x};afij @ 0x{address:x}"),
+        "rizin_disassemble" => format!("af @ 0x{address:x};pdfj @ 0x{address:x}"),
         "rizin_xrefs_to" => format!("aaa;axtj @ 0x{address:x}"),
-        "rizin_xrefs_from" => format!("aaa;axfj @ 0x{address:x}"),
-        "rizin_cfg" => format!("aaa;agf json @ 0x{address:x}"),
+        "rizin_xrefs_from" => format!("af @ 0x{address:x};axfj @ 0x{address:x}"),
+        "rizin_cfg" => format!("af @ 0x{address:x};agf json @ 0x{address:x}"),
         other => return Err(anyhow!("unknown Rizin operation '{other}'")),
     };
     Ok((command, Some(address)))
@@ -225,7 +229,8 @@ fn resolve_address(session: &Session, args: &Value) -> Result<u64> {
         .into_iter()
         .find_map(|key| args.get(key).and_then(Value::as_str))
         .ok_or_else(|| anyhow!("missing `selector` (the `address` alias is also accepted)"))?;
-    crate::api::navigation::resolve_address_in(&session.an, selector).map(|address| address.get())
+    crate::api::navigation::resolve_address_in_session(session, selector)
+        .map(|address| address.get())
 }
 
 fn shape_result(

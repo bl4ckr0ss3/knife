@@ -170,6 +170,8 @@ One tool, many jobs, which is the point of a Swiss-army knife:
 | `knife hashes FILE` | MD5 / SHA-1 / SHA-256 and imphash |
 | `knife drv FILE [--reachable]` | kernel-driver / BYOVD analysis: identity, devices, IRP dispatch, IOCTLs, kernel primitives, signing, loldrivers matches |
 | `knife scan FILE` | crypto constants, packer markers, embedded formats |
+| `knife artifact FILE [--limit N]` | bounded 7-Zip/firmware package inventory without extraction or execution |
+| `knife ihex FILE` | validate Intel HEX checksums and report firmware load regions and entry points |
 | `knife map FILE` | whole-file entropy sparkline, packed regions flagged |
 | `knife hex FILE --off O --len L` | hex dump |
 | `knife ls FILE` | archive (.a/.lib) members |
@@ -253,6 +255,13 @@ database. Bind a binary once (`knife mcp --file PATH` or the
 `open` tool) and nothing after it needs a path. Being static, the server
 cannot run the sample it is reading — which is what makes it safe to hand an
 agent a piece of malware.
+
+Firmware and package investigations can begin target-free with
+`artifact_inventory {"path":"/absolute/package.spk"}`. It invokes an optional
+caller-installed `7z`/`7za` (or `KNIFE_7Z`) using a fixed read-only listing,
+returns exact package identity and paginated member metadata, and does not
+extract members. Open a selected contained executable separately for native
+analysis.
 
 ```bash
 claude mcp add knife -- knife mcp

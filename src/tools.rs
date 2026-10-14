@@ -172,6 +172,25 @@ pub fn mutation_catalog() -> Vec<OperationDescriptor> {
 pub fn system_catalog() -> Vec<OperationDescriptor> {
     vec![
         OperationDescriptor::system_read(
+            "artifact_inventory",
+            "List a local archive with bounded 7-Zip metadata without extracting or executing members.",
+            json!({
+                "path": {"type": "string", "description": "absolute path to the archive"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 400},
+                "cursor": {"type": "string"}
+            }),
+            &["path"],
+        )
+        .with_result_mode(ResultMode::Paginated)
+        .with_evidence(),
+        OperationDescriptor::system_read(
+            "intel_hex_inventory",
+            "Validate Intel HEX checksums and report bounded firmware load regions and entry points without executing the image.",
+            json!({"path": {"type": "string", "description": "absolute path to an Intel HEX file"}}),
+            &["path"],
+        )
+        .with_evidence(),
+        OperationDescriptor::system_read(
             "provider_status",
             "Discover optional external analysis providers, versions, safety mode, licenses, limitations, and their operations.",
             json!({}),
@@ -203,6 +222,8 @@ pub fn catalog() -> Vec<OperationDescriptor> {
 
 pub fn dispatch_system(store: &ResultStore, name: &str, args: &Value) -> Result<Value> {
     match name {
+        "artifact_inventory" => crate::artifact::inspect(args),
+        "intel_hex_inventory" => crate::firmware::inspect_intel_hex(args),
         "provider_status" => Ok(json!({
             "providers": crate::providers::statuses(),
         })),

@@ -342,6 +342,16 @@ enum Command {
     },
     /// Crypto constants, packers, embedded formats.
     Scan { file: String },
+    /// List a firmware/package archive without extracting it.
+    Artifact {
+        file: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    /// Validate and map an Intel HEX firmware image.
+    Ihex { file: String },
     /// List archive (.a/.lib) members.
     Ls { file: String },
     /// WAT-style listing of one WebAssembly function (or the function table).
@@ -671,6 +681,12 @@ fn real_main() -> Result<()> {
         Command::Hex { file, off, len } => cmd_hex(&file, off, len),
         Command::Map { file, buckets } => cmd_map(&file, buckets, cli.json),
         Command::Scan { file } => cmd_scan(&file, cli.json),
+        Command::Artifact {
+            file,
+            limit,
+            cursor,
+        } => cmd_artifact(&file, limit, cursor.as_deref(), cli.json),
+        Command::Ihex { file } => cmd_ihex(&file, cli.json),
         Command::Ls { file } => cmd_ls(&file),
         Command::Wat { file, func } => cmd_wat(&file, func.as_deref(), cli.json),
         Command::Completions { shell } => {
@@ -3494,6 +3510,92 @@ fn cmd_scan(file: &str, as_json: bool) -> Result<()> {
             h.name.style(st),
             format!("[{}] {} · {}", h.category, loc, h.note).style(faint()),
         );
+    }
+    Ok(())
+}
+
+fn cmd_artifact(file: &str, limit: usize, cursor: Option<&str>, as_json: bool) -> Result<()> {
+    let absolute =
+        std::fs::canonicalize(file).with_context(|| format!("cannot resolve artifact {file}"))?;
+    let mut args = json!({
+        "path": absolute.to_string_lossy(),
+        "limit": limit,
+    });
+    if let Some(cursor) = cursor {
+        args["cursor"] = json!(cursor);
+    }
+    let result = reknife::artifact::inspect(&args)?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    let data = &result["data"];
+    section_header(&format!(
+        "artifact {} ({})",
+        data["archive_type"].as_str().unwrap_or("unknown"),
+        data["matched"].as_u64().unwrap_or(0)
+    ));
+    println!(
+        "  {}  {}",
+        data["sha256"].as_str().unwrap_or("unknown").style(faint()),
+        data["path"].as_str().unwrap_or(file)
+    );
+    if let Some(entries) = data["entries"].as_array() {
+        for entry in entries {
+            let size = entry["size"]
+                .as_u64()
+                .map(human)
+                .unwrap_or_else(|| "-".into());
+            let encrypted = match entry["encrypted"].as_bool() {
+                Some(true) => " encrypted",
+                _ => "",
+            };
+            println!(
+                "  {:>10}  {}{}",
+                size.style(faint()),
+                entry["path"].as_str().unwrap_or("?"),
+                encrypted.style(amber())
+            );
+        }
+    }
+    if let Some(next) = result["continuation"].as_str() {
+        println!("  {} --cursor {}", "more:".style(faint()), next);
+    }
+    Ok(())
+}
+
+fn cmd_ihex(file: &str, as_json: bool) -> Result<()> {
+    let absolute =
+        std::fs::canonicalize(file).with_context(|| format!("cannot resolve firmware {file}"))?;
+    let result = reknife::firmware::inspect_intel_hex(&json!({
+        "path": absolute.to_string_lossy(),
+    }))?;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    let data = &result["data"];
+    section_header("Intel HEX firmware map");
+    println!(
+        "  {} records · {} data bytes · {} region(s)",
+        data["records"].as_u64().unwrap_or(0),
+        data["data_bytes"].as_u64().unwrap_or(0),
+        data["regions"].as_array().map_or(0, Vec::len)
+    );
+    if let Some(regions) = data["regions"].as_array() {
+        for region in regions {
+            println!(
+                "  {} .. {}",
+                region["start"].as_str().unwrap_or("?"),
+                region["end_exclusive"].as_str().unwrap_or("?")
+            );
+        }
+    }
+    if let Some(entry) = data["start_linear_address"].as_str() {
+        println!("  start linear: {entry}");
+    }
+    if let Some(entry) = data["start_segment_address"].as_str() {
+        println!("  start segment: {entry}");
     }
     Ok(())
 }
