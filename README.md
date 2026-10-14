@@ -259,9 +259,10 @@ agent a piece of malware.
 Firmware and package investigations can begin target-free with
 `artifact_inventory {"path":"/absolute/package.spk"}`. It invokes an optional
 caller-installed `7z`/`7za` (or `KNIFE_7Z`) using a fixed read-only listing,
-returns exact package identity and paginated member metadata, and does not
-extract members. Open a selected contained executable separately for native
-analysis.
+returns exact package identity and paginated member metadata, classifies absolute
+and parent-traversal paths, preserves reported symbolic/hard-link targets, and
+does not extract members. Open a selected contained executable separately for
+native analysis.
 
 ```bash
 claude mcp add knife -- knife mcp

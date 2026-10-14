@@ -3536,9 +3536,11 @@ fn cmd_artifact(file: &str, limit: usize, cursor: Option<&str>, as_json: bool) -
         data["matched"].as_u64().unwrap_or(0)
     ));
     println!(
-        "  {}  {}",
+        "  {}  {} · {} unsafe path(s) · {} link(s)",
         data["sha256"].as_str().unwrap_or("unknown").style(faint()),
-        data["path"].as_str().unwrap_or(file)
+        data["path"].as_str().unwrap_or(file),
+        data["unsafe_paths"].as_u64().unwrap_or(0),
+        data["link_entries"].as_u64().unwrap_or(0),
     );
     if let Some(entries) = data["entries"].as_array() {
         for entry in entries {
@@ -3550,11 +3552,27 @@ fn cmd_artifact(file: &str, limit: usize, cursor: Option<&str>, as_json: bool) -
                 Some(true) => " encrypted",
                 _ => "",
             };
+            let risk = entry["path_risk"]
+                .as_str()
+                .map(|risk| format!(" [{risk}]"))
+                .unwrap_or_default();
+            let link = entry["symbolic_link"]
+                .as_str()
+                .or_else(|| entry["hard_link"].as_str())
+                .map(|target| format!(" -> {target}"))
+                .or_else(|| {
+                    entry["link_kind"]
+                        .as_str()
+                        .map(|kind| format!(" [{kind} link]"))
+                })
+                .unwrap_or_default();
             println!(
-                "  {:>10}  {}{}",
+                "  {:>10}  {}{}{}{}",
                 size.style(faint()),
                 entry["path"].as_str().unwrap_or("?"),
-                encrypted.style(amber())
+                link,
+                encrypted.style(amber()),
+                risk.style(red())
             );
         }
     }

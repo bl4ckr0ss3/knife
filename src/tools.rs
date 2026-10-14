@@ -173,7 +173,7 @@ pub fn system_catalog() -> Vec<OperationDescriptor> {
     vec![
         OperationDescriptor::system_read(
             "artifact_inventory",
-            "List a local archive with bounded 7-Zip metadata without extracting or executing members.",
+            "List a local archive with bounded 7-Zip metadata, unsafe-path classification, and link targets without extracting or executing members.",
             json!({
                 "path": {"type": "string", "description": "absolute path to the archive"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 400},
