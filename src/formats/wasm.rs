@@ -1151,7 +1151,7 @@ mod tests {
         // Corrupt the body's last instruction with SIMD 0xFD: the listing
         // must stop there with a marker, not guess.
         let mut corrupt = bytes.clone();
-        let code_sec = corrupt.iter().position(|b| *b == 0x0B).unwrap() - 0; // find end byte
+        let code_sec = corrupt.iter().position(|b| *b == 0x0B).unwrap(); // find end byte
         let _ = code_sec;
         // Locate the body: last two bytes of the file are the two `end`s.
         let n = corrupt.len();

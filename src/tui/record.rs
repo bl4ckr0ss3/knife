@@ -270,7 +270,9 @@ pub fn record(target: &str, script: &Path, out: &Path) -> Result<()> {
     let steps = parse_script(&text)?;
 
     let session = workspace::Session::open(target, None, crate::ANALYSIS_BUDGET, "the recorder")?;
-    let workspace::Session { bin, bytes, db, an } = session;
+    let workspace::Session {
+        bin, bytes, db, an, ..
+    } = session;
     let mut sinks = audit::run(&an, &bin, &bytes);
     sinks.sort_by(|a, b| {
         b.severity
