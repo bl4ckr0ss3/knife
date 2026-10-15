@@ -2577,13 +2577,24 @@ impl App {
         }
         if self.investigation_open && self.investigation_focused && self.prompt.is_none() {
             match key.code {
-                KeyCode::Char('i') => self.ask(Ask::AgentQuestion),
-                KeyCode::Char('a') => self.start_quick_investigation(false),
-                KeyCode::Char('t') => self.start_quick_investigation(true),
-                KeyCode::Char('r') => self.retry_last_investigation(),
-                KeyCode::Char('S') => self.start_agent_setup(),
-                KeyCode::Char('f') => self.investigation_follow = !self.investigation_follow,
-                KeyCode::Char('z') => self.toggle_pane_zoom(),
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.start_quick_investigation(false)
+                }
+                KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.start_quick_investigation(true)
+                }
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.retry_last_investigation()
+                }
+                KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.start_agent_setup()
+                }
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.investigation_follow = !self.investigation_follow
+                }
+                KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    self.toggle_pane_zoom()
+                }
                 KeyCode::Tab => {
                     self.investigation_focused = false;
                     self.investigation_follow = false;
@@ -2595,7 +2606,7 @@ impl App {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.execute_command("interrupt")
                 }
-                KeyCode::Char('e') => {
+                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::ALT) => {
                     self.investigation_evidence_detail = !self.investigation_evidence_detail;
                     self.investigation_message_scroll = 0;
                 }
@@ -2663,13 +2674,6 @@ impl App {
                         .min(maximum);
                     self.investigation_chat_follow = self.investigation_message_offset == 0
                         && self.investigation_message_scroll == maximum;
-                }
-                KeyCode::Char('k') => {
-                    self.investigation_selection = self.investigation_selection.saturating_sub(1)
-                }
-                KeyCode::Char('j') => {
-                    self.investigation_selection = (self.investigation_selection + 1)
-                        .min(self.investigation.evidence.len().saturating_sub(1))
                 }
                 KeyCode::Enter => self.follow_investigation_evidence(),
                 KeyCode::Char(':') => {}
@@ -5095,7 +5099,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
         assert_eq!(app.investigation_message_offset, 1);
         assert!(rendered(&mut app, 110, 30).contains("Explain this comparison"));
-        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::ALT));
         assert!(app.investigation_evidence_detail);
         assert!(rendered(&mut app, 110, 30).contains("STATIC   0x1000"));
         app.follow_investigation_evidence();
@@ -5145,7 +5149,7 @@ mod tests {
         let mut app = two_functions();
         app.splash = false;
         app.execute_command("agent");
-        app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT));
         let panes = app.panes(ratatui::layout::Rect::new(0, 0, 160, 40));
         assert!(panes.agent.width >= 36);
         assert!(panes.listing.width > 0);
@@ -5189,16 +5193,16 @@ mod tests {
         app.execute_command("agent");
         app.on_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
 
-        for character in "hello".chars() {
+        for character in "analyze this, trace and explain".chars() {
             app.on_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
         }
 
         let prompt = app.prompt.as_ref().expect("direct typing opens a prompt");
         assert_eq!(prompt.ask, Ask::AgentQuestion);
-        assert_eq!(prompt.input, "hello");
+        assert_eq!(prompt.input, "analyze this, trace and explain");
         let screen = rendered(&mut app, 160, 40);
         assert!(screen.contains("YOU → Knife Agent"));
-        assert!(screen.contains("hello"));
+        assert!(screen.contains("analyze this, trace and explain"));
         assert!(screen.contains("Enter send"));
         assert!(screen.contains("Chat composer active"));
     }
@@ -5217,8 +5221,8 @@ mod tests {
             .unwrap();
         app.investigation_activity = "Failed: provider unavailable".into();
         let screen = rendered(&mut app, 160, 40);
-        assert!(screen.contains("r  retry last question"));
-        assert!(screen.contains("S  provider setup"));
+        assert!(screen.contains("Alt+R  retry last question"));
+        assert!(screen.contains("Alt+S  provider setup"));
     }
 
     #[test]

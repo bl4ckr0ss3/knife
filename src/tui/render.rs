@@ -274,9 +274,9 @@ fn investigation_desk(f: &mut Frame, app: &App) {
         TLine::from(Span::styled(
             if app.investigation_focused {
                 if app.investigation_zoomed {
-                    " a analyze · t triage · type to chat · r retry · z split view"
+                    " type to chat · Alt+A analyze · Alt+T triage · Alt+Z split"
                 } else {
-                    " a analyze · t triage · type to chat · r retry · z maximize"
+                    " type to chat · Alt+A analyze · Alt+T triage · Alt+Z maximize"
                 }
             } else {
                 " F6, Ctrl+Right, or Ctrl+Tab focuses this desk"
@@ -335,7 +335,7 @@ fn investigation_desk(f: &mut Frame, app: &App) {
         }
     }
     lines.push(TLine::from(Span::styled(
-        " EVIDENCE  j/k or Shift+↑↓ select · e inspect · Enter follow",
+        " EVIDENCE  Shift+↑↓ select · Alt+E inspect · Enter follow",
         Style::default().fg(accent()).add_modifier(Modifier::BOLD),
     )));
     let evidence_height = usize::from(desk.height.saturating_sub(2)).saturating_sub(lines.len());
@@ -516,11 +516,11 @@ fn agent_conversation(app: &App) -> Vec<TLine<'static>> {
             TLine::from("validation logic, or request a complete evidence-led triage."),
             TLine::default(),
             TLine::from(Span::styled(
-                "a  analyze selection  t  triage target  i  custom question",
+                "type a question  ·  Alt+A analyze selection  ·  Alt+T triage",
                 Style::default().fg(analyst_color()),
             )),
             TLine::from(Span::styled(
-                "S  provider setup     z  maximize desk  e  inspect evidence",
+                "Alt+S setup  ·  Alt+Z layout  ·  Alt+E inspect evidence",
                 Style::default().fg(faint()),
             )),
         ];
@@ -605,7 +605,7 @@ fn agent_conversation(app: &App) -> Vec<TLine<'static>> {
             ),
         ]));
         lines.push(TLine::from(Span::styled(
-            "r  retry last question     S  provider setup",
+            "Alt+R  retry last question     Alt+S  provider setup",
             Style::default()
                 .fg(warning_color())
                 .add_modifier(Modifier::BOLD),
@@ -733,7 +733,7 @@ fn evidence_detail_lines(app: &App) -> Vec<TLine<'static>> {
         .nth(app.investigation_selection)
     else {
         return vec![TLine::from(Span::styled(
-            "No evidence selected. Press e to return to conversation.",
+            "No evidence selected. Press Alt+E to return to conversation.",
             Style::default().fg(faint()),
         ))];
     };

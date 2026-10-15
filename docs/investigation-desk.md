@@ -97,15 +97,16 @@ an `.investigation.json` file. Press `i` to compose an agent message. `F6` and
 to disassembly, and only `Ctrl+Tab` toggles between them. This makes the mode
 change visually unmistakable and repeated entry commands idempotent. Focus
 changes preserve the thread, selection, and scroll position. The focused desk
-uses a bright rounded border and a `FOCUSED` label; press `z` to move between
-the full agent workspace and the side-by-side analysis layout. Press `a` for an evidence-led analysis of
-the current selection, `t` for complete-target triage, or `i` to write a custom
-question. With the desk focused, ordinary typing also opens the inline chat
-composer and preserves the first character; `Enter` sends and `Esc` cancels.
-After a provider or network failure, `r` retries the latest saved
+uses a bright rounded border and a `FOCUSED` label; press `Alt+Z` to move between
+the full agent workspace and the side-by-side analysis layout. With the desk
+focused, every ordinary printable letter belongs to the inline chat composer,
+including the first character; `Enter` sends and `Esc` cancels. This means a
+question beginning with "analyze", "trace", or "explain" cannot accidentally
+trigger a pane action. Press `Alt+A` for an evidence-led analysis of the current
+selection or `Alt+T` for complete-target triage. After a provider or network failure, `Alt+R` retries the latest saved
 question without adding a duplicate ledger entry. While follow mode is enabled, completed agent tools move the listing
 to their first static evidence address. Manual focus on the listing pauses that
-behavior; `f` toggles it explicitly. `j`/`k` or Shift+Up/Down selects evidence; Enter navigates
+behavior; `Alt+F` toggles it explicitly. Shift+Up/Down selects evidence; Enter navigates
 to its first static location without closing the desk. Esc closes the desk;
 `:` opens command input while leaving it visible.
 The desk separates conversation from findings. Its chat pane shows a compact
@@ -116,10 +117,10 @@ older/newer messages. Scrolling is clamped so the conversation cannot disappear
 into an empty pane. The latest 32 non-tool messages form the bounded visible
 window. New answers follow the bottom automatically; scrolling upward changes
 the title to `HISTORY`, and reaching the bottom or pressing End restores `LIVE`.
-Use `j`/`k` or Shift+Up/Down to select evidence.
-Press `e` to inspect selected evidence in the upper panel: producer, typed hex
+Use Shift+Up/Down to select evidence.
+Press `Alt+E` to inspect selected evidence in the upper panel: producer, typed hex
 locations, observation/inference/unknown statements, confidence and limitations.
-The same scrolling keys move through these details; `e` returns to conversation. Sending a new
+The same scrolling keys move through these details; `Alt+E` returns to conversation. Sending a new
 message and receiving an answer automatically return the upper pane to the
 conversation so an old evidence-detail selection cannot hide the response.
 Conversation badges identify `YOU` and the configured model by its readable

@@ -14,6 +14,10 @@
   without losing the first character. The draft, selected model identity, and
   send/cancel guidance stay inside the conversation instead of the global
   command footer.
+- Agent-desk actions now use `Alt+A/T/R/S/F/Z/E`, leaving every unmodified
+  printable letter available to start a message. Questions beginning with
+  action-like words such as "analyze", "trace", or "explain" no longer trigger
+  a shortcut or lose their first character.
 - Plain Up/Down now scrolls the focused agent chat or evidence detail, with
   Ctrl+Up/Down for faster movement and Home/End for bounds. `j`/`k` or
   Shift+Up/Down selects findings, and scrolling is clamped before blank space.

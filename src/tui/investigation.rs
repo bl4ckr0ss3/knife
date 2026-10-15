@@ -140,7 +140,8 @@ impl App {
             .rev()
             .any(|message| message.role == Role::Analyst && !message.text.trim().is_empty())
         {
-            self.status = "No previous agent question to retry; press i, a, or t".into();
+            self.status =
+                "No previous agent question to retry; type a message or press Alt+A/Alt+T".into();
             return;
         }
         self.investigation_open = true;
@@ -289,7 +290,7 @@ impl App {
     fn finish_agent_setup_without_status(&mut self) {
         self.investigation_activity = self.agent_config.status();
         self.status = match crate::agent::ConfiguredProvider::from_config(&self.agent_config) {
-            Ok(_) => "Agent provider ready and remembered; press i to start a conversation".into(),
+            Ok(_) => "Agent provider ready and remembered; press F6 and type to chat".into(),
             Err(error) => format!("Provider setup incomplete: {error}"),
         };
     }
