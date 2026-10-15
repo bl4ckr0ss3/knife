@@ -314,7 +314,129 @@ pub(super) fn read_bounded(
         let room = output_limit.saturating_sub(kept.len());
         let store = read.min(room);
         kept.write_all(&buffer[..store])?;
-        truncated |= store != read;
+        if store < read {
+            truncated = true;
+        }
+    }
+    Ok((kept, truncated))
+}
+
+/// Run a bounded provider process with an exact stdin payload, forwarding
+/// stdout chunks to `on_output` as they arrive so callers can show progress
+/// while the provider is still running. The returned output, stderr, exit
+/// status, and truncation flag match `run_process_with_input` exactly; the
+/// callback stops receiving chunks once the output limit is reached.
+pub(crate) fn run_process_streaming<I, F>(
+    executable: &Path,
+    args: I,
+    input: Vec<u8>,
+    deadline: Duration,
+    output_limit: usize,
+    mut on_output: F,
+) -> Result<ProcessOutput>
+where
+    I: IntoIterator<Item = OsString>,
+    F: FnMut(&[u8]),
+{
+    let mut command = Command::new(executable);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start {}", executable.display()))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("missing child stdin"))?;
+    let stdin_writer = thread::spawn(move || stdin.write_all(&input));
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("missing child stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("missing child stderr"))?;
+    let (chunk_sender, chunk_receiver) = std::sync::mpsc::channel::<Vec<u8>>();
+    let stdout_reader =
+        thread::spawn(move || read_bounded_chunked(stdout, output_limit, chunk_sender));
+    let stderr_reader = thread::spawn(move || read_bounded(stderr, output_limit));
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= deadline {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdin_writer.join();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(anyhow!(
+                "external provider exceeded its {} second deadline",
+                deadline.as_secs()
+            ));
+        }
+        while let Ok(chunk) = chunk_receiver.try_recv() {
+            on_output(&chunk);
+        }
+        thread::sleep(POLL_INTERVAL);
+    };
+    while let Ok(chunk) = chunk_receiver.try_recv() {
+        on_output(&chunk);
+    }
+    stdin_writer
+        .join()
+        .map_err(|_| anyhow!("provider stdin writer panicked"))??;
+    let (stdout, stdout_truncated) = stdout_reader
+        .join()
+        .map_err(|_| anyhow!("provider stdout reader panicked"))??;
+    let (stderr, stderr_truncated) = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("provider stderr reader panicked"))??;
+    Ok(ProcessOutput {
+        status,
+        stdout,
+        stderr,
+        truncated: stdout_truncated || stderr_truncated,
+    })
+}
+
+/// Bounded reader that also forwards every retained chunk so a caller can
+/// stream progress. Chunks stop being forwarded once the limit is reached.
+fn read_bounded_chunked(
+    mut reader: impl Read,
+    output_limit: usize,
+    sender: std::sync::mpsc::Sender<Vec<u8>>,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut kept = Vec::new();
+    let mut buffer = [0u8; 16 * 1024];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let room = output_limit.saturating_sub(kept.len());
+        let store = read.min(room);
+        kept.write_all(&buffer[..store])?;
+        if store < read {
+            truncated = true;
+        }
+        if store > 0 && !truncated {
+            let _ = sender.send(buffer[..store].to_vec());
+        }
     }
     Ok((kept, truncated))
 }

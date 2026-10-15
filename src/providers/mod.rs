@@ -7,6 +7,7 @@ pub mod gdb;
 pub mod ghidra;
 pub(crate) mod process;
 pub mod rizin;
+pub(crate) mod stream;
 pub mod yarax;
 
 use serde::Serialize;

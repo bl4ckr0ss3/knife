@@ -43,6 +43,19 @@ pub enum AgentEvent {
 pub trait ChatProvider {
     fn complete(&mut self, messages: &[Value], tools: &[Value]) -> Result<Value>;
 
+    /// Complete a turn while reporting provider progress (streamed bytes) to
+    /// `progress`. The default ignores progress and falls back to `complete`,
+    /// so simple providers need no streaming implementation.
+    fn complete_with_progress(
+        &mut self,
+        messages: &[Value],
+        tools: &[Value],
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<Value> {
+        let _ = progress;
+        self.complete(messages, tools)
+    }
+
     fn tool_result(&self, call: &Value, name: &str, content: String) -> Result<Value> {
         let _ = call;
         Ok(json!({"role":"tool","tool_name":name,"content":content}))
@@ -317,6 +330,20 @@ impl ChatProvider for ConfiguredProvider {
         }
     }
 
+    fn complete_with_progress(
+        &mut self,
+        messages: &[Value],
+        tools: &[Value],
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<Value> {
+        match self {
+            Self::Ollama(provider) => provider.complete_with_progress(messages, tools, progress),
+            Self::OpenAiCompatible(provider) => {
+                provider.complete_with_progress(messages, tools, progress)
+            }
+        }
+    }
+
     fn tool_result(&self, call: &Value, name: &str, content: String) -> Result<Value> {
         match self {
             Self::Ollama(provider) => provider.tool_result(call, name, content),
@@ -424,6 +451,97 @@ impl ChatProvider for Ollama {
             .ok_or_else(|| anyhow!("model response has no assistant message"))?;
         Ok(message.clone())
     }
+
+    fn complete_with_progress(
+        &mut self,
+        messages: &[Value],
+        tools: &[Value],
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<Value> {
+        let mut request = json!({
+            "model": self.model,
+            "messages": messages,
+            "stream": true,
+            "max_tokens": 8192
+        });
+        if !tools.is_empty() {
+            request["tools"] = json!(tools);
+        }
+        let payload = serde_json::to_string(&request)?;
+        if payload.len() > MAX_CONTEXT {
+            return Err(anyhow!(
+                "conversation exceeds the 512 KiB request budget after compaction"
+            ));
+        }
+        let curl = crate::providers::process::find_on_path("curl")
+            .ok_or_else(|| anyhow!("local model transport requires curl"))?;
+        let args: Vec<OsString> = [
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--no-buffer",
+            "--noproxy",
+            "*",
+            "--connect-timeout",
+            "3",
+            "--max-time",
+            "60",
+            "--header",
+            "Content-Type: application/json",
+            "--data-binary",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .chain([
+            OsString::from(&payload),
+            OsString::from(format!("{}/api/chat", self.endpoint)),
+        ])
+        .collect();
+        let output = stream_process(&curl, args, payload.into_bytes(), progress)?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "Ollama request failed or exceeded its output bound"
+            ));
+        }
+        let message = match crate::providers::stream::ollama_ndjson_message(&output.stdout) {
+            Ok(message) => message,
+            // The endpoint may not honor streaming; retry once without it.
+            Err(_) => return self.complete(messages, tools),
+        };
+        Ok(message)
+    }
+}
+
+/// Run a streaming provider request and report received bytes as progress.
+fn stream_process(
+    curl: &Path,
+    args: Vec<OsString>,
+    payload: Vec<u8>,
+    progress: &mut dyn FnMut(&str),
+) -> Result<crate::providers::process::ProcessOutput> {
+    let mut received = 0usize;
+    let mut reported = 0usize;
+    let output = crate::providers::process::run_process_streaming(
+        curl,
+        args,
+        payload,
+        Duration::from_secs(65),
+        MAX_PROVIDER_RESPONSE,
+        |chunk| {
+            received = received.saturating_add(chunk.len());
+            if received.saturating_sub(reported) >= 2048 {
+                reported = received;
+                progress(&format!("Streaming reply… {} kB", received / 1024));
+            }
+        },
+    )?;
+    if output.truncated {
+        return Err(anyhow!(
+            "provider response exceeded Knife's {} MiB safety limit",
+            MAX_PROVIDER_RESPONSE / (1024 * 1024)
+        ));
+    }
+    Ok(output)
 }
 
 #[derive(Clone, Copy)]
@@ -602,6 +720,76 @@ impl ChatProvider for OpenAiCompatible {
             .filter(|message| message.is_object())
             .cloned()
             .ok_or_else(|| anyhow!("model response has no assistant message"))
+    }
+
+    fn complete_with_progress(
+        &mut self,
+        messages: &[Value],
+        tools: &[Value],
+        progress: &mut dyn FnMut(&str),
+    ) -> Result<Value> {
+        let mut request = json!({"model": self.model, "messages": messages, "stream": true});
+        if !tools.is_empty() {
+            request["tools"] = json!(tools);
+        }
+        let payload = serde_json::to_vec(&request)?;
+        if payload.len() > MAX_CONTEXT {
+            return Err(anyhow!(
+                "conversation exceeds the 512 KiB request budget after compaction"
+            ));
+        }
+        let curl = crate::providers::process::find_on_path("curl")
+            .ok_or_else(|| anyhow!("hosted model transport requires curl"))?;
+        let headers = SecretHeaderFile::create(
+            &self.api_key,
+            self.site_url.as_deref(),
+            self.app_name.as_deref(),
+        )?;
+        let args: Vec<OsString> = [
+            "--silent",
+            "--show-error",
+            "--fail-with-body",
+            "--no-buffer",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "60",
+            "--header",
+            "Content-Type: application/json",
+            "--header",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .chain([
+            OsString::from(format!("@{}", headers.path.display())),
+            OsString::from("--data-binary"),
+            OsString::from("@-"),
+            OsString::from(&self.endpoint),
+        ])
+        .collect();
+        let output = stream_process(&curl, args, payload, progress)?;
+        if !output.status.success() {
+            let detail = provider_error_detail(&output.stdout, &output.stderr);
+            return Err(anyhow!(
+                "{} request failed (transport exit {}){}",
+                self.service.label(),
+                output
+                    .status
+                    .code()
+                    .map_or_else(|| "unknown".into(), |code| code.to_string()),
+                if detail.is_empty() {
+                    "; check network access, API key, model availability, and account credits"
+                        .into()
+                } else {
+                    format!(": {detail}")
+                }
+            ));
+        }
+        match crate::providers::stream::openai_sse_message(&output.stdout) {
+            Ok(message) => Ok(message),
+            // The endpoint may not honor streaming; retry once without it.
+            Err(_) => self.complete(messages, tools),
+        }
     }
 
     fn tool_result(&self, call: &Value, _: &str, content: String) -> Result<Value> {
@@ -849,7 +1037,9 @@ pub fn converse_with_ui_context(
             round + 1
         )));
         let schemas: Vec<_> = catalog.iter().filter(|operation|active.contains(operation.name)).map(|operation|json!({"type":"function","function":{"name":operation.name,"description":operation.description,"parameters":operation.params}})).collect();
-        let response = provider.complete(&messages, &schemas)?;
+        let response = provider.complete_with_progress(&messages, &schemas, &mut |update| {
+            events(AgentEvent::Activity(update.to_string()))
+        })?;
         if cancellation.is_cancelled() {
             return Err(anyhow!("investigation cancelled"));
         }
@@ -958,7 +1148,9 @@ pub fn converse_with_ui_context(
         "Partial investigation: the agent reached {limit_reason} after {count} tool calls. Knife preserved {} evidence record(s) and the tool transcript. Review the findings below or ask a narrower follow-up question to continue.",
         evidence.len()
     );
-    let answer = match provider.complete(&messages, &[]) {
+    let answer = match provider.complete_with_progress(&messages, &[], &mut |update| {
+        events(AgentEvent::Activity(update.to_string()))
+    }) {
         Ok(response) => response
             .get("content")
             .and_then(Value::as_str)
@@ -1610,5 +1802,130 @@ mod tests {
             .unwrap();
         server.join().unwrap();
         assert_eq!(message["content"], "ready");
+    }
+
+    #[test]
+    fn hosted_streaming_reassembles_messages_and_reports_progress() {
+        if crate::providers::process::find_on_path("curl").is_none() {
+            return;
+        }
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 8192];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..read]);
+                if read == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(
+                headers.contains("\"stream\":true") || headers.contains("\"stream\": true"),
+                "{headers}"
+            );
+            let filler = "a".repeat(4096);
+            let content_event = serde_json::json!({
+                "choices": [{"delta": {"content": filler}}]
+            });
+            let call_event = serde_json::json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_7",
+                    "function": {"name": "strings", "arguments": "{}"}
+                }]}}]
+            });
+            let body = format!("data: {content_event}\n\ndata: {call_event}\n\ndata: [DONE]\n\n");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+        let mut provider = OpenAiCompatible {
+            service: OpenAiService::Compatible,
+            model: "test/model".into(),
+            endpoint: format!("http://{address}/v1/chat/completions"),
+            api_key: "test-secret".into(),
+            site_url: None,
+            app_name: None,
+        };
+        let mut updates = Vec::new();
+        let message = provider
+            .complete_with_progress(
+                &[json!({"role":"user","content":"hi"})],
+                &[],
+                &mut |update| updates.push(update.to_string()),
+            )
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            message["tool_calls"][0]["function"]["name"], "strings",
+            "{message}"
+        );
+        assert!(
+            updates.iter().any(|update| update.contains("Streaming")),
+            "{updates:?}"
+        );
+    }
+
+    #[test]
+    fn ollama_streaming_reassembles_messages_and_reports_progress() {
+        if crate::providers::process::find_on_path("curl").is_none() {
+            return;
+        }
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 8192];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..read]);
+                if read == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let filler = "b".repeat(4096);
+            let body = format!(
+                "{{\"message\":{{\"role\":\"assistant\",\"content\":\"{filler}\"}},\"done\":false}}\n\
+                 {{\"message\":{{\"role\":\"assistant\",\"content\":\"\"}},\"done\":true}}\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        });
+        let mut provider = Ollama {
+            model: "qwen3".into(),
+            endpoint: format!("http://{address}"),
+        };
+        let mut updates = Vec::new();
+        let message = provider
+            .complete_with_progress(
+                &[json!({"role":"user","content":"hi"})],
+                &[],
+                &mut |update| updates.push(update.to_string()),
+            )
+            .unwrap();
+        server.join().unwrap();
+        assert!(message["content"]
+            .as_str()
+            .is_some_and(|content| content.starts_with("bbb")));
+        assert!(
+            updates.iter().any(|update| update.contains("Streaming")),
+            "{updates:?}"
+        );
     }
 }

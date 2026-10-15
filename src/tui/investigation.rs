@@ -411,7 +411,7 @@ impl App {
                         self.investigation_chat_follow = true;
                         self.investigation_message_scroll =
                             crate::tui::render::investigation_scroll_max(self);
-                        self.investigation_activity = if value
+                        let mut status = if value
                             .get("limited")
                             .and_then(serde_json::Value::as_bool)
                             .unwrap_or(false)
@@ -424,8 +424,25 @@ impl App {
                                     .unwrap_or("agent tool budget reached")
                             )
                         } else {
-                            "Completed; evidence and tool response saved".into()
+                            "Completed; evidence and tool response saved".to_string()
                         };
+                        // Substantial reports auto-export for the analyst to
+                        // review and publish; one-liners never touch disk.
+                        if value
+                            .get("assistant")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(is_report_shaped)
+                        {
+                            match self.write_investigation_report(&self.investigation) {
+                                Ok(path) => {
+                                    status.push_str(&format!(" Report: {}", path.display()))
+                                }
+                                Err(error) => {
+                                    status.push_str(&format!(" Report export failed: {error:#}"))
+                                }
+                            }
+                        }
+                        self.investigation_activity = status;
                     }
                     Err(error) => {
                         self.investigation_activity = format!("Could not persist result: {error}")
@@ -448,9 +465,19 @@ impl App {
             self.status = "No agent answer to export yet; ask a question first".into();
             return;
         }
+        match self.write_investigation_report(&self.investigation) {
+            Ok(path) => self.status = format!("Report exported to {}", path.display()),
+            Err(error) => self.status = format!("Could not write the report: {error:#}"),
+        }
+    }
+
+    /// Build and write the shareable Markdown report for a ledger snapshot.
+    fn write_investigation_report(
+        &self,
+        ledger: &crate::api::investigation::Investigation,
+    ) -> anyhow::Result<std::path::PathBuf> {
         let Some(database) = self.db.path() else {
-            self.status = "this workspace has no persistent database".into();
-            return;
+            anyhow::bail!("this workspace has no persistent database");
         };
         let name = Path::new(&self.bin.path)
             .file_name()
@@ -464,14 +491,10 @@ impl App {
             architecture,
             sha256: self.db.sha256.as_str(),
         };
-        let report = crate::api::report::markdown(&target, &self.investigation);
+        let report = crate::api::report::markdown(&target, ledger);
         let path = database.with_extension("report.md");
-        match std::fs::write(&path, report) {
-            Ok(()) => {
-                self.status = format!("Report exported to {}", path.display());
-            }
-            Err(error) => self.status = format!("Could not write the report: {error}"),
-        }
+        std::fs::write(&path, report)?;
+        Ok(path)
     }
 
     pub fn investigation_question(&mut self, question: String) {
@@ -574,6 +597,12 @@ impl App {
     }
 }
 
+/// A substantial answer follows the report contract's opening section; only
+/// those auto-export to the shareable Markdown file.
+fn is_report_shaped(answer: &str) -> bool {
+    answer.contains("## Verdict")
+}
+
 fn model_choices(provider: &str, current: &str) -> Vec<String> {
     let suggestions: &[&str] = match provider {
         "openrouter" => &[
@@ -607,7 +636,16 @@ fn quick_investigation_prompt(target_wide: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::is_report_shaped;
     use super::quick_investigation_prompt;
+
+    #[test]
+    fn only_report_shaped_answers_auto_export() {
+        assert!(is_report_shaped("## Verdict\nA benign crackme."));
+        assert!(is_report_shaped("Preamble\n## Verdict\n..."));
+        assert!(!is_report_shaped("Short conversational reply."));
+        assert!(!is_report_shaped(""));
+    }
 
     #[test]
     fn quick_prompts_request_evidence_and_honest_limits() {

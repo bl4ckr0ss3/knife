@@ -57,7 +57,7 @@ pub fn read_catalog() -> Vec<OperationDescriptor> {
         tool("discover_investigation_tools", "Find tools by investigation task (triage, code, strings, validation, memory, external, all), with operation policy and target availability.", json!({"task":{"type":"string","enum":["triage","code","strings","validation","memory","external","all"]}}), &["task"]),
         tool("investigation_status", "Read saved investigation questions, hypotheses, recent conversation, and evidence counts for the active project.", json!({}), &[]),
         tool("investigation_conflicts", "Inspect hypotheses with supporting and contradicting evidence links; this reports recorded conflicts rather than automatically proving contradictions.", json!({}), &[]),
-        tool("investigation_get_evidence", "Retrieve one exact persisted evidence record by its ID from the active project investigation.", json!({"evidence_id":{"type":"string"}}), &["evidence_id"]),
+        tool("investigation_get_evidence", "Retrieve one persisted evidence record by its ID from the active project investigation; a unique ID prefix is accepted.", json!({"evidence_id":{"type":"string"}}), &["evidence_id"]),
         tool("explain_function", "Collect evidence-backed function context, bounded instructions, callers, callees, and pseudocode for an explanation; recovered semantics remain inference.", selector_props(), &[]).with_any_required(&["selector", "address"]).with_evidence(),
         tool("trace_string_usage", "Follow matching string literals to recovered reference instructions and containing functions with bounded coverage and evidence.", json!({"query":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":20},"cursor":{"type":"string"}}), &["query"]).with_result_mode(ResultMode::Paginated).with_evidence(),
         tool("inspect_input_validation", "Inspect a function's comparison/conditional-branch sites, validation API calls, and dangerous-argument provenance; candidate checks are not proof of a complete validation path.", selector_props(), &[]).with_any_required(&["selector","address"]).with_evidence(),
@@ -367,13 +367,7 @@ pub fn dispatch(sess: &Session, name: &str, args: &Value) -> Result<Value> {
                 &investigation_path(sess)?,
                 &sess.db.sha256,
             )?;
-            serde_json::to_value(
-                ledger
-                    .evidence
-                    .get(id)
-                    .ok_or_else(|| anyhow!("unknown saved evidence"))?,
-            )
-            .map_err(Into::into)
+            serde_json::to_value(ledger.resolve_evidence(id)?).map_err(Into::into)
         }
         "explain_function" => explain_function(sess, args),
         "trace_string_usage" => trace_string_usage(sess, args),

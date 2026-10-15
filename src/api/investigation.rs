@@ -334,10 +334,71 @@ fn check_text(text: &str) -> Result<()> {
     Ok(())
 }
 
+impl Investigation {
+    /// Resolve one persisted evidence record by exact ID or unique prefix.
+    ///
+    /// Prefix matching keeps abbreviated citations usable without trusting a
+    /// model to copy a 70-character ID perfectly; an ambiguous prefix is
+    /// refused so a shortened ID can never silently select the wrong record.
+    /// Writes (linking, recording) still require exact IDs.
+    pub fn resolve_evidence(&self, requested: &str) -> Result<&EvidenceRecord> {
+        if let Some(record) = self.evidence.get(requested) {
+            return Ok(record);
+        }
+        let matches: Vec<&EvidenceRecord> = self
+            .evidence
+            .range(requested.to_owned()..)
+            .take_while(|(id, _)| id.starts_with(requested))
+            .map(|(_, record)| record)
+            .collect();
+        match matches.as_slice() {
+            [record] => Ok(record),
+            [] => Err(anyhow!("unknown saved evidence '{requested}'")),
+            _ => Err(anyhow!(
+                "evidence prefix '{requested}' matches {} records; cite a longer prefix",
+                matches.len()
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::evidence::EvidenceKind;
+
+    #[test]
+    fn evidence_ids_resolve_by_exact_match_or_unique_prefix() {
+        let mut ledger = Investigation::new("target");
+        for summary in ["first observation", "second observation"] {
+            ledger
+                .record(crate::api::evidence::EvidenceRecord::new(
+                    "target",
+                    "triage",
+                    EvidenceKind::StaticAnalysis,
+                    summary,
+                    vec![],
+                    vec![],
+                    vec![],
+                ))
+                .unwrap();
+        }
+        let (first_id, first_summary) = ledger.evidence.iter().next().expect("records are saved");
+        assert_eq!(
+            ledger.resolve_evidence(first_id).unwrap().summary,
+            first_summary.summary
+        );
+        let prefix = first_id[..12].to_string();
+        assert_eq!(
+            ledger.resolve_evidence(&prefix).unwrap().summary,
+            first_summary.summary
+        );
+        // A prefix matching several records is refused, never guessed.
+        let ambiguous = first_id[..3].to_string();
+        let error = ledger.resolve_evidence(&ambiguous).unwrap_err().to_string();
+        assert!(error.contains("matches 2 records"), "{error}");
+        assert!(ledger.resolve_evidence("ev-ffffffff").is_err());
+    }
 
     #[test]
     fn disk_round_trip_preserves_target_and_refuses_foreign_overwrites() {
