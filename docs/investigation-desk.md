@@ -47,6 +47,10 @@ tool calls, and serialized context is capped at 512 KiB. Before a new request,
 Knife excludes saved tool transcripts from protocol history and retains a
 bounded recent conversation window. Live tool results are also bounded, so a
 large saved investigation cannot prevent a focused follow-up from starting.
+If the model consumes the round or tool budget, Knife disables tools for one
+final synthesis turn. A failed final synthesis still saves a clearly marked
+partial answer, collected evidence, and tool activity instead of discarding the
+investigation.
 
 The model can invoke registered analysis reads. Tool activity appears while it
 works; the resulting answer, tool-response previews, and evidence records are
@@ -89,8 +93,10 @@ to their first static evidence address. Manual focus on the listing pauses that
 behavior; `f` toggles it explicitly. Up/Down selects evidence; Enter navigates
 to its first static location without closing the desk. Esc closes the desk;
 `:` opens command input while leaving it visible.
-The desk separates conversation from findings. PgUp/PgDn browse older/newer
-messages; Ctrl+Up/Down scroll the selected message, including saved tool output.
+The desk separates conversation from findings. Its chat pane shows a compact
+thread of recent analyst and Knife messages rather than exposing protocol tool
+transcripts as chat. PgUp/PgDn browse older/newer messages; Ctrl+Up/Down scroll
+the thread.
 Press `e` to inspect selected evidence in the upper panel: producer, typed hex
 locations, observation/inference/unknown statements, confidence and limitations.
 Ctrl+Up/Down scrolls these details; `e` returns to conversation. Sending a new

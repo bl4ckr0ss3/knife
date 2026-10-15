@@ -165,13 +165,7 @@ fn investigation_desk(f: &mut Frame, app: &App) {
     f.render_widget(Clear, desk);
     let conversation_height = desk.height / 2;
     let conversation_area = Rect::new(desk.x, desk.y, desk.width, conversation_height);
-    let message = app
-        .investigation
-        .messages
-        .iter()
-        .rev()
-        .nth(app.investigation_message_offset);
-    let conversation = message.map(|message|format!("{:?}\n{}",message.role,message.text)).unwrap_or_else(||format!("{}\n\nPress S to configure provider/model/API key.\nPress i anywhere to speak to the agent.\nPgUp/PgDn: conversation history\nCtrl+Up/Down: scroll message\nEnter: follow selected evidence\nCtrl+Tab: switch workspace/chat\nf: toggle live following\nCtrl+C: interrupt agent", app.agent_config.status()));
+    let conversation = agent_conversation(app);
     let conversation = if app.investigation_evidence_detail {
         app.investigation
             .evidence
@@ -212,7 +206,7 @@ fn investigation_desk(f: &mut Frame, app: &App) {
         Paragraph::new(conversation)
             .block(Block::default().borders(Borders::ALL).title(
                 if app.investigation_evidence_detail {
-                    " Investigation desk — evidence "
+                    " Investigation desk — evidence (e: back to chat) "
                 } else {
                     " Investigation desk — Agent chat "
                 },
@@ -343,6 +337,37 @@ fn investigation_desk(f: &mut Frame, app: &App) {
             .wrap(Wrap { trim: false }),
         desk,
     );
+}
+
+fn agent_conversation(app: &App) -> String {
+    let mut messages = app
+        .investigation
+        .messages
+        .iter()
+        .rev()
+        .filter(|message| message.role != crate::api::investigation::Role::Tool)
+        .skip(app.investigation_message_offset)
+        .take(4)
+        .collect::<Vec<_>>();
+    if messages.is_empty() {
+        return format!(
+            "{}\n\nPress S to configure provider/model/API key.\nPress i anywhere to speak to the agent.\nPgUp/PgDn: older/newer chat\nCtrl+Up/Down: scroll\nEnter: follow selected evidence\nCtrl+Tab: switch workspace/chat\nf: toggle live following\nCtrl+C: interrupt agent",
+            app.agent_config.status()
+        );
+    }
+    messages.reverse();
+    messages
+        .into_iter()
+        .map(|message| {
+            let speaker = match message.role {
+                crate::api::investigation::Role::Analyst => "YOU",
+                crate::api::investigation::Role::Assistant => "KNIFE",
+                crate::api::investigation::Role::Tool => "TOOL",
+            };
+            format!("{speaker}\n{}", message.text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn desk_preview(text: &str, limit: usize) -> String {

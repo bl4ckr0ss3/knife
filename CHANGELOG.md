@@ -14,6 +14,10 @@
   excluded from model protocol history, recent conversation and live tool
   previews are bounded, and a new answer always switches the pane back from
   evidence detail to conversation.
+- Reaching the agent's round or tool budget now triggers a tool-free synthesis
+  turn rather than failing the investigation. If synthesis fails, Knife still
+  saves a marked partial result and its evidence. The chat pane presents a
+  compact human/Knife thread and keeps protocol transcripts in findings.
 
 ## v1.8.3
 

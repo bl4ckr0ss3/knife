@@ -51,6 +51,16 @@ impl App {
             .map(|path| path.to_string_lossy().into_owned());
         let expected = crate::analysis::hashes::sha256_hex(&self.bytes);
         let ledger = self.investigation.clone();
+        let ui_context = self.current_function().map(|function| {
+            format!(
+                "function {} at static VA 0x{:x}; cursor static VA {}",
+                function.name,
+                function.addr.saturating_add(self.base),
+                self.cursor_addr()
+                    .map(|address| format!("0x{:x}", address.saturating_add(self.base)))
+                    .unwrap_or_else(|| "unavailable".into())
+            )
+        });
         let activity = std::sync::Arc::new(std::sync::Mutex::new("Preparing model context".into()));
         self.investigation_live_activity = Some(activity.clone());
         let cancellation = crate::api::execution::CancellationToken::default();
@@ -69,11 +79,12 @@ impl App {
                 if crate::analysis::hashes::sha256_hex(&session.bytes) != expected {
                     anyhow::bail!("workspace changed; reload before starting the agent");
                 }
-                crate::agent::converse_with_events(
+                crate::agent::converse_with_ui_context(
                     &mut provider,
                     &session,
                     &ledger,
                     &cancellation,
+                    ui_context.as_deref(),
                     |event| {
                         if let crate::agent::AgentEvent::Activity(message) = &event {
                             if let Ok(mut current) = activity.lock() {
@@ -306,8 +317,21 @@ impl App {
                         self.investigation_evidence_detail = false;
                         self.investigation_message_offset = 0;
                         self.investigation_message_scroll = 0;
-                        self.investigation_activity =
-                            "Completed; evidence and tool response saved".into();
+                        self.investigation_activity = if value
+                            .get("limited")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                        {
+                            format!(
+                                "Partial answer saved: {}",
+                                value
+                                    .get("limitation")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("agent tool budget reached")
+                            )
+                        } else {
+                            "Completed; evidence and tool response saved".into()
+                        };
                     }
                     Err(error) => {
                         self.investigation_activity = format!("Could not persist result: {error}")

@@ -2506,8 +2506,14 @@ impl App {
                     self.investigation_message_scroll = 0;
                 }
                 KeyCode::PageUp => {
+                    let conversation_len = self
+                        .investigation
+                        .messages
+                        .iter()
+                        .filter(|message| message.role != crate::api::investigation::Role::Tool)
+                        .count();
                     self.investigation_message_offset = (self.investigation_message_offset + 1)
-                        .min(self.investigation.messages.len().saturating_sub(1));
+                        .min(conversation_len.saturating_sub(1));
                     self.investigation_message_scroll = 0;
                 }
                 KeyCode::PageDown => {
