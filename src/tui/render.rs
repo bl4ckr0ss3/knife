@@ -271,6 +271,42 @@ fn investigation_desk(f: &mut Frame, app: &App) {
                 Style::default().fg(muted()),
             ),
         ]),
+        TLine::from(vec![
+            Span::styled(
+                " TARGET  ",
+                Style::default()
+                    .fg(canvas())
+                    .bg(accent())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    " {} · {} / {}",
+                    std::path::Path::new(&app.bin.path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(&app.bin.path),
+                    app.bin.format.label(),
+                    app.bin.arch.label()
+                ),
+                Style::default().fg(muted()),
+            ),
+        ]),
+        TLine::from(vec![
+            Span::styled(
+                " SCOPE   ",
+                Style::default()
+                    .fg(warning_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                desk_preview(
+                    &app.investigation_context_label(),
+                    usize::from(width.saturating_sub(12)),
+                ),
+                Style::default().fg(muted()),
+            ),
+        ]),
         TLine::from(Span::styled(
             if app.investigation_focused {
                 if app.investigation_zoomed {
@@ -288,6 +324,33 @@ fn investigation_desk(f: &mut Frame, app: &App) {
             Style::default().fg(accent()).add_modifier(Modifier::BOLD),
         )),
     ];
+    if !app.investigation_tool_trace.is_empty() {
+        lines.push(TLine::from(Span::styled(
+            " TOOL TRACE",
+            Style::default()
+                .fg(success_color())
+                .add_modifier(Modifier::BOLD),
+        )));
+        let start = app.investigation_tool_trace.len().saturating_sub(3);
+        for (name, address) in &app.investigation_tool_trace[start..] {
+            lines.push(TLine::from(vec![
+                Span::styled(" ✓ ", Style::default().fg(success_color())),
+                Span::styled(
+                    desk_preview(
+                        &name.replace('_', " "),
+                        usize::from(width.saturating_sub(22)),
+                    ),
+                    Style::default().fg(muted()),
+                ),
+                Span::styled(
+                    address
+                        .map(|address| format!("  @ 0x{address:x}"))
+                        .unwrap_or_default(),
+                    Style::default().fg(analyst_color()),
+                ),
+            ]));
+        }
+    }
     lines.push(TLine::from(if app.investigation_conflicts_only {
         " Conflicting evidence — review required"
     } else {
@@ -2014,6 +2077,8 @@ const HELP_LINES: &[&str] = &[
         "                 catalogs: imports exports strings sections; ELF headers segments section-headers",
         "  i / S          message the agent / configure provider, model and API key",
         "                 Ctrl+Left/Right or Ctrl+Tab switches workspace/chat; keys use the OS vault",
+        "  :report        export the saved agent conversation and evidence as a Markdown",
+        "                 report beside the workspace database",
         "  b              toggle local bookmark; :bookmarks lists saved locations",
         "",
         "  /              filter the function list, or search the code when the",

@@ -6,6 +6,7 @@ pub enum Command {
     AgentSetup,
     Contradictions,
     RefreshInvestigation,
+    Report,
     Ask(String),
     RunTool(String),
     InterruptInvestigation,
@@ -46,6 +47,7 @@ pub const NAMES: &[&str] = &[
     "agent-setup",
     "contradictions",
     "investigation-reload",
+    "report",
     "ask",
     "run-tool",
     "interrupt",
@@ -112,6 +114,7 @@ impl super::App {
                 self.investigation_conflicts_only = true;
             }
             Command::RefreshInvestigation => self.refresh_investigation(),
+            Command::Report => self.export_investigation_report(),
             Command::Ask(question) => self.investigation_question(question),
             Command::RunTool(input) => self.run_investigation_tool(&input),
             Command::InterruptInvestigation => {
@@ -307,6 +310,7 @@ pub fn parse(input: &str) -> Result<Command, String> {
         "agent-setup" | "provider" => no_args(Command::AgentSetup),
         "contradictions" => no_args(Command::Contradictions),
         "investigation-reload" => no_args(Command::RefreshInvestigation),
+        "report" => no_args(Command::Report),
         "ask" => required().map(Command::Ask),
         "run-tool" => required().map(Command::RunTool),
         "interrupt" => no_args(Command::InterruptInvestigation),
@@ -430,6 +434,13 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_command_parses_without_arguments() {
+        assert_eq!(parse("report").unwrap(), Command::Report);
+        assert!(parse("report now").is_err());
+        assert!(complete("rep").contains(&"report"));
+    }
 
     #[test]
     fn split_commands_parse_with_and_without_arguments() {

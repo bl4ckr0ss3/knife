@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use super::App;
 use crate::api::investigation::Role;
 
@@ -44,6 +46,7 @@ impl App {
             }
         };
         self.investigation_activity = format!("Connecting to {}", provider.label());
+        self.investigation_tool_trace.clear();
         let path = self.bin.path.clone();
         let database = self
             .db
@@ -51,28 +54,7 @@ impl App {
             .map(|path| path.to_string_lossy().into_owned());
         let expected = crate::analysis::hashes::sha256_hex(&self.bytes);
         let ledger = self.investigation.clone();
-        let selection = if let Some(function) = self.current_function() {
-            format!(
-                "function {} at static VA 0x{:x}; cursor static VA {}",
-                function.name,
-                function.addr.saturating_add(self.base),
-                self.cursor_addr()
-                    .map(|address| format!("0x{:x}", address.saturating_add(self.base)))
-                    .unwrap_or_else(|| "unavailable".into())
-            )
-        } else if self.raw_file {
-            let offset = self
-                .lines
-                .get(self.cursor)
-                .map(super::Line::addr)
-                .or(self.cur)
-                .unwrap_or(0);
-            format!("raw file view at file offset 0x{offset:x}")
-        } else {
-            self.cursor_addr()
-                .map(|address| format!("data at static VA 0x{:x}", address + self.base))
-                .unwrap_or_else(|| "no address selected".into())
-        };
+        let selection = self.investigation_context_label();
         let ui_context = Some(format!(
             "{} / {} target; {selection}",
             self.bin.format.label(),
@@ -453,6 +435,45 @@ impl App {
         }
     }
 
+    /// Export the saved conversation and evidence as a shareable Markdown
+    /// report beside the workspace database. The output is a plain local file:
+    /// nothing is uploaded, and the analyst decides what to publish from it.
+    pub fn export_investigation_report(&mut self) {
+        if !self
+            .investigation
+            .messages
+            .iter()
+            .any(|message| message.role == Role::Assistant)
+        {
+            self.status = "No agent answer to export yet; ask a question first".into();
+            return;
+        }
+        let Some(database) = self.db.path() else {
+            self.status = "this workspace has no persistent database".into();
+            return;
+        };
+        let name = Path::new(&self.bin.path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.bin.path.clone());
+        let format = self.bin.format.label();
+        let architecture = self.bin.arch.label();
+        let target = crate::api::report::ReportTarget {
+            name: name.as_str(),
+            format,
+            architecture,
+            sha256: self.db.sha256.as_str(),
+        };
+        let report = crate::api::report::markdown(&target, &self.investigation);
+        let path = database.with_extension("report.md");
+        match std::fs::write(&path, report) {
+            Ok(()) => {
+                self.status = format!("Report exported to {}", path.display());
+            }
+            Err(error) => self.status = format!("Could not write the report: {error}"),
+        }
+    }
+
     pub fn investigation_question(&mut self, question: String) {
         let mut next = self.investigation.clone();
         let result = (|| {
@@ -513,6 +534,11 @@ impl App {
                 static_address,
             } => {
                 self.investigation_activity = format!("Completed {name}");
+                self.investigation_tool_trace
+                    .push((name.clone(), static_address));
+                if self.investigation_tool_trace.len() > 8 {
+                    self.investigation_tool_trace.remove(0);
+                }
                 if self.investigation_open && self.investigation_follow {
                     if let Some(address) = static_address {
                         self.execute_command(&format!("goto 0x{address:x}"));
@@ -520,6 +546,31 @@ impl App {
                 }
             }
         }
+    }
+
+    pub fn investigation_context_label(&self) -> String {
+        if let Some(function) = self.current_function() {
+            return format!(
+                "function {} @ 0x{:x} · cursor {}",
+                function.name,
+                function.addr.saturating_add(self.base),
+                self.cursor_addr()
+                    .map(|address| format!("0x{:x}", address.saturating_add(self.base)))
+                    .unwrap_or_else(|| "unavailable".into())
+            );
+        }
+        if self.raw_file {
+            let offset = self
+                .lines
+                .get(self.cursor)
+                .map(super::Line::addr)
+                .or(self.cur)
+                .unwrap_or(0);
+            return format!("raw bytes @ file offset 0x{offset:x}");
+        }
+        self.cursor_addr()
+            .map(|address| format!("data @ static VA 0x{:x}", address + self.base))
+            .unwrap_or_else(|| "no address selected".into())
     }
 }
 

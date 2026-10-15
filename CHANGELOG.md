@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- Agent runs no longer end when the model merely narrates next steps: answers
+  that promise future work ("let me inspect...", "two reads will finish
+  coverage") without a tool call are nudged up to twice per run to invoke
+  tools, discover needed ones first, or answer outright, and each nudge shows
+  in the activity pane. The prompt and loop guidance forbid narrating tool
+  calls in prose, and data-only sessions state explicitly that byte and string
+  inspection requires `discover_investigation_tools` before content tools
+  become callable.
+- `:report` exports the saved agent conversation and evidence as a
+  deterministic Markdown report beside the workspace database: target identity,
+  the latest shareable recap when present, the conversation without tool
+  transcripts, and a bounded evidence inventory with typed locations.
+- Agent answers now follow a self-contained report shape: a plain-language
+  verdict, `Observed:`/`Inferred:` findings with evidence citations, explicit
+  `Unknown:`/`Limitation:` bullets, and one prioritized next step, so reports
+  stay readable and ready to share instead of continuing an earlier outline.
+  Substantial reports end with a short shareable recap suitable for public
+  posting; budget-limited partial answers keep the same shape and omit that
+  recap because incomplete findings must not be published.
 - `F6` and `Ctrl+Right` now always open the full agent workspace instead of
   silently changing focus in the split layout or toggling back to disassembly;
   `Ctrl+Left` always restores analysis and `Ctrl+Tab` remains the explicit
@@ -22,6 +41,10 @@
   Home/End, Delete/Backspace, Ctrl+U, Shift+Enter multiline drafts, and bounded
   bracketed paste. Model/tool progress redraws every 100 ms while active, so a
   completed response no longer waits for an unrelated keypress to appear.
+- The Agent activity pane now exposes the exact target filename, detected
+  format/architecture, current function/address or raw-file offset, and a
+  bounded live trace of recently completed analysis tools with evidence
+  addresses.
 - Plain Up/Down now scrolls the focused agent chat or evidence detail, with
   Ctrl+Up/Down for faster movement and Home/End for bounds. `j`/`k` or
   Shift+Up/Down selects findings, and scrolling is clamped before blank space.

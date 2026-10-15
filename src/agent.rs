@@ -10,6 +10,10 @@ use std::time::Duration;
 
 const MAX_ROUNDS: usize = 8;
 const MAX_CALLS: usize = 24;
+/// How many times a run may bounce a narration-only model turn back to work.
+/// Narration that promises future analysis ("let me inspect...") without a
+/// tool call otherwise ends the whole run before any evidence is collected.
+const MAX_CONTINUATION_NUDGES: usize = 2;
 const MAX_CONTEXT: usize = 512 * 1024;
 const MAX_HISTORY: usize = 32 * 1024;
 const MAX_HISTORY_MESSAGE: usize = 4 * 1024;
@@ -17,6 +21,8 @@ const MAX_TOOL_PREVIEW: usize = 8 * 1024;
 const MAX_PROVIDER_RESPONSE: usize = 8 * 1024 * 1024;
 const SYSTEM_PROMPT: &str = include_str!("agent_system_prompt.md");
 const CREDENTIAL_SERVICE: &str = "io.github.bl4ckr0ss3.knife";
+
+const CONTINUATION_NUDGE: &str = "Your previous message described analysis steps you intended to take, but you made no tool calls, so the turn ended without results. Do not narrate intentions: either invoke the next available tool now, or first call discover_investigation_tools for the task that matches what you need (triage, code, strings, validation, memory, external) and use it on your next round, or, if no further tool work is warranted, answer the analyst completely now without promising future actions.";
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct AgentPreferences {
@@ -795,7 +801,7 @@ pub fn converse_with_ui_context(
     let mut messages = vec![json!({"role":"system","content":SYSTEM_PROMPT})];
     if !session.code_analyzed {
         messages.push(json!({"role":"system","content":format!(
-            "This is a data-only {} / {} session. Native code lifting is unavailable. Use container, byte, string, entropy, signature, artifact, and format-specific tools; do not claim that unavailable code paths were analyzed.",
+            "This is a data-only {} / {} session. Native code lifting is unavailable. Only identity and triage tools are active at first; call discover_investigation_tools with the task that matches what you need (for example strings for byte and string inspection) before examining content, and do not claim that unavailable code paths were analyzed.",
             session.bin.format.label(), session.bin.arch.label()
         )}));
     }
@@ -828,10 +834,11 @@ pub fn converse_with_ui_context(
         };
         messages.push(json!({"role":role,"content":text}));
     }
-    messages.insert(1,json!({"role":"system","content":"Begin with session_status. Use discover_investigation_tools to request more tools for triage, code, strings, validation, memory, or external analysis. Newly discovered tools become callable on your next model round. Consider their reported availability before calling them. You have at most eight tool rounds and 24 calls; synthesize as soon as sufficient evidence is available rather than exhausting the budget."}));
+    messages.insert(1,json!({"role":"system","content":"Begin with session_status. Use discover_investigation_tools to request more tools for triage, code, strings, validation, memory, or external analysis. Newly discovered tools become callable on your next model round. Consider their reported availability before calling them. You have at most eight tool rounds and 24 calls; synthesize as soon as sufficient evidence is available rather than exhausting the budget. Never describe a tool call in prose: emit the call itself, because a turn without tool calls ends the investigation."}));
     let mut evidence = Vec::new();
     let mut tool_activity = Vec::new();
     let mut count = 0;
+    let mut continuations = 0;
     let mut limit_reason = "the 8-round investigation limit";
     for round in 0..MAX_ROUNDS {
         if cancellation.is_cancelled() {
@@ -858,6 +865,21 @@ pub fn converse_with_ui_context(
                 .and_then(Value::as_str)
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| anyhow!("model returned no answer or tool calls"))?;
+            // Narration that promises follow-up work is not a final answer.
+            // Bounce it back so the model acts, unless the budget for rounds,
+            // calls, or nudges is already spent.
+            if round + 1 < MAX_ROUNDS
+                && continuations < MAX_CONTINUATION_NUDGES
+                && count < MAX_CALLS
+                && announces_pending_work(answer)
+            {
+                continuations += 1;
+                events(AgentEvent::Activity(
+                    "Model announced work without calling a tool; prompting it to act".into(),
+                ));
+                messages.push(json!({"role":"system","content":CONTINUATION_NUDGE}));
+                continue;
+            }
             return Ok(
                 json!({"assistant":answer,"evidence":evidence,"tool_activity":tool_activity}),
             );
@@ -931,7 +953,7 @@ pub fn converse_with_ui_context(
     events(AgentEvent::Activity(
         "Tool budget reached; synthesizing the collected evidence".into(),
     ));
-    messages.push(json!({"role":"system","content":format!("Tool use has ended because the agent reached {limit_reason}. Do not request more tools. Answer the analyst now using only the collected results. Clearly state that coverage is partial and name the most important unresolved next step.")}));
+    messages.push(json!({"role":"system","content":synthesis_instruction(limit_reason)}));
     let fallback = format!(
         "Partial investigation: the agent reached {limit_reason} after {count} tool calls. Knife preserved {} evidence record(s) and the tool transcript. Review the findings below or ask a narrower follow-up question to continue.",
         evidence.len()
@@ -961,6 +983,75 @@ fn normalize_tool_arguments(value: &Value) -> Value {
     }
 }
 
+/// Detect narration that promises future work instead of invoking tools.
+/// Deliberately conservative: a false positive only costs one bounded nudge,
+/// and the nudge always offers "answer completely now" as an exit. Covers
+/// first-person promises ("I'll inspect") and third-person planning ("two
+/// parallel reads will finish coverage"), which weaker models both produce.
+fn announces_pending_work(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let first_person = [
+        "let me ",
+        "let's ",
+        "i'll",
+        "i will",
+        "i'm going to",
+        "i am going to",
+        "i intend to",
+        "i plan to",
+        "i'm about to",
+    ];
+    if first_person.iter().any(|marker| lower.contains(marker)) {
+        return true;
+    }
+    // A finished report never needs a nudge, even if its wording slips a
+    // future tense in; only bare narration should bounce.
+    if lower.contains("## verdict") || lower.contains("## shareable recap") {
+        return false;
+    }
+    [
+        "finish",
+        "pull",
+        "view",
+        "inspect",
+        "check",
+        "run",
+        "read",
+        "enumerate",
+        "cross-check",
+        "complete",
+        "cover",
+        "analyze",
+        "examine",
+        "fetch",
+        "list",
+        "dump",
+        "scan",
+        "trace",
+        "decode",
+        "disassemble",
+        "hash",
+        "search",
+        "request",
+        "call",
+    ]
+    .iter()
+    .any(|verb| lower.contains(&format!("will {verb}")))
+}
+
+/// Final-turn instruction for a budget-limited synthesis. Partial answers keep
+/// the report shape from the system prompt but must not produce a shareable
+/// recap, because partial coverage is unsafe to quote publicly.
+fn synthesis_instruction(limit_reason: &str) -> String {
+    format!(
+        "Tool use has ended because the agent reached {limit_reason}. Do not request more tools. \
+Answer the analyst now using only the collected results and follow the report shape: a verdict, \
+findings labeled Observed or Inferred with their evidence citations, then Unknowns and limits. \
+Clearly state that coverage is partial, name the most important unresolved next step, and omit \
+the Shareable recap section because incomplete findings must not be published."
+    )
+}
+
 fn matching_evidence(result: &Value, expected_target: &str) -> (Vec<Value>, Option<u64>) {
     let records = result
         .get("evidence")
@@ -987,6 +1078,173 @@ fn matching_evidence(result: &Value, expected_target: &str) -> (Vec<Value>, Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_prompt_keeps_the_selfcontained_report_contract() {
+        for marker in [
+            "self-contained report",
+            "Never continue a numbered outline",
+            "## Verdict",
+            "## Findings",
+            "## Unknowns and limits",
+            "## Next step",
+            "## Shareable recap",
+            "free of\nrecovered secrets",
+        ] {
+            assert!(
+                SYSTEM_PROMPT.contains(marker),
+                "embedded system prompt lost the report-contract marker: {marker}"
+            );
+        }
+    }
+
+    #[test]
+    fn synthesis_keeps_the_report_shape_and_refuses_a_public_recap() {
+        let instruction = synthesis_instruction("the 8-round investigation limit");
+        assert!(instruction.contains("the 8-round investigation limit"));
+        assert!(instruction.contains("report shape"));
+        assert!(instruction.contains("partial"));
+        assert!(instruction.contains("omit the Shareable recap section"));
+    }
+
+    #[test]
+    fn action_language_detection_covers_the_common_promises() {
+        assert!(announces_pending_work("Let me inspect the raw bytes next."));
+        assert!(announces_pending_work(
+            "I'll view the remaining bytes and pull strings."
+        ));
+        assert!(announces_pending_work(
+            "I'm going to cross-check the entropy."
+        ));
+        assert!(!announces_pending_work(
+            "The verdict: benign crackme, LowRisk (3)."
+        ));
+        assert!(!announces_pending_work("Observed: seven gates in .rdata."));
+    }
+
+    #[test]
+    fn third_person_planning_also_bounces_until_it_becomes_a_report() {
+        assert!(announces_pending_work(
+            "Two parallel reads will finish coverage of the file: the remaining bytes past the first 512, and a full strings pass."
+        ));
+        assert!(announces_pending_work(
+            "A follow-up pass will enumerate the remaining strings."
+        ));
+        // A completed report skeleton is final even when its wording slips
+        // into future tense; only bare narration should bounce.
+        assert!(!announces_pending_work(
+            "## Verdict\nBenign.\n\n## Next step\nRunning strings will enumerate the strings."
+        ));
+    }
+
+    #[test]
+    fn narration_that_promises_work_is_nudged_to_act_before_the_turn_ends() {
+        let bytes = crate::formats::fixture::pe_with_driver();
+        let bin = crate::formats::analyze("fixture.exe", &bytes).unwrap();
+        let db = crate::db::Db::default();
+        let an = crate::analysis::engine::analyze(&bin, &bytes, 200_000, &db);
+        let session = Session {
+            bin,
+            bytes,
+            db,
+            an,
+            code_analyzed: true,
+        };
+        let mut ledger = Investigation::new("fixture");
+        ledger
+            .append(Role::Analyst, "Triage the target".into(), vec![])
+            .unwrap();
+        let mut provider = Scripted {
+            messages: vec![
+                json!({"role":"assistant","tool_calls":[{"function":{"name":"session_status","arguments":{}}}]}),
+                json!({"role":"assistant","content":"Session established. Let me inspect the raw bytes next."}),
+                json!({"role":"assistant","tool_calls":[{"function":{"name":"discover_investigation_tools","arguments":{"task":"strings"}}}]}),
+                json!({"role":"assistant","content":"Inspected the bytes; analysis complete."}),
+            ],
+            index: 0,
+        };
+        let mut activity = Vec::new();
+        let result = converse(&mut provider, &session, &ledger, |message| {
+            activity.push(message.to_string())
+        })
+        .unwrap();
+        assert_eq!(
+            result["assistant"],
+            "Inspected the bytes; analysis complete."
+        );
+        assert!(activity
+            .iter()
+            .any(|value| value.contains("without calling a tool")));
+        assert!(result.get("limited").is_none());
+    }
+
+    #[test]
+    fn answers_without_action_language_end_the_turn_immediately() {
+        let bytes = crate::formats::fixture::pe_with_driver();
+        let bin = crate::formats::analyze("fixture.exe", &bytes).unwrap();
+        let db = crate::db::Db::default();
+        let an = crate::analysis::engine::analyze(&bin, &bytes, 200_000, &db);
+        let session = Session {
+            bin,
+            bytes,
+            db,
+            an,
+            code_analyzed: true,
+        };
+        let mut ledger = Investigation::new("fixture");
+        ledger
+            .append(Role::Analyst, "Question".into(), vec![])
+            .unwrap();
+        let mut provider = Scripted {
+            messages: vec![json!({"role":"assistant","content":"The verdict is benign."})],
+            index: 0,
+        };
+        let result = converse(&mut provider, &session, &ledger, |_| {}).unwrap();
+        assert_eq!(result["assistant"], "The verdict is benign.");
+        assert_eq!(provider.index, 1);
+    }
+
+    #[test]
+    fn narration_nudging_is_bounded_and_then_accepts_the_answer() {
+        let bytes = crate::formats::fixture::pe_with_driver();
+        let bin = crate::formats::analyze("fixture.exe", &bytes).unwrap();
+        let db = crate::db::Db::default();
+        let an = crate::analysis::engine::analyze(&bin, &bytes, 200_000, &db);
+        let session = Session {
+            bin,
+            bytes,
+            db,
+            an,
+            code_analyzed: true,
+        };
+        let mut ledger = Investigation::new("fixture");
+        ledger
+            .append(Role::Analyst, "Question".into(), vec![])
+            .unwrap();
+        let mut provider = Scripted {
+            messages: vec![
+                json!({"role":"assistant","tool_calls":[{"function":{"name":"session_status","arguments":{}}}]}),
+                json!({"role":"assistant","content":"Let me check the structure."}),
+                json!({"role":"assistant","content":"I'll pull more evidence."}),
+                json!({"role":"assistant","content":"No further action is warranted."}),
+            ],
+            index: 0,
+        };
+        let mut activity = Vec::new();
+        let result = converse(&mut provider, &session, &ledger, |message| {
+            activity.push(message.to_string())
+        })
+        .unwrap();
+        assert_eq!(result["assistant"], "No further action is warranted.");
+        assert_eq!(
+            activity
+                .iter()
+                .filter(|value| value.contains("without calling a tool"))
+                .count(),
+            MAX_CONTINUATION_NUDGES
+        );
+    }
+
     struct Scripted {
         messages: Vec<Value>,
         index: usize,

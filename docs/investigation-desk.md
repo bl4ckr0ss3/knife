@@ -62,11 +62,26 @@ The model can invoke registered analysis reads. Tool activity appears while it
 works; the resulting answer, tool-response previews, and evidence records are
 persisted. While a model or tool worker is active, the TUI polls and redraws at
 100 ms intervals, so progress and completed answers appear without an extra
-keypress. The prompt requires observed facts, inferences, unknowns, evidence
-IDs, and static addresses. Model compliance with those instructions still needs
+keypress. The prompt requires each substantial answer to be a self-contained
+report rather than a continuation of an earlier outline: a plain-language
+verdict, findings labeled `Observed:` or `Inferred:` with evidence IDs and
+typed locations, explicit `Unknown:` or `Limitation:` bullets, and one
+prioritized next step. Substantial reports end with a short shareable recap
+that is safe to quote publicly and omits recovered secrets; budget-limited
+partial answers keep the same shape and omit that recap because incomplete
+findings must not be published. The label prefixes also feed the desk's
+semantic highlighting. Model compliance with those instructions still needs
 to be assessed by the analyst. Project mutation and target execution are not
 available to this initial loop. Responses currently arrive after each complete
 model request; token streaming is outstanding.
+
+If a model narrates intended work without invoking tools ("let me inspect the
+bytes next"), the run does not end there: Knife nudges it — at most twice per
+run, and never past the round or tool budget — to either call the next
+available tool, discover it first when the task needs an unlisted operation,
+or answer completely without promising future actions. Narration that survives
+its nudges is still saved as a normal answer. The activity pane shows each
+nudge while it happens.
 
 The complete embedded investigator prompt is intentionally auditable at
 [`src/agent_system_prompt.md`](../src/agent_system_prompt.md). Repository-level
@@ -90,6 +105,13 @@ Run an existing analysis operation with:
 :run-tool trace_string_usage {"query":"password","limit":5}
 :run-tool inspect_input_validation {"selector":"main"}
 ```
+
+Export the saved conversation and evidence with `:report`. It writes a
+deterministic Markdown report (`<project>.report.md`) beside the workspace
+database: the target identity with its SHA-256, the latest `Shareable recap`
+section when the model produced one, the analyst conversation without tool
+transcripts, and a bounded evidence inventory with typed locations. The file
+is written locally only; the analyst decides what to publish from it.
 
 The worker reopens the saved project and checks that its workspace bytes match
 the TUI before collecting results. Navigation remains responsive. Evidence
@@ -131,6 +153,11 @@ Conversation badges identify `YOU` and the configured model by its readable
 name rather than a generic assistant label. Colors distinguish the two roles
 and call out observations, inferences, unknowns, limitations, and worker state;
 the text labels remain authoritative for monochrome or low-color terminals.
+The activity pane always shows the target filename, detected format and
+architecture, plus the function/address or raw-file offset currently supplied
+as agent context. A bounded live trace retains the latest completed analysis
+tools and their first static evidence address, so tool progress does not vanish
+when the next operation starts.
 
 `:interrupt` or Ctrl+C discards the active worker result and stops the model loop before
 its next request or tool call. An in-flight model request or analysis operation

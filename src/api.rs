@@ -23,6 +23,7 @@ pub mod paging;
 pub mod patches;
 pub mod persistence;
 pub mod references;
+pub mod report;
 pub mod results;
 pub mod risk_signals;
 pub mod symbols;

@@ -514,6 +514,8 @@ pub struct App {
     pub investigation_evidence_detail: bool,
     pub investigation_worker: Option<std::sync::mpsc::Receiver<Result<serde_json::Value>>>,
     pub investigation_activity: String,
+    /// Recent completed tools for a visible, bounded live activity trace.
+    pub investigation_tool_trace: Vec<(String, Option<u64>)>,
     pub investigation_live_activity: Option<std::sync::Arc<std::sync::Mutex<String>>>,
     pub investigation_cancellation: Option<crate::api::execution::CancellationToken>,
     // ── the target ──
@@ -685,6 +687,7 @@ impl App {
             investigation_evidence_detail: false,
             investigation_worker: None,
             investigation_activity: String::new(),
+            investigation_tool_trace: Vec::new(),
             investigation_live_activity: None,
             investigation_cancellation: None,
             bin,
@@ -2515,6 +2518,7 @@ impl App {
             token.cancel();
         }
         self.investigation_live_activity = None;
+        self.investigation_tool_trace.clear();
         self.investigation_activity =
             "Workspace reloaded; pending investigation work discarded".into();
         self.investigation_selection = 0;
@@ -5306,6 +5310,25 @@ mod tests {
         let screen = rendered(&mut app, 160, 40);
         assert!(screen.contains("Chat"));
         assert!(screen.contains("YOU → Knife Agent"));
+        assert!(screen.contains("TARGET"));
+        assert!(screen.contains("SCOPE"));
+        assert!(screen.contains("TOOL TRACE"));
+        assert!(screen.contains("explain function"));
+    }
+
+    #[test]
+    fn agent_tool_trace_is_recent_and_bounded() {
+        let mut app = two_functions();
+        app.investigation_follow = false;
+        for index in 0..12 {
+            app.apply_agent_event(crate::agent::AgentEvent::ToolCompleted {
+                name: format!("tool_{index}"),
+                static_address: Some(0x1000 + index),
+            });
+        }
+        assert_eq!(app.investigation_tool_trace.len(), 8);
+        assert_eq!(app.investigation_tool_trace[0].0, "tool_4");
+        assert_eq!(app.investigation_tool_trace[7].0, "tool_11");
     }
 
     #[test]
@@ -5355,6 +5378,42 @@ mod tests {
         let screen = rendered(&mut app, 160, 40);
         assert!(screen.contains("Alt+R  retry last question"));
         assert!(screen.contains("Alt+S  provider setup"));
+    }
+
+    #[test]
+    fn report_command_exports_a_deterministic_markdown_file() {
+        let mut app = two_functions();
+        app.splash = false;
+        let root = std::env::temp_dir().join(format!(
+            "knife-report-command-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        app.db = crate::db::Db::load(
+            "stub-hash",
+            "fixture.elf",
+            Some(root.join("workspace.json").to_str().unwrap()),
+        )
+        .unwrap();
+        app.execute_command("report");
+        assert!(app.status.contains("No agent answer to export yet"));
+        app.investigation
+            .append(
+                crate::api::investigation::Role::Assistant,
+                "## Verdict\nBenign.".into(),
+                vec![],
+            )
+            .unwrap();
+        app.execute_command("report");
+        let written = std::fs::read_to_string(root.join("workspace.report.md")).unwrap();
+        assert!(written.starts_with("# Knife investigation report"));
+        assert!(written.contains("## Verdict\nBenign."));
+        assert!(app.status.contains("Report exported to"));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
