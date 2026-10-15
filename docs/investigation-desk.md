@@ -8,6 +8,12 @@ is configured, starts a background tool-using conversation.
 
 ## Model providers
 
+Press `S` in the TUI (or run `:agent-setup`) to enter the provider, model,
+optional base URL, and API key without leaving Knife. The API-key field is
+masked and the completed configuration remains in process memory only; it is
+not written to the project, investigation ledger, command history, or an
+environment file. Environment variables remain available for scripted startup.
+
 Ollama remains the no-account local default:
 
 ```sh
@@ -37,7 +43,10 @@ results to the configured service, so use Ollama for targets that must remain
 local. There is no default hosted model or account requirement.
 
 Each request has a 60-second timeout, the loop allows eight model rounds and 24
-tool calls, and serialized context is capped at 96 KiB.
+tool calls, and serialized context is capped at 512 KiB. Before a new request,
+Knife excludes saved tool transcripts from protocol history and retains a
+bounded recent conversation window. Live tool results are also bounded, so a
+large saved investigation cannot prevent a focused follow-up from starting.
 
 The model can invoke registered analysis reads. Tool activity appears while it
 works; the resulting answer, tool-response previews, and evidence records are
@@ -84,7 +93,9 @@ The desk separates conversation from findings. PgUp/PgDn browse older/newer
 messages; Ctrl+Up/Down scroll the selected message, including saved tool output.
 Press `e` to inspect selected evidence in the upper panel: producer, typed hex
 locations, observation/inference/unknown statements, confidence and limitations.
-Ctrl+Up/Down scrolls these details; `e` returns to conversation.
+Ctrl+Up/Down scrolls these details; `e` returns to conversation. Sending a new
+message and receiving an answer automatically return the upper pane to the
+conversation so an old evidence-detail selection cannot hide the response.
 
 `:interrupt` or Ctrl+C discards the active worker result and stops the model loop before
 its next request or tool call. An in-flight model request or analysis operation

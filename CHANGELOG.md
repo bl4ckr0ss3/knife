@@ -7,8 +7,13 @@
   the chat pane.
 - The embedded tool-using agent supports OpenRouter, OpenAI, and custom
   OpenAI-compatible chat-completions endpoints in addition to local Ollama.
-  Hosted API credentials remain environment-only and are kept out of child
-  process command lines and saved investigation data.
+  Hosted API credentials remain ephemeral and are kept out of child process
+  command lines and saved investigation data.
+- Provider, model, base URL, and a masked memory-only API key can now be entered
+  with `S` directly in the investigation desk. Saved tool transcripts are
+  excluded from model protocol history, recent conversation and live tool
+  previews are bounded, and a new answer always switches the pane back from
+  evidence detail to conversation.
 
 ## v1.8.3
 

@@ -283,8 +283,9 @@ knife query sample.exe explain_function --args '{"selector":"main"}'
 The built-in [investigation desk](docs/investigation-desk.md) opens beside the
 listing. Press `i` to chat through local Ollama, OpenRouter, OpenAI, or another
 OpenAI-compatible endpoint; the agent can call Knife's bounded analysis tools
-and save its evidence into the project ledger. No provider is contacted until
-you configure one and submit a message.
+and save its evidence into the project ledger. Press `S` to configure the
+provider, model, base URL and a masked memory-only API key inside the TUI. No
+provider is contacted until you configure one and submit a message.
 
 ## Kernel drivers & BYOVD
 

@@ -171,7 +171,7 @@ fn investigation_desk(f: &mut Frame, app: &App) {
         .iter()
         .rev()
         .nth(app.investigation_message_offset);
-    let conversation = message.map(|message|format!("{:?}\n{}",message.role,message.text)).unwrap_or_else(||format!("{}\n\nPress i anywhere to speak to the agent.\nPgUp/PgDn: conversation history\nCtrl+Up/Down: scroll message\nEnter: follow selected evidence\nCtrl+Tab: switch workspace/chat\nf: toggle live following\nCtrl+C: interrupt agent", crate::agent::provider_status()));
+    let conversation = message.map(|message|format!("{:?}\n{}",message.role,message.text)).unwrap_or_else(||format!("{}\n\nPress S to configure provider/model/API key.\nPress i anywhere to speak to the agent.\nPgUp/PgDn: conversation history\nCtrl+Up/Down: scroll message\nEnter: follow selected evidence\nCtrl+Tab: switch workspace/chat\nf: toggle live following\nCtrl+C: interrupt agent", app.agent_config.status()));
     let conversation = if app.investigation_evidence_detail {
         app.investigation
             .evidence
@@ -230,7 +230,7 @@ fn investigation_desk(f: &mut Frame, app: &App) {
     );
     let mut lines = vec![
         TLine::from(format!(
-            " i: chat  f: follow {}  Ctrl+Tab: {}",
+            " i: chat  S: setup  f: follow {}  Ctrl+Tab: {}",
             if app.investigation_follow {
                 "ON"
             } else {
@@ -247,6 +247,10 @@ fn investigation_desk(f: &mut Frame, app: &App) {
     lines.insert(
         1,
         TLine::from(format!(" Activity: {}", app.investigation_activity)),
+    );
+    lines.insert(
+        2,
+        TLine::from(format!(" Provider: {}", app.agent_config.status())),
     );
     lines.push(TLine::from(if app.investigation_conflicts_only {
         " Conflicting evidence — review required"
@@ -1395,7 +1399,11 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
                 },
                 Style::default().fg(accent()).add_modifier(Modifier::BOLD),
             ),
-            Span::raw(p.input.clone()),
+            Span::raw(if p.ask == super::Ask::AgentApiKey {
+                "•".repeat(p.input.chars().count())
+            } else {
+                p.input.clone()
+            }),
             Span::styled("█", Style::default().fg(accent())),
             Span::styled(format!("  {}", app.status), Style::default().fg(muted())),
         ]);
@@ -1476,6 +1484,8 @@ const HELP_LINES: &[&str] = &[
         "                 functions, function NAME, goto VA, cfg, disasm, decompile",
         "                 xrefs, callers, callees, types, rename NAME, comment TEXT, help",
         "                 catalogs: imports exports strings sections; ELF headers segments section-headers",
+        "  i / S          message the agent / configure provider, model and API key",
+        "                 Ctrl+Tab switches workspace/chat; agent API keys stay memory-only",
         "  b              toggle local bookmark; :bookmarks lists saved locations",
         "",
         "  /              filter the function list, or search the code when the",

@@ -9,7 +9,10 @@ use std::time::Duration;
 
 const MAX_ROUNDS: usize = 8;
 const MAX_CALLS: usize = 24;
-const MAX_CONTEXT: usize = 96 * 1024;
+const MAX_CONTEXT: usize = 512 * 1024;
+const MAX_HISTORY: usize = 32 * 1024;
+const MAX_HISTORY_MESSAGE: usize = 4 * 1024;
+const MAX_TOOL_PREVIEW: usize = 8 * 1024;
 const SYSTEM_PROMPT: &str = include_str!("agent_system_prompt.md");
 
 #[derive(Debug, Clone)]
@@ -35,23 +38,71 @@ pub enum ConfiguredProvider {
     OpenAiCompatible(OpenAiCompatible),
 }
 
+#[derive(Clone)]
+pub struct AgentConfig {
+    pub provider: String,
+    pub model: String,
+    pub api_key: String,
+    pub base_url: String,
+}
+
+impl AgentConfig {
+    pub fn from_environment() -> Self {
+        let provider = std::env::var("KNIFE_AGENT_PROVIDER").unwrap_or_else(|_| "ollama".into());
+        let provider = provider.trim().to_ascii_lowercase();
+        let api_key = std::env::var("KNIFE_AGENT_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| match provider.as_str() {
+                "openrouter" => std::env::var("OPENROUTER_API_KEY").ok(),
+                "openai" => std::env::var("OPENAI_API_KEY").ok(),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let base_url = match provider.as_str() {
+            "ollama" => std::env::var("KNIFE_OLLAMA_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:11434".into()),
+            "compatible" | "openai-compatible" => {
+                std::env::var("KNIFE_AGENT_BASE_URL").unwrap_or_default()
+            }
+            _ => String::new(),
+        };
+        Self {
+            provider,
+            model: std::env::var("KNIFE_AGENT_MODEL").unwrap_or_default(),
+            api_key,
+            base_url,
+        }
+    }
+
+    pub fn status(&self) -> String {
+        match ConfiguredProvider::from_config(self) {
+            Ok(provider) => format!("Ready: {}", provider.label()),
+            Err(error) => format!("Offline: {error}"),
+        }
+    }
+
+    pub fn has_api_key(&self) -> bool {
+        !self.api_key.is_empty()
+    }
+}
+
 impl ConfiguredProvider {
     pub fn from_environment() -> Result<Self> {
-        match std::env::var("KNIFE_AGENT_PROVIDER")
-            .unwrap_or_else(|_| "ollama".into())
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "ollama" => Ok(Self::Ollama(Ollama::from_environment()?)),
+        Self::from_config(&AgentConfig::from_environment())
+    }
+
+    pub fn from_config(config: &AgentConfig) -> Result<Self> {
+        match config.provider.trim().to_ascii_lowercase().as_str() {
+            "ollama" => Ok(Self::Ollama(Ollama::from_config(config)?)),
             "openrouter" => Ok(Self::OpenAiCompatible(
-                OpenAiCompatible::from_environment(OpenAiService::OpenRouter)?,
+                OpenAiCompatible::from_config(OpenAiService::OpenRouter, config)?,
             )),
             "openai" => Ok(Self::OpenAiCompatible(
-                OpenAiCompatible::from_environment(OpenAiService::OpenAi)?,
+                OpenAiCompatible::from_config(OpenAiService::OpenAi, config)?,
             )),
             "compatible" | "openai-compatible" => Ok(Self::OpenAiCompatible(
-                OpenAiCompatible::from_environment(OpenAiService::Compatible)?,
+                OpenAiCompatible::from_config(OpenAiService::Compatible, config)?,
             )),
             value => Err(anyhow!(
                 "Unknown KNIFE_AGENT_PROVIDER '{value}'; use ollama, openrouter, openai, or compatible"
@@ -86,10 +137,7 @@ impl ChatProvider for ConfiguredProvider {
 }
 
 pub fn provider_status() -> String {
-    match ConfiguredProvider::from_environment() {
-        Ok(provider) => format!("Ready: {}", provider.label()),
-        Err(error) => format!("Offline: {error}"),
-    }
+    AgentConfig::from_environment().status()
 }
 
 pub struct Ollama {
@@ -99,11 +147,15 @@ pub struct Ollama {
 
 impl Ollama {
     pub fn from_environment() -> Result<Self> {
-        let model = std::env::var("KNIFE_AGENT_MODEL").map_err(|_| {
-            anyhow!("Set KNIFE_AGENT_MODEL to an installed Ollama model to enable conversation")
-        })?;
-        let endpoint =
-            std::env::var("KNIFE_OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
+        Self::from_config(&AgentConfig::from_environment())
+    }
+
+    fn from_config(config: &AgentConfig) -> Result<Self> {
+        let model = config.model.clone();
+        if model.trim().is_empty() {
+            return Err(anyhow!("choose a model with S setup"));
+        }
+        let endpoint = config.base_url.clone();
         // This first adapter is deliberately local. Remote authenticated
         // services will have a separate transport/configuration contract.
         let authority = endpoint
@@ -132,7 +184,7 @@ impl ChatProvider for Ollama {
         )?;
         if payload.len() > MAX_CONTEXT {
             return Err(anyhow!(
-                "conversation exceeds the 96 KiB context budget; start a focused question"
+                "conversation exceeds the 512 KiB request budget after compaction"
             ));
         }
         let curl = crate::providers::process::find_on_path("curl")
@@ -205,8 +257,11 @@ pub struct OpenAiCompatible {
 }
 
 impl OpenAiCompatible {
-    fn from_environment(service: OpenAiService) -> Result<Self> {
-        let model = required_environment("KNIFE_AGENT_MODEL")?;
+    fn from_config(service: OpenAiService, config: &AgentConfig) -> Result<Self> {
+        let model = config.model.clone();
+        if model.trim().is_empty() {
+            return Err(anyhow!("choose a model with S setup"));
+        }
         if model.len() > 256 || model.chars().any(char::is_control) {
             return Err(anyhow!("invalid KNIFE_AGENT_MODEL"));
         }
@@ -220,7 +275,10 @@ impl OpenAiCompatible {
                 "OPENAI_API_KEY",
             ),
             OpenAiService::Compatible => {
-                let base = required_environment("KNIFE_AGENT_BASE_URL")?;
+                let base = config.base_url.trim();
+                if base.is_empty() {
+                    return Err(anyhow!("enter a base URL with S setup"));
+                }
                 let base = base.trim_end_matches('/');
                 let endpoint = if base.ends_with("/chat/completions") {
                     base.to_string()
@@ -231,16 +289,13 @@ impl OpenAiCompatible {
             }
         };
         validate_remote_endpoint(&endpoint)?;
-        let api_key = std::env::var("KNIFE_AGENT_API_KEY")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| std::env::var(service_key).ok())
-            .ok_or_else(|| {
-                anyhow!(
-                    "Set {service_key} (or KNIFE_AGENT_API_KEY) for {}",
-                    service.label()
-                )
-            })?;
+        let api_key = config.api_key.clone();
+        if api_key.trim().is_empty() {
+            return Err(anyhow!(
+                "enter {service_key} for {} with S setup",
+                service.label()
+            ));
+        }
         if api_key.len() > 4096 || api_key.chars().any(|ch| matches!(ch, '\r' | '\n')) {
             return Err(anyhow!("invalid API key"));
         }
@@ -264,7 +319,7 @@ impl ChatProvider for OpenAiCompatible {
         )?;
         if payload.len() > MAX_CONTEXT {
             return Err(anyhow!(
-                "conversation exceeds the 96 KiB context budget; start a focused question"
+                "conversation exceeds the 512 KiB request budget after compaction"
             ));
         }
         let curl = crate::providers::process::find_on_path("curl")
@@ -332,13 +387,6 @@ impl ChatProvider for OpenAiCompatible {
             .ok_or_else(|| anyhow!("OpenAI-compatible tool call has no id"))?;
         Ok(json!({"role":"tool","tool_call_id":id,"content":content}))
     }
-}
-
-fn required_environment(name: &str) -> Result<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("Set {name} to enable agent conversation"))
 }
 
 fn validate_remote_endpoint(endpoint: &str) -> Result<()> {
@@ -468,24 +516,31 @@ pub fn converse_with_events(
     .map(str::to_string)
     .collect();
     let mut messages = vec![json!({"role":"system","content":SYSTEM_PROMPT})];
-    for message in ledger
-        .messages
-        .iter()
-        .rev()
-        .take(12)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-    {
+    let mut history = Vec::new();
+    let mut history_bytes = 0usize;
+    for message in ledger.messages.iter().rev() {
+        // Tool transcripts are retained in the ledger for inspection, but
+        // replaying them as unmatched user messages wastes context and can
+        // confuse provider tool-call protocols.
+        if message.role == Role::Tool {
+            continue;
+        }
+        let text: String = message.text.chars().take(MAX_HISTORY_MESSAGE).collect();
+        if history_bytes.saturating_add(text.len()) > MAX_HISTORY && !history.is_empty() {
+            break;
+        }
+        history_bytes = history_bytes.saturating_add(text.len());
+        history.push((message.role, text));
+    }
+    for (role, text) in history.into_iter().rev() {
         // Historical tool results are context, not unmatched protocol tool
         // responses: provider messages must have complete tool-call pairs.
-        let role = if message.role == Role::Assistant {
+        let role = if role == Role::Assistant {
             "assistant"
         } else {
             "user"
         };
-        messages
-            .push(json!({"role":role,"content":format!("{:?}: {}", message.role, message.text)}));
+        messages.push(json!({"role":role,"content":text}));
     }
     messages.insert(1,json!({"role":"system","content":"Begin with session_status. Use discover_investigation_tools to request more tools for triage, code, strings, validation, memory, or external analysis. Newly discovered tools become callable on your next model round. Consider their reported availability before calling them."}));
     let mut evidence = Vec::new();
@@ -561,7 +616,7 @@ pub fn converse_with_events(
                 }
             }
             let encoded = serde_json::to_string(&result)?;
-            let bounded: String = encoded.chars().take(12_000).collect();
+            let bounded: String = encoded.chars().take(MAX_TOOL_PREVIEW).collect();
             let bounded = if bounded.len() < encoded.len() {
                 format!("Result preview truncated; request a smaller page.\n{bounded}")
             } else {
@@ -736,6 +791,58 @@ mod tests {
         assert!(validate_remote_endpoint("http://localhost:8080/v1/chat/completions").is_ok());
         assert!(validate_remote_endpoint("http://example.test/v1/chat/completions").is_err());
         assert!(validate_remote_endpoint("https://key@example.test/v1/chat/completions").is_err());
+    }
+
+    #[test]
+    fn saved_tool_transcripts_are_compacted_before_a_new_request() {
+        struct MeasuringProvider {
+            request_bytes: usize,
+            history_messages: usize,
+        }
+        impl ChatProvider for MeasuringProvider {
+            fn complete(&mut self, messages: &[Value], tools: &[Value]) -> Result<Value> {
+                self.request_bytes = serde_json::to_vec(&json!({
+                    "messages": messages,
+                    "tools": tools
+                }))?
+                .len();
+                self.history_messages = messages.len();
+                Ok(json!({"role":"assistant","content":"compacted"}))
+            }
+        }
+
+        let bytes = crate::formats::fixture::pe_with_driver();
+        let bin = crate::formats::analyze("fixture.exe", &bytes).unwrap();
+        let db = crate::db::Db::default();
+        let an = crate::analysis::engine::analyze(&bin, &bytes, 200_000, &db);
+        let session = Session {
+            bin,
+            bytes,
+            db,
+            an,
+            code_analyzed: true,
+        };
+        let mut ledger = Investigation::new("fixture");
+        for index in 0..20 {
+            ledger
+                .append(Role::Tool, "tool transcript ".repeat(700), vec![])
+                .unwrap();
+            ledger
+                .append(
+                    Role::Analyst,
+                    format!("question {index}: {}", "focused context ".repeat(500)),
+                    vec![],
+                )
+                .unwrap();
+        }
+        let mut provider = MeasuringProvider {
+            request_bytes: 0,
+            history_messages: 0,
+        };
+        let result = converse(&mut provider, &session, &ledger, |_| {}).unwrap();
+        assert_eq!(result["assistant"], "compacted");
+        assert!(provider.request_bytes < MAX_CONTEXT);
+        assert!(provider.history_messages < ledger.messages.len());
     }
 
     #[test]

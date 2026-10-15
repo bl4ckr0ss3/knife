@@ -224,6 +224,10 @@ pub struct TyRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ask {
     AgentQuestion,
+    AgentProvider,
+    AgentModel,
+    AgentBaseUrl,
+    AgentApiKey,
     Command,
     Filter,
     Name,
@@ -253,6 +257,10 @@ impl Ask {
     fn label(self) -> &'static str {
         match self {
             Ask::AgentQuestion => "agent message",
+            Ask::AgentProvider => "provider (ollama/openrouter/openai/compatible)",
+            Ask::AgentModel => "model",
+            Ask::AgentBaseUrl => "base URL",
+            Ask::AgentApiKey => "API key (blank keeps current)",
             Ask::Command => ":",
             Ask::Filter => "filter",
             Ask::Name => "name",
@@ -411,6 +419,7 @@ pub struct ListingViewRef<'a> {
 
 pub struct App {
     pub investigation: crate::api::investigation::Investigation,
+    pub agent_config: crate::agent::AgentConfig,
     pub investigation_open: bool,
     pub investigation_focused: bool,
     pub investigation_follow: bool,
@@ -566,6 +575,7 @@ impl App {
         };
         let mut app = App {
             investigation,
+            agent_config: crate::agent::AgentConfig::from_environment(),
             investigation_open: false,
             investigation_focused: true,
             investigation_follow: true,
@@ -1981,6 +1991,10 @@ impl App {
         let stored = at.wrapping_sub(self.base);
         match ask {
             Ask::AgentQuestion => self.investigation_question(text),
+            Ask::AgentProvider => self.agent_setup_provider(text),
+            Ask::AgentModel => self.agent_setup_model(text),
+            Ask::AgentBaseUrl => self.agent_setup_base_url(text),
+            Ask::AgentApiKey => self.agent_setup_api_key(text),
             Ask::Command => {
                 self.command_history.record(&text);
                 self.execute_command(&text);
@@ -2478,6 +2492,7 @@ impl App {
         if self.investigation_open && self.investigation_focused && self.prompt.is_none() {
             match key.code {
                 KeyCode::Char('i') => self.ask(Ask::AgentQuestion),
+                KeyCode::Char('S') => self.start_agent_setup(),
                 KeyCode::Char('f') => self.investigation_follow = !self.investigation_follow,
                 KeyCode::Tab => {
                     self.investigation_focused = false;
@@ -2629,6 +2644,7 @@ impl App {
                 self.investigation_focused = true;
                 self.ask(Ask::AgentQuestion);
             }
+            KeyCode::Char('S') => self.start_agent_setup(),
             KeyCode::Char('b') => self.execute_command("bookmark"),
             KeyCode::Char('+') | KeyCode::Char('=') => self.resize_pane(4),
             KeyCode::Char('-') => self.resize_pane(-4),
@@ -2919,7 +2935,10 @@ impl App {
             return;
         }
         let input = match ask {
-            Ask::Command | Ask::AgentQuestion => String::new(),
+            Ask::Command | Ask::AgentQuestion | Ask::AgentApiKey => String::new(),
+            Ask::AgentProvider => self.agent_config.provider.clone(),
+            Ask::AgentModel => self.agent_config.model.clone(),
+            Ask::AgentBaseUrl => self.agent_config.base_url.clone(),
             Ask::Filter if self.browser.is_some() => self.browser.as_ref().unwrap().filter.clone(),
             Ask::Filter => match self.left {
                 LeftView::Driver => self.dsrch.clone(),
@@ -4959,6 +4978,30 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
         assert_eq!(app.prompt.as_ref().unwrap().ask, Ask::AgentQuestion);
         assert!(rendered(&mut app, 160, 40).contains("Agent chat"));
+    }
+
+    #[test]
+    fn agent_provider_setup_is_in_tui_and_masks_the_api_key() {
+        let mut app = two_functions();
+        app.splash = false;
+        app.start_agent_setup();
+        assert_eq!(app.prompt.as_ref().unwrap().ask, Ask::AgentProvider);
+        app.commit(Ask::AgentProvider, 0, "openrouter".into());
+        assert_eq!(app.prompt.as_ref().unwrap().ask, Ask::AgentModel);
+        app.commit(Ask::AgentModel, 0, "example/model".into());
+        assert_eq!(app.prompt.as_ref().unwrap().ask, Ask::AgentApiKey);
+        app.prompt.as_mut().unwrap().input = "super-secret-key".into();
+        let screen = rendered(&mut app, 160, 40);
+        assert!(!screen.contains("super-secret-key"));
+        assert!(screen.contains("••••"));
+        app.prompt = None;
+        app.commit(Ask::AgentApiKey, 0, "super-secret-key".into());
+        assert!(app.prompt.is_none());
+        assert!(app
+            .agent_config
+            .status()
+            .contains("OpenRouter / example/model"));
+        assert!(!rendered(&mut app, 160, 40).contains("super-secret-key"));
     }
 
     #[test]

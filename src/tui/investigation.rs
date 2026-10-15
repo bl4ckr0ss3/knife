@@ -35,7 +35,7 @@ impl App {
                     .into();
             return;
         }
-        let mut provider = match crate::agent::ConfiguredProvider::from_environment() {
+        let mut provider = match crate::agent::ConfiguredProvider::from_config(&self.agent_config) {
             Ok(provider) => provider,
             Err(error) => {
                 self.investigation_activity = error.to_string();
@@ -87,6 +87,96 @@ impl App {
             let _ = sender.send(result);
         });
         self.investigation_worker = Some(receiver);
+    }
+
+    pub fn start_agent_setup(&mut self) {
+        if self.investigation_worker.is_some() {
+            self.status = "Interrupt active agent work before changing its provider".into();
+            return;
+        }
+        self.investigation_open = true;
+        self.investigation_focused = true;
+        self.status = "Provider setup stays in memory; credentials are not saved".into();
+        self.ask(super::Ask::AgentProvider);
+    }
+
+    pub fn agent_setup_provider(&mut self, provider: String) {
+        let provider = provider.trim().to_ascii_lowercase();
+        if !matches!(
+            provider.as_str(),
+            "ollama" | "openrouter" | "openai" | "compatible" | "openai-compatible"
+        ) {
+            self.status = "Provider must be ollama, openrouter, openai, or compatible".into();
+            self.ask(super::Ask::AgentProvider);
+            return;
+        }
+        self.agent_config.provider = if provider == "openai-compatible" {
+            "compatible".into()
+        } else {
+            provider
+        };
+        if self.agent_config.provider == "ollama" && self.agent_config.base_url.is_empty() {
+            self.agent_config.base_url = "http://127.0.0.1:11434".into();
+        }
+        self.status = "Choose the exact provider model identifier".into();
+        self.ask(super::Ask::AgentModel);
+    }
+
+    pub fn agent_setup_model(&mut self, model: String) {
+        let model = model.trim();
+        if model.is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
+            self.status = "Model must be a non-empty identifier under 257 characters".into();
+            self.ask(super::Ask::AgentModel);
+            return;
+        }
+        self.agent_config.model = model.into();
+        match self.agent_config.provider.as_str() {
+            "ollama" | "compatible" => {
+                self.status = if self.agent_config.provider == "ollama" {
+                    "Confirm the local Ollama URL".into()
+                } else {
+                    "Enter the OpenAI-compatible API base URL".into()
+                };
+                self.ask(super::Ask::AgentBaseUrl);
+            }
+            _ => {
+                self.status = if self.agent_config.has_api_key() {
+                    "Enter a replacement API key, or leave blank to keep the loaded key".into()
+                } else {
+                    "Enter the API key; input is masked and retained in memory only".into()
+                };
+                self.ask(super::Ask::AgentApiKey);
+            }
+        }
+    }
+
+    pub fn agent_setup_base_url(&mut self, base_url: String) {
+        self.agent_config.base_url = base_url.trim().to_string();
+        if self.agent_config.provider == "ollama" {
+            self.finish_agent_setup();
+        } else {
+            self.status = if self.agent_config.has_api_key() {
+                "Enter a replacement API key, or leave blank to keep the loaded key".into()
+            } else {
+                "Enter the API key; input is masked and retained in memory only".into()
+            };
+            self.ask(super::Ask::AgentApiKey);
+        }
+    }
+
+    pub fn agent_setup_api_key(&mut self, api_key: String) {
+        if !api_key.is_empty() {
+            self.agent_config.api_key = api_key;
+        }
+        self.finish_agent_setup();
+    }
+
+    fn finish_agent_setup(&mut self) {
+        self.investigation_activity = self.agent_config.status();
+        self.status = match crate::agent::ConfiguredProvider::from_config(&self.agent_config) {
+            Ok(_) => "Agent provider ready; press i to start a conversation".into(),
+            Err(error) => format!("Provider setup incomplete: {error}"),
+        };
     }
 
     pub fn run_investigation_tool(&mut self, input: &str) {
@@ -213,6 +303,9 @@ impl App {
                 match saved {
                     Ok(()) => {
                         self.investigation = next;
+                        self.investigation_evidence_detail = false;
+                        self.investigation_message_offset = 0;
+                        self.investigation_message_scroll = 0;
                         self.investigation_activity =
                             "Completed; evidence and tool response saved".into();
                     }
@@ -242,6 +335,9 @@ impl App {
                 self.investigation = next;
                 self.investigation_open = true;
                 self.investigation_focused = true;
+                self.investigation_evidence_detail = false;
+                self.investigation_message_offset = 0;
+                self.investigation_message_scroll = 0;
                 self.status = format!("Saved investigation question #{id}");
                 self.start_investigation_agent();
             }

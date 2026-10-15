@@ -3,6 +3,7 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Investigation,
+    AgentSetup,
     Contradictions,
     RefreshInvestigation,
     Ask(String),
@@ -42,6 +43,7 @@ pub enum Command {
 
 pub const NAMES: &[&str] = &[
     "investigation",
+    "agent-setup",
     "contradictions",
     "investigation-reload",
     "ask",
@@ -103,6 +105,7 @@ impl super::App {
                 self.investigation_focused = true;
                 self.investigation_conflicts_only = false;
             }
+            Command::AgentSetup => self.start_agent_setup(),
             Command::Contradictions => {
                 self.investigation_open = true;
                 self.investigation_conflicts_only = true;
@@ -300,6 +303,7 @@ pub fn parse(input: &str) -> Result<Command, String> {
     };
     match verb {
         "investigation" | "agent" => no_args(Command::Investigation),
+        "agent-setup" | "provider" => no_args(Command::AgentSetup),
         "contradictions" => no_args(Command::Contradictions),
         "investigation-reload" => no_args(Command::RefreshInvestigation),
         "ask" => required().map(Command::Ask),
