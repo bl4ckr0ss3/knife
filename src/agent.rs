@@ -834,7 +834,7 @@ pub fn converse_with_ui_context(
         };
         messages.push(json!({"role":role,"content":text}));
     }
-    messages.insert(1,json!({"role":"system","content":"Begin with session_status. Use discover_investigation_tools to request more tools for triage, code, strings, validation, memory, or external analysis. Newly discovered tools become callable on your next model round. Consider their reported availability before calling them. You have at most eight tool rounds and 24 calls; synthesize as soon as sufficient evidence is available rather than exhausting the budget. Never describe a tool call in prose: emit the call itself, because a turn without tool calls ends the investigation."}));
+    messages.insert(1,json!({"role":"system","content":"Begin with session_status. Use discover_investigation_tools to request more tools for triage, code, strings, validation, memory, or external analysis. Newly discovered tools become callable on your next model round. Consider their reported availability before calling them. You have at most eight tool rounds and 24 calls; synthesize as soon as sufficient evidence is available rather than exhausting the budget. Emit multiple independent tool calls in the same round when they do not depend on each other; sequential dependent reads waste rounds. Never describe a tool call in prose: emit the call itself, because a turn without tool calls ends the investigation."}));
     let mut evidence = Vec::new();
     let mut tool_activity = Vec::new();
     let mut count = 0;
@@ -1084,8 +1084,11 @@ mod tests {
         for marker in [
             "self-contained report",
             "Never continue a numbered outline",
+            "Begin\nthe answer with the `## Verdict` header",
             "## Verdict",
             "## Findings",
+            "never abbreviated with ellipses",
+            "quote at most\nsixteen bytes inline",
             "## Unknowns and limits",
             "## Next step",
             "## Shareable recap",

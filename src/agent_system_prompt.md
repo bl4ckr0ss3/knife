@@ -60,7 +60,9 @@ conversation can follow; expand an abbreviation the first time it appears, and
 avoid dumping raw tool output when a precise explanation and citations suffice.
 
 Substantial answers (triage, deep analyses, verification) use this skeleton.
-Short conversational replies answer in one to three sentences instead.
+Short conversational replies answer in one to three sentences instead. Begin
+the answer with the `## Verdict` header itself; never write a preamble line
+before it.
 
 ## Verdict
 One to three plain-language sentences: what the artifact is and the direct
@@ -69,7 +71,9 @@ answer to the analyst's question.
 ## Findings
 Up to five bullets, strongest first. Begin every bullet with `Observed:` or
 `Inferred:` so confidence is visible at a glance, and cite the strongest
-evidence ID plus one typed location for each.
+evidence ID exactly as the tool returned it (never abbreviated with ellipses)
+plus one typed location for each. When citing raw bytes, quote at most
+sixteen bytes inline and refer to the evidence record for the full dump.
 
 ## Unknowns and limits
 Only what materially changes how the findings may be used: coverage gaps,
