@@ -48,8 +48,13 @@ request still sends the recent conversation and tool
 results to the configured service, so use Ollama for targets that must remain
 local. There is no default hosted model or account requirement.
 
-Each request has a 60-second timeout, the loop allows eight model rounds and 24
-tool calls, and serialized context is capped at 512 KiB. Before a new request,
+Each request has a 60-second timeout, the loop allows eight model rounds and
+48 tool calls, and serialized context is capped at 512 KiB. Tool calls run
+locally against the open analysis, so the budget favors many local reads over
+additional model round-trips. While a hosted or local model streams its
+answer, the activity line shows a live tail of the reply — and of the
+provider's reasoning stream when one is sent — so the thought process is
+visible before the final answer lands. Before a new request,
 Knife excludes saved tool transcripts from protocol history and retains a
 bounded recent conversation window. Live tool results are also bounded, so a
 large saved investigation cannot prevent a focused follow-up from starting.

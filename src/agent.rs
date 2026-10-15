@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const MAX_ROUNDS: usize = 8;
-const MAX_CALLS: usize = 24;
+/// Tool calls run locally against already-opened analysis state, so they cost
+/// milliseconds; a model round costs a provider request. The budget therefore
+/// favors many local reads over more model round-trips.
+const MAX_CALLS: usize = 48;
 /// How many times a run may bounce a narration-only model turn back to work.
 /// Narration that promises future analysis ("let me inspect...") without a
 /// tool call otherwise ends the whole run before any evidence is collected.
@@ -497,7 +500,13 @@ impl ChatProvider for Ollama {
             OsString::from(format!("{}/api/chat", self.endpoint)),
         ])
         .collect();
-        let output = stream_process(&curl, args, payload.into_bytes(), progress)?;
+        let output = stream_process(
+            crate::providers::stream::StreamKind::OllamaNdjson,
+            &curl,
+            args,
+            payload.into_bytes(),
+            progress,
+        )?;
         if !output.status.success() {
             return Err(anyhow!(
                 "Ollama request failed or exceeded its output bound"
@@ -512,28 +521,22 @@ impl ChatProvider for Ollama {
     }
 }
 
-/// Run a streaming provider request and report received bytes as progress.
+/// Run a streaming provider request and report streamed text as progress.
 fn stream_process(
+    kind: crate::providers::stream::StreamKind,
     curl: &Path,
     args: Vec<OsString>,
     payload: Vec<u8>,
     progress: &mut dyn FnMut(&str),
 ) -> Result<crate::providers::process::ProcessOutput> {
-    let mut received = 0usize;
-    let mut reported = 0usize;
+    let mut tailer = crate::providers::stream::StreamTailer::new(kind);
     let output = crate::providers::process::run_process_streaming(
         curl,
         args,
         payload,
         Duration::from_secs(65),
         MAX_PROVIDER_RESPONSE,
-        |chunk| {
-            received = received.saturating_add(chunk.len());
-            if received.saturating_sub(reported) >= 2048 {
-                reported = received;
-                progress(&format!("Streaming reply… {} kB", received / 1024));
-            }
-        },
+        |chunk| tailer.feed(chunk, progress),
     )?;
     if output.truncated {
         return Err(anyhow!(
@@ -541,6 +544,7 @@ fn stream_process(
             MAX_PROVIDER_RESPONSE / (1024 * 1024)
         ));
     }
+    progress(&tailer.summary());
     Ok(output)
 }
 
@@ -767,7 +771,13 @@ impl ChatProvider for OpenAiCompatible {
             OsString::from(&self.endpoint),
         ])
         .collect();
-        let output = stream_process(&curl, args, payload, progress)?;
+        let output = stream_process(
+            crate::providers::stream::StreamKind::OpenAiSse,
+            &curl,
+            args,
+            payload,
+            progress,
+        )?;
         if !output.status.success() {
             let detail = provider_error_detail(&output.stdout, &output.stderr);
             return Err(anyhow!(
@@ -1034,12 +1044,12 @@ pub fn converse_with_ui_context(
         };
         messages.push(json!({"role":role,"content":text}));
     }
-    messages.insert(1,json!({"role":"system","content":"Begin with session_status. Use discover_investigation_tools to request more tools for triage, code, strings, validation, memory, or external analysis. Newly discovered tools become callable on your next model round. Consider their reported availability before calling them. You have at most eight tool rounds and 24 calls; synthesize as soon as sufficient evidence is available rather than exhausting the budget. Emit multiple independent tool calls in the same round when they do not depend on each other; sequential dependent reads waste rounds. Never describe a tool call in prose: emit the call itself, because a turn without tool calls ends the investigation."}));
+    messages.insert(1,json!({"role":"system","content":format!("Begin with session_status. Use discover_investigation_tools to request more tools for triage, code, strings, validation, memory, or external analysis. Newly discovered tools become callable on your next model round. Consider their reported availability before calling them. You have at most eight tool rounds and {MAX_CALLS} calls; synthesize as soon as sufficient evidence is available rather than exhausting the budget. Emit multiple independent tool calls in the same round when they do not depend on each other; sequential dependent reads waste rounds. Never describe a tool call in prose: emit the call itself, because a turn without tool calls ends the investigation.")}));
     let mut evidence = Vec::new();
     let mut tool_activity = Vec::new();
     let mut count = 0;
     let mut continuations = 0;
-    let mut limit_reason = "the 8-round investigation limit";
+    let mut limit_reason = String::from("the 8-round investigation limit");
     for round in 0..MAX_ROUNDS {
         if cancellation.is_cancelled() {
             return Err(anyhow!("investigation cancelled"));
@@ -1140,7 +1150,7 @@ pub fn converse_with_ui_context(
             messages.push(provider.tool_result(&call, name, bounded)?);
         }
         if call_budget_exhausted {
-            limit_reason = "the 24-tool-call limit";
+            limit_reason = format!("the {MAX_CALLS}-tool-call limit");
             break;
         }
     }
@@ -1155,7 +1165,7 @@ pub fn converse_with_ui_context(
     events(AgentEvent::Activity(
         "Tool budget reached; synthesizing the collected evidence".into(),
     ));
-    messages.push(json!({"role":"system","content":synthesis_instruction(limit_reason)}));
+    messages.push(json!({"role":"system","content":synthesis_instruction(&limit_reason)}));
     let fallback = format!(
         "Partial investigation: the agent reached {limit_reason} after {count} tool calls. Knife preserved {} evidence record(s) and the tool transcript. Review the findings below or ask a narrower follow-up question to continue.",
         evidence.len()
@@ -1884,7 +1894,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            updates.iter().any(|update| update.contains("Streaming")),
+            updates.iter().any(|update| update.starts_with("Replying…")),
             "{updates:?}"
         );
     }
@@ -1938,7 +1948,7 @@ mod tests {
             .as_str()
             .is_some_and(|content| content.starts_with("bbb")));
         assert!(
-            updates.iter().any(|update| update.contains("Streaming")),
+            updates.iter().any(|update| update.starts_with("Replying…")),
             "{updates:?}"
         );
     }

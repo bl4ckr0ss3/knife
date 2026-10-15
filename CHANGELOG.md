@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Tool-call budgets grew from 24 to 48 per investigation: local analysis calls
+  cost milliseconds while model rounds cost a provider request, so deep
+  analyses stop dying at the budget before finishing their reads.
+- Streamed model replies are now shown live in the activity line — a tail of
+  the visible reply, the provider's reasoning stream when one is sent, and
+  `Preparing tool call: <name>` as fragments arrive — instead of a silent
+  byte counter.
+
 - Agent runs no longer end when the model merely narrates next steps: answers
   that promise future work ("let me inspect...", "two reads will finish
   coverage") without a tool call are nudged up to twice per run to invoke

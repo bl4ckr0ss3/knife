@@ -10,6 +10,172 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
+/// Which protocol a streamed body speaks.
+#[derive(Clone, Copy)]
+pub(crate) enum StreamKind {
+    OpenAiSse,
+    OllamaNdjson,
+}
+
+/// Incremental progress extractor for streamed model replies.
+///
+/// Feeds raw transport chunks, splits complete lines at byte level (safe
+/// across chunked UTF-8 boundaries), and reports a live tail of the model's
+/// visible text — and its reasoning when the provider streams one — so the
+/// analyst watches the thought process instead of a silent spinner. Reports
+/// are throttled so tiny deltas cannot flood the activity line.
+pub(crate) struct StreamTailer {
+    kind: StreamKind,
+    pending: Vec<u8>,
+    content: String,
+    reasoning: String,
+    content_chars: usize,
+    reasoning_chars: usize,
+    reported_at: usize,
+    last_tool: String,
+}
+
+impl StreamTailer {
+    pub(crate) fn new(kind: StreamKind) -> Self {
+        Self {
+            kind,
+            pending: Vec::new(),
+            content: String::new(),
+            reasoning: String::new(),
+            content_chars: 0,
+            reasoning_chars: 0,
+            reported_at: 0,
+            last_tool: String::new(),
+        }
+    }
+
+    pub(crate) fn feed(&mut self, chunk: &[u8], report: &mut dyn FnMut(&str)) {
+        self.pending.extend_from_slice(chunk);
+        while let Some(position) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = self.pending.drain(..=position).collect();
+            self.process_line(&line[..line.len() - 1], report);
+        }
+        if self.pending.len() > 64 * 1024 {
+            // A pathological unterminated line must not grow without bound;
+            // drop it and keep streaming the rest of the body.
+            self.pending.clear();
+        }
+    }
+
+    /// Closing status line once the stream ends.
+    pub(crate) fn summary(&self) -> String {
+        if self.content_chars > 0 {
+            format!("Reply complete: {} chars", self.content_chars)
+        } else if self.reasoning_chars > 0 {
+            format!("Thinking complete: {} chars", self.reasoning_chars)
+        } else {
+            "Stream ended without visible reply text".to_string()
+        }
+    }
+
+    fn process_line(&mut self, line: &[u8], report: &mut dyn FnMut(&str)) {
+        let text = String::from_utf8_lossy(line);
+        let text = text.trim_end_matches('\r');
+        let payload = match self.kind {
+            StreamKind::OpenAiSse => {
+                let Some(data) = text.trim().strip_prefix("data:") else {
+                    return;
+                };
+                let data = data.trim();
+                if data.is_empty() || data == "[DONE]" {
+                    return;
+                }
+                data
+            }
+            StreamKind::OllamaNdjson => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    return;
+                }
+                trimmed
+            }
+        };
+        let Ok(value) = serde_json::from_str::<Value>(payload) else {
+            return;
+        };
+        let (content_delta, reasoning_delta, tool_name) = match self.kind {
+            StreamKind::OpenAiSse => {
+                let Some(delta) = value.pointer("/choices/0/delta") else {
+                    return;
+                };
+                (
+                    delta.get("content").and_then(Value::as_str),
+                    delta
+                        .get("reasoning_content")
+                        .or_else(|| delta.get("reasoning"))
+                        .and_then(Value::as_str),
+                    delta
+                        .pointer("/tool_calls/0/function/name")
+                        .and_then(Value::as_str),
+                )
+            }
+            StreamKind::OllamaNdjson => {
+                let Some(message) = value.get("message") else {
+                    return;
+                };
+                (
+                    message.get("content").and_then(Value::as_str),
+                    None,
+                    message
+                        .pointer("/tool_calls/0/function/name")
+                        .and_then(Value::as_str),
+                )
+            }
+        };
+        if let Some(piece) = reasoning_delta {
+            self.reasoning.push_str(piece);
+            self.reasoning_chars += piece.chars().count();
+        }
+        if let Some(piece) = content_delta {
+            self.content.push_str(piece);
+            self.content_chars += piece.chars().count();
+        }
+        if let Some(name) = tool_name {
+            if !name.is_empty() && self.last_tool != name {
+                self.last_tool = name.to_string();
+                report(&format!("Preparing tool call: {name}"));
+                self.reported_at = self.content_chars + self.reasoning_chars;
+                return;
+            }
+        }
+        let total = self.content_chars + self.reasoning_chars;
+        if total.saturating_sub(self.reported_at) >= 120 {
+            self.reported_at = total;
+            if self.content_chars > 0 {
+                report(&format!(
+                    "Replying… {} chars · {}",
+                    self.content_chars,
+                    tail(&self.content)
+                ));
+            } else {
+                report(&format!(
+                    "Thinking… {} chars · {}",
+                    self.reasoning_chars,
+                    tail(&self.reasoning)
+                ));
+            }
+        }
+    }
+}
+
+/// The last `chars` of `text` on one line, for a single-line status display.
+fn tail(text: &str) -> String {
+    let collected: String = text
+        .chars()
+        .rev()
+        .take(96)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    collected.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Reassemble an OpenAI-compatible SSE body into one assistant message.
 ///
 /// Content deltas concatenate; tool calls reassemble by index from `id`,
@@ -198,5 +364,79 @@ mod tests {
     fn an_ollama_body_without_json_lines_is_an_error() {
         assert!(ollama_ndjson_message(b"not json\n").is_err());
         assert!(ollama_ndjson_message(b"").is_err());
+    }
+
+    #[test]
+    fn the_tailer_streams_thought_then_reply_with_throttled_reports() {
+        let mut tailer = StreamTailer::new(StreamKind::OpenAiSse);
+        let mut reports: Vec<String> = Vec::new();
+        // Reasoning first. The value is split across three chunks, including
+        // the two bytes of é, so a chunk boundary must not corrupt the line.
+        let ones = "w".repeat(100);
+        let fifties = "w".repeat(50);
+        tailer.feed(
+            format!("data: {{\"choices\":[{{\"delta\":{{\"reasoning_content\":\"{ones}").as_bytes(),
+            &mut |m| reports.push(m.to_string()),
+        );
+        tailer.feed(fifties.as_bytes(), &mut |m| reports.push(m.to_string()));
+        tailer.feed(&[0xC3], &mut |m| reports.push(m.to_string()));
+        tailer.feed(b"\xA9tre\"}}]}\n\n", &mut |m| reports.push(m.to_string()));
+        assert!(
+            reports.iter().any(|m| m.starts_with("Thinking…")),
+            "{reports:?}"
+        );
+        tailer.feed(
+            format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+                "Reading the gate constants. ".repeat(6)
+            )
+            .as_bytes(),
+            &mut |m| reports.push(m.to_string()),
+        );
+        assert!(
+            reports.iter().any(|m| m.starts_with("Replying…")),
+            "{reports:?}"
+        );
+        assert!(tailer.summary().starts_with("Reply complete: "));
+    }
+
+    #[test]
+    fn the_tailer_announces_tool_calls_and_ignores_keepalives() {
+        let mut tailer = StreamTailer::new(StreamKind::OpenAiSse);
+        let mut reports = Vec::new();
+        tailer.feed(b": ping\n\ndata: [DONE]\n\n", &mut |m| {
+            reports.push(m.to_string())
+        });
+        assert!(reports.is_empty(), "{reports:?}");
+        tailer.feed(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"strings\"}}]}}]}\n\n",
+            &mut |m| reports.push(m.to_string()),
+        );
+        assert_eq!(
+            reports.last().map(String::as_str),
+            Some("Preparing tool call: strings")
+        );
+        // Repeating the same name must not re-announce.
+        tailer.feed(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n",
+            &mut |m| reports.push(m.to_string()),
+        );
+        assert_eq!(
+            reports.last().map(String::as_str),
+            Some("Preparing tool call: strings")
+        );
+    }
+
+    #[test]
+    fn the_tailer_handles_ollama_lines_and_bounded_pending() {
+        let mut tailer = StreamTailer::new(StreamKind::OllamaNdjson);
+        let mut reports = Vec::new();
+        tailer.feed(
+            b"{\"message\":{\"content\":\"Hello world\"},\"done\":false}\n",
+            &mut |m| reports.push(m.to_string()),
+        );
+        // An unterminated monster line is dropped, not grown without bound.
+        tailer.feed(&[b'x'; 70 * 1024], &mut |m| reports.push(m.to_string()));
+        assert!(tailer.summary().starts_with("Reply complete: "));
     }
 }
