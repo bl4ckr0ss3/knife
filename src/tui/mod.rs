@@ -2592,11 +2592,24 @@ impl App {
                 }
                 KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.investigation_message_scroll =
-                        self.investigation_message_scroll.saturating_sub(1)
+                        self.investigation_message_scroll.saturating_sub(3)
                 }
                 KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.investigation_message_scroll =
-                        self.investigation_message_scroll.saturating_add(1)
+                    self.investigation_message_scroll = self
+                        .investigation_message_scroll
+                        .saturating_add(3)
+                        .min(render::investigation_scroll_max(self))
+                }
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.investigation_selection = self.investigation_selection.saturating_sub(1)
+                }
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.investigation_selection = (self.investigation_selection + 1)
+                        .min(self.investigation.evidence.len().saturating_sub(1))
+                }
+                KeyCode::Home => self.investigation_message_scroll = 0,
+                KeyCode::End => {
+                    self.investigation_message_scroll = render::investigation_scroll_max(self)
                 }
                 KeyCode::Esc => {
                     self.investigation_open = false;
@@ -2604,9 +2617,19 @@ impl App {
                     self.investigation_zoomed = false;
                 }
                 KeyCode::Up => {
-                    self.investigation_selection = self.investigation_selection.saturating_sub(1)
+                    self.investigation_message_scroll =
+                        self.investigation_message_scroll.saturating_sub(1)
                 }
                 KeyCode::Down => {
+                    self.investigation_message_scroll = self
+                        .investigation_message_scroll
+                        .saturating_add(1)
+                        .min(render::investigation_scroll_max(self))
+                }
+                KeyCode::Char('k') => {
+                    self.investigation_selection = self.investigation_selection.saturating_sub(1)
+                }
+                KeyCode::Char('j') => {
                     self.investigation_selection = (self.investigation_selection + 1)
                         .min(self.investigation.evidence.len().saturating_sub(1))
                 }
@@ -3195,8 +3218,10 @@ impl App {
                             self.investigation_message_scroll.saturating_sub(3)
                     }
                     MouseEventKind::ScrollDown => {
-                        self.investigation_message_scroll =
-                            self.investigation_message_scroll.saturating_add(3)
+                        self.investigation_message_scroll = self
+                            .investigation_message_scroll
+                            .saturating_add(3)
+                            .min(render::investigation_scroll_max(self))
                     }
                     _ => {}
                 }
@@ -5020,6 +5045,38 @@ mod tests {
         assert!(app.investigation_open);
         assert!(!app.investigation_focused);
         assert_eq!(app.focus, Focus::Listing);
+    }
+
+    #[test]
+    fn plain_arrows_scroll_agent_chat_and_clamp_at_both_ends() {
+        let mut app = two_functions();
+        let long_answer = (0..80)
+            .map(|index| format!("analysis line {index:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.investigation
+            .append(
+                crate::api::investigation::Role::Assistant,
+                long_answer,
+                vec![],
+            )
+            .unwrap();
+        app.execute_command("investigation");
+        app.dims = (120, 32);
+        let _ = rendered(&mut app, 120, 32);
+        let maximum = render::investigation_scroll_max(&app);
+        assert!(maximum > 1);
+
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.investigation_message_scroll, 1);
+        app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.investigation_message_scroll, maximum);
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.investigation_message_scroll, maximum);
+        app.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.investigation_message_scroll, 0);
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.investigation_message_scroll, 0);
     }
 
     #[test]

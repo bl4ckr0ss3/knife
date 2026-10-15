@@ -268,7 +268,7 @@ fn investigation_desk(f: &mut Frame, app: &App) {
         ]),
         TLine::from(Span::styled(
             if app.investigation_focused {
-                " i chat · S setup · f follow · z maximize · Tab workspace"
+                " ↑↓ scroll chat · j/k evidence · i chat · S setup · z maximize"
             } else {
                 " Ctrl+Tab or F6 focuses this desk"
             },
@@ -326,7 +326,7 @@ fn investigation_desk(f: &mut Frame, app: &App) {
         }
     }
     lines.push(TLine::from(Span::styled(
-        " EVIDENCE  ↑↓ select · e inspect · Enter follow",
+        " EVIDENCE  j/k or Shift+↑↓ select · e inspect · Enter follow",
         Style::default().fg(accent()).add_modifier(Modifier::BOLD),
     )));
     let evidence_height = usize::from(desk.height.saturating_sub(2)).saturating_sub(lines.len());
@@ -596,6 +596,38 @@ fn agent_conversation(app: &App) -> Vec<TLine<'static>> {
         ]));
     }
     lines
+}
+
+/// Last useful vertical scroll position for the visible conversation/detail
+/// pane. Keeping this derived from the same styled lines and wrapping rules as
+/// rendering prevents arrow or mouse scrolling into an empty black pane.
+pub(super) fn investigation_scroll_max(app: &App) -> u16 {
+    let desk = app.panes(Rect::new(0, 0, app.dims.0, app.dims.1)).agent;
+    let conversation_area = if app.investigation_zoomed && desk.width >= 100 {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(desk)[0]
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(desk)[0]
+    };
+    let inner_width = conversation_area.width.saturating_sub(2);
+    let inner_height = usize::from(conversation_area.height.saturating_sub(2));
+    if inner_width == 0 || inner_height == 0 {
+        return 0;
+    }
+    let lines = if app.investigation_evidence_detail {
+        evidence_detail_lines(app)
+    } else {
+        agent_conversation(app)
+    };
+    let rows = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .line_count(inner_width);
+    u16::try_from(rows.saturating_sub(inner_height)).unwrap_or(u16::MAX)
 }
 
 fn conversation_body_line(

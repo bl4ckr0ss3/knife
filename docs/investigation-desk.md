@@ -105,11 +105,13 @@ to its first static location without closing the desk. Esc closes the desk;
 `:` opens command input while leaving it visible.
 The desk separates conversation from findings. Its chat pane shows a compact
 thread of recent analyst and Knife messages rather than exposing protocol tool
-transcripts as chat. PgUp/PgDn browse older/newer messages; Ctrl+Up/Down scroll
-the thread.
+transcripts as chat. Up/Down scroll the visible thread, Ctrl+Up/Down scroll it
+three rows at a time, Home/End jump to its beginning/end, and PgUp/PgDn browse
+older/newer messages. Scrolling is clamped so the conversation cannot disappear
+into an empty pane. Use `j`/`k` or Shift+Up/Down to select evidence.
 Press `e` to inspect selected evidence in the upper panel: producer, typed hex
 locations, observation/inference/unknown statements, confidence and limitations.
-Ctrl+Up/Down scrolls these details; `e` returns to conversation. Sending a new
+The same scrolling keys move through these details; `e` returns to conversation. Sending a new
 message and receiving an answer automatically return the upper pane to the
 conversation so an old evidence-detail selection cannot hide the response.
 Conversation badges identify `YOU` and the configured model by its readable

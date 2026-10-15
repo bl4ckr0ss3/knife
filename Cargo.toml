@@ -68,7 +68,7 @@ flate2 = "1"
 tar = "0.4"
 zip = { version = "6", default-features = false, features = ["deflate"] }
 self-replace = "1.5"
-ratatui = "0.30"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 cpp_demangle = "0.5.1"
 msvc-demangler = "0.11.0"
 rustc-demangle = "0.1.28"

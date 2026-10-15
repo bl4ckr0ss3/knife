@@ -14,6 +14,7 @@ const MAX_CONTEXT: usize = 512 * 1024;
 const MAX_HISTORY: usize = 32 * 1024;
 const MAX_HISTORY_MESSAGE: usize = 4 * 1024;
 const MAX_TOOL_PREVIEW: usize = 8 * 1024;
+const MAX_PROVIDER_RESPONSE: usize = 8 * 1024 * 1024;
 const SYSTEM_PROMPT: &str = include_str!("agent_system_prompt.md");
 const CREDENTIAL_SERVICE: &str = "io.github.bl4ckr0ss3.knife";
 
@@ -361,7 +362,12 @@ impl Ollama {
 
 impl ChatProvider for Ollama {
     fn complete(&mut self, messages: &[Value], tools: &[Value]) -> Result<Value> {
-        let mut request = json!({"model": self.model, "messages": messages, "stream": false});
+        let mut request = json!({
+            "model": self.model,
+            "messages": messages,
+            "stream": false,
+            "max_tokens": 8192
+        });
         if !tools.is_empty() {
             request["tools"] = json!(tools);
         }
@@ -541,24 +547,50 @@ impl ChatProvider for OpenAiCompatible {
             args,
             payload,
             Duration::from_secs(65),
-            1024 * 1024,
+            MAX_PROVIDER_RESPONSE,
         )?;
-        if !result.status.success() || result.truncated {
-            let detail: String = String::from_utf8_lossy(&result.stdout)
-                .chars()
-                .take(500)
-                .collect();
+        if result.truncated {
             return Err(anyhow!(
-                "{} request failed or exceeded its output bound{}",
+                "{} response exceeded Knife's {} MiB safety limit",
                 self.service.label(),
-                if detail.trim().is_empty() {
-                    String::new()
+                MAX_PROVIDER_RESPONSE / (1024 * 1024)
+            ));
+        }
+        if !result.status.success() {
+            let detail = provider_error_detail(&result.stdout, &result.stderr);
+            return Err(anyhow!(
+                "{} request failed (transport exit {}){}",
+                self.service.label(),
+                result
+                    .status
+                    .code()
+                    .map_or_else(|| "unknown".into(), |code| code.to_string()),
+                if detail.is_empty() {
+                    "; check network access, API key, model availability, and account credits"
+                        .into()
                 } else {
                     format!(": {detail}")
                 }
             ));
         }
-        let result: Value = serde_json::from_slice(&result.stdout)?;
+        let result: Value = serde_json::from_slice(&result.stdout).map_err(|error| {
+            anyhow!(
+                "{} returned invalid JSON: {error}{}",
+                self.service.label(),
+                response_preview(&result.stdout)
+            )
+        })?;
+        if let Some(error) = result.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| error.as_str())
+                .unwrap_or("provider returned an unspecified error");
+            return Err(anyhow!(
+                "{} rejected the request: {message}",
+                self.service.label()
+            ));
+        }
         result
             .pointer("/choices/0/message")
             .filter(|message| message.is_object())
@@ -573,6 +605,53 @@ impl ChatProvider for OpenAiCompatible {
             .ok_or_else(|| anyhow!("OpenAI-compatible tool call has no id"))?;
         Ok(json!({"role":"tool","tool_call_id":id,"content":content}))
     }
+}
+
+fn provider_error_detail(stdout: &[u8], stderr: &[u8]) -> String {
+    for bytes in [stdout, stderr] {
+        if bytes.is_empty() {
+            continue;
+        }
+        if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+            if let Some(message) = value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .or_else(|| value.get("message").and_then(Value::as_str))
+            {
+                return clean_provider_detail(message);
+            }
+        }
+        let detail = clean_provider_detail(&String::from_utf8_lossy(bytes));
+        if !detail.is_empty() {
+            return detail;
+        }
+    }
+    String::new()
+}
+
+fn response_preview(bytes: &[u8]) -> String {
+    let preview = clean_provider_detail(&String::from_utf8_lossy(bytes));
+    if preview.is_empty() {
+        String::new()
+    } else {
+        format!("; response began: {preview}")
+    }
+}
+
+fn clean_provider_detail(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(800)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 fn validate_remote_endpoint(endpoint: &str) -> Result<()> {
@@ -1037,6 +1116,19 @@ mod tests {
         assert!(validate_remote_endpoint("http://localhost:8080/v1/chat/completions").is_ok());
         assert!(validate_remote_endpoint("http://example.test/v1/chat/completions").is_err());
         assert!(validate_remote_endpoint("https://key@example.test/v1/chat/completions").is_err());
+    }
+
+    #[test]
+    fn hosted_provider_errors_preserve_the_actionable_message() {
+        let json = br#"{"error":{"message":"model unavailable for this account"}}"#;
+        assert_eq!(
+            provider_error_detail(json, b"curl: (22) HTTP 404"),
+            "model unavailable for this account"
+        );
+        assert_eq!(
+            provider_error_detail(b"", b"curl: (6) Could not resolve host\n"),
+            "curl: (6) Could not resolve host"
+        );
     }
 
     #[test]
