@@ -145,6 +145,7 @@ impl App {
         }
         self.investigation_open = true;
         self.investigation_focused = true;
+        self.investigation_zoomed = true;
         self.investigation_evidence_detail = false;
         self.investigation_message_offset = 0;
         self.investigation_chat_follow = true;
@@ -160,6 +161,7 @@ impl App {
         }
         self.investigation_open = true;
         self.investigation_focused = true;
+        self.investigation_zoomed = true;
         self.agent_setup_choices = vec![
             "openrouter".into(),
             "ollama".into(),
@@ -468,6 +470,7 @@ impl App {
                 self.investigation = next;
                 self.investigation_open = true;
                 self.investigation_focused = true;
+                self.investigation_zoomed = true;
                 self.investigation_evidence_detail = false;
                 self.investigation_message_offset = 0;
                 self.investigation_chat_follow = true;

@@ -92,16 +92,17 @@ Run an existing analysis operation with:
 The worker reopens the saved project and checks that its workspace bytes match
 the TUI before collecting results. Navigation remains responsive. Evidence
 records and bounded tool responses are saved beside the annotation database in
-an `.investigation.json` file. Press `i` to compose an agent message in the
-ordinary command input. `F6` and `Ctrl+Right` always open/focus the desk,
-`Ctrl+Left` always returns to analysis, and only `Ctrl+Tab` toggles between
-them. This makes repeated focus commands idempotent instead of unexpectedly
-sending the user back to disassembly. Focus changes preserve the thread,
-selection, and scroll position. The focused desk uses a bright rounded border and a `FOCUSED` label;
-press `z` there to maximize chat and evidence together, then `z` again to
-restore the side-by-side workspace. Press `a` for an evidence-led analysis of
+an `.investigation.json` file. Press `i` to compose an agent message. `F6` and
+`Ctrl+Right` always open the full agent workspace, `Ctrl+Left` always returns
+to disassembly, and only `Ctrl+Tab` toggles between them. This makes the mode
+change visually unmistakable and repeated entry commands idempotent. Focus
+changes preserve the thread, selection, and scroll position. The focused desk
+uses a bright rounded border and a `FOCUSED` label; press `z` to move between
+the full agent workspace and the side-by-side analysis layout. Press `a` for an evidence-led analysis of
 the current selection, `t` for complete-target triage, or `i` to write a custom
-question. After a provider or network failure, `r` retries the latest saved
+question. With the desk focused, ordinary typing also opens the inline chat
+composer and preserves the first character; `Enter` sends and `Esc` cancels.
+After a provider or network failure, `r` retries the latest saved
 question without adding a duplicate ledger entry. While follow mode is enabled, completed agent tools move the listing
 to their first static evidence address. Manual focus on the listing pauses that
 behavior; `f` toggles it explicitly. `j`/`k` or Shift+Up/Down selects evidence; Enter navigates

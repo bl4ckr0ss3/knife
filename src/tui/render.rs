@@ -273,7 +273,11 @@ fn investigation_desk(f: &mut Frame, app: &App) {
         ]),
         TLine::from(Span::styled(
             if app.investigation_focused {
-                " a analyze · t triage · i ask · r retry · S setup · z maximize"
+                if app.investigation_zoomed {
+                    " a analyze · t triage · type to chat · r retry · z split view"
+                } else {
+                    " a analyze · t triage · type to chat · r retry · z maximize"
+                }
             } else {
                 " F6, Ctrl+Right, or Ctrl+Tab focuses this desk"
             },
@@ -542,6 +546,7 @@ fn agent_conversation(app: &App) -> Vec<TLine<'static>> {
                 ),
             ]));
         }
+        append_agent_composer(&mut lines, app);
         return lines;
     }
     messages.reverse();
@@ -606,7 +611,42 @@ fn agent_conversation(app: &App) -> Vec<TLine<'static>> {
                 .add_modifier(Modifier::BOLD),
         )));
     }
+    append_agent_composer(&mut lines, app);
     lines
+}
+
+fn append_agent_composer(lines: &mut Vec<TLine<'static>>, app: &App) {
+    let Some(prompt) = app
+        .prompt
+        .as_ref()
+        .filter(|prompt| prompt.ask == super::Ask::AgentQuestion)
+    else {
+        return;
+    };
+    let color = analyst_color();
+    lines.push(TLine::default());
+    lines.push(TLine::from(vec![
+        Span::styled(
+            " YOU ",
+            Style::default()
+                .fg(canvas())
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  YOU → {}", app.agent_config.model_display_name()),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(TLine::from(vec![
+        Span::styled(" │ ", Style::default().fg(color)),
+        Span::styled(prompt.input.clone(), Style::default().fg(color)),
+        Span::styled("█", Style::default().fg(color)),
+    ]));
+    lines.push(TLine::from(Span::styled(
+        "   Enter send  ·  Esc cancel  ·  Backspace edit",
+        Style::default().fg(faint()),
+    )));
 }
 
 /// Last useful vertical scroll position for the visible conversation/detail
@@ -1832,13 +1872,27 @@ fn xrefs(f: &mut Frame, area: Rect, app: &App) {
 
 fn footer(f: &mut Frame, area: Rect, app: &App) {
     if let Some(p) = &app.prompt {
+        if p.ask == super::Ask::AgentQuestion {
+            f.render_widget(
+                Paragraph::new(TLine::from(vec![
+                    Span::styled(
+                        " Chat composer active ",
+                        Style::default()
+                            .fg(canvas())
+                            .bg(analyst_color())
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "  Enter send · Esc cancel · message stays inside the agent pane",
+                        Style::default().fg(muted()),
+                    ),
+                ])),
+                area,
+            );
+            return;
+        }
         let (label, input_color) = if p.ask == super::Ask::Command {
             (" : ".into(), accent())
-        } else if p.ask == super::Ask::AgentQuestion {
-            (
-                format!(" YOU → {}: ", app.agent_config.model_display_name()),
-                analyst_color(),
-            )
         } else {
             (format!(" {}: ", p.ask.label()), accent())
         };

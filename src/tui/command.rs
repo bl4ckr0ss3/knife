@@ -103,6 +103,7 @@ impl super::App {
             Command::Investigation => {
                 self.investigation_open = true;
                 self.investigation_focused = true;
+                self.investigation_zoomed = true;
                 self.investigation_conflicts_only = false;
             }
             Command::AgentSetup => self.start_agent_setup(),

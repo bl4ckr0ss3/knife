@@ -2562,9 +2562,14 @@ impl App {
             if !self.investigation_focused {
                 self.investigation_follow = false;
                 self.investigation_zoomed = false;
+            } else {
+                // A keyboard "switch to agent" must produce a visible mode
+                // change, not just move an invisible focus bit while leaving
+                // the same split workspace on screen.
+                self.investigation_zoomed = true;
             }
             self.status = if self.investigation_focused {
-                "investigation desk focused; z maximizes it, Tab returns to workspace".into()
+                "agent workspace open; Ctrl+Left returns to disassembly, z shows split view".into()
             } else {
                 "analysis workspace focused; F6, Ctrl+Right, or Ctrl+Tab enters the desk".into()
             };
@@ -2668,6 +2673,20 @@ impl App {
                 }
                 KeyCode::Enter => self.follow_investigation_evidence(),
                 KeyCode::Char(':') => {}
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    // Once the desk is focused it should feel like a chat,
+                    // not another command mode. Preserve the explicit action
+                    // keys above, but let ordinary typing open the composer
+                    // and keep the first character the analyst entered.
+                    self.ask(Ask::AgentQuestion);
+                    if let Some(prompt) = &mut self.prompt {
+                        prompt.input.push(character);
+                    }
+                }
                 _ => return,
             }
             if key.code != KeyCode::Char(':') {
@@ -2789,6 +2808,7 @@ impl App {
             KeyCode::Char('i') => {
                 self.investigation_open = true;
                 self.investigation_focused = true;
+                self.investigation_zoomed = true;
                 self.ask(Ask::AgentQuestion);
             }
             KeyCode::Char('S') => self.start_agent_setup(),
@@ -5125,6 +5145,7 @@ mod tests {
         let mut app = two_functions();
         app.splash = false;
         app.execute_command("agent");
+        app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
         let panes = app.panes(ratatui::layout::Rect::new(0, 0, 160, 40));
         assert!(panes.agent.width >= 36);
         assert!(panes.listing.width > 0);
@@ -5162,6 +5183,27 @@ mod tests {
     }
 
     #[test]
+    fn typing_in_the_focused_desk_opens_the_inline_chat_composer() {
+        let mut app = two_functions();
+        app.splash = false;
+        app.execute_command("agent");
+        app.on_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
+
+        for character in "hello".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+        }
+
+        let prompt = app.prompt.as_ref().expect("direct typing opens a prompt");
+        assert_eq!(prompt.ask, Ask::AgentQuestion);
+        assert_eq!(prompt.input, "hello");
+        let screen = rendered(&mut app, 160, 40);
+        assert!(screen.contains("YOU → Knife Agent"));
+        assert!(screen.contains("hello"));
+        assert!(screen.contains("Enter send"));
+        assert!(screen.contains("Chat composer active"));
+    }
+
+    #[test]
     fn agent_error_card_offers_retry_and_setup() {
         let mut app = two_functions();
         app.splash = false;
@@ -5185,41 +5227,49 @@ mod tests {
         app.splash = false;
         app.execute_command("agent");
 
-        let docked = app.panes(ratatui::layout::Rect::new(0, 0, 160, 40));
-        assert!(docked.agent.width > 0);
-        assert!(docked.listing.width > 0);
+        let opened = app.panes(ratatui::layout::Rect::new(0, 0, 160, 40));
+        assert!(app.investigation_focused);
+        assert!(app.investigation_zoomed);
+        assert_eq!(opened.agent.width, 160);
+        assert_eq!(opened.listing.width, 0);
         assert!(rendered(&mut app, 160, 40).contains("Chat · Knife Agent · LIVE · FOCUSED"));
 
-        app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
-        let zoomed = app.panes(ratatui::layout::Rect::new(0, 0, 160, 40));
-        assert!(app.investigation_zoomed);
-        assert_eq!(zoomed.agent.width, 160);
-        assert_eq!(zoomed.listing.width, 0);
-
-        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
         let restored = app.panes(ratatui::layout::Rect::new(0, 0, 160, 40));
         assert!(!app.investigation_focused);
         assert!(!app.investigation_zoomed);
         assert!(restored.listing.width > 0);
+        assert!(restored.agent.width > 0);
 
         app.on_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
         assert!(app.investigation_focused);
-        assert!(app.status.contains("desk focused"));
+        assert!(app.investigation_zoomed);
+        assert!(app.status.contains("agent workspace open"));
+        assert_eq!(
+            app.panes(ratatui::layout::Rect::new(0, 0, 160, 40))
+                .listing
+                .width,
+            0
+        );
         app.on_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
         assert!(
             app.investigation_focused,
             "F6 focuses; it does not toggle away"
         );
+        assert!(app.investigation_zoomed);
 
         app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
         assert!(!app.investigation_focused);
+        assert!(!app.investigation_zoomed);
         app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
         assert!(app.investigation_focused);
+        assert!(app.investigation_zoomed);
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.investigation_open);
         app.on_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
         assert!(app.investigation_open);
         assert!(app.investigation_focused);
+        assert!(app.investigation_zoomed);
     }
 
     #[test]

@@ -2,13 +2,18 @@
 
 ## Unreleased
 
-- `F6` and `Ctrl+Right` now always open/focus the agent desk instead of
-  toggling back to disassembly; `Ctrl+Left` always returns to analysis and
-  `Ctrl+Tab` remains the explicit toggle.
+- `F6` and `Ctrl+Right` now always open the full agent workspace instead of
+  silently changing focus in the split layout or toggling back to disassembly;
+  `Ctrl+Left` always restores analysis and `Ctrl+Tab` remains the explicit
+  workspace toggle.
 - The focused agent desk now offers `a` to analyze the current selection, `t`
   for evidence-led whole-target triage, and `r` to retry the latest question
   after a provider failure without duplicating its ledger entry. Error cards
   surface retry and provider-setup actions directly in the conversation.
+- Ordinary typing in the focused agent desk now starts an inline chat composer
+  without losing the first character. The draft, selected model identity, and
+  send/cancel guidance stay inside the conversation instead of the global
+  command footer.
 - Plain Up/Down now scrolls the focused agent chat or evidence detail, with
   Ctrl+Up/Down for faster movement and Home/End for bounds. `j`/`k` or
   Shift+Up/Down selects findings, and scrolling is clamped before blank space.
