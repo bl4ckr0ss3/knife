@@ -5,6 +5,9 @@
 - Plain Up/Down now scrolls the focused agent chat or evidence detail, with
   Ctrl+Up/Down for faster movement and Home/End for bounds. `j`/`k` or
   Shift+Up/Down selects findings, and scrolling is clamped before blank space.
+- The chat renders a bounded 32-message conversation instead of only four
+  entries. New answers follow the newest line; scrolling upward visibly enters
+  `HISTORY` mode and End returns to the `LIVE` tail.
 - The investigation desk is now a first-class focus and zoom target:
   `Ctrl+Left`/`Ctrl+Right`, `Ctrl+Tab`, or `F6` moves between it and analysis,
   a visible active border confirms focus, and `z` maximizes/restores the

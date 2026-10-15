@@ -330,7 +330,13 @@ impl App {
         self.investigation_cancellation = None;
         self.investigation_live_activity = None;
         match result {
-            Err(error) => self.investigation_activity = format!("Failed: {error}"),
+            Err(error) => {
+                self.investigation_activity = format!("Failed: {error}");
+                if self.investigation_chat_follow {
+                    self.investigation_message_scroll =
+                        crate::tui::render::investigation_scroll_max(self);
+                }
+            }
             Ok(value) => {
                 let mut next = self.investigation.clone();
                 let saved = (|| {
@@ -380,7 +386,9 @@ impl App {
                         self.investigation = next;
                         self.investigation_evidence_detail = false;
                         self.investigation_message_offset = 0;
-                        self.investigation_message_scroll = 0;
+                        self.investigation_chat_follow = true;
+                        self.investigation_message_scroll =
+                            crate::tui::render::investigation_scroll_max(self);
                         self.investigation_activity = if value
                             .get("limited")
                             .and_then(serde_json::Value::as_bool)
@@ -425,9 +433,11 @@ impl App {
                 self.investigation_focused = true;
                 self.investigation_evidence_detail = false;
                 self.investigation_message_offset = 0;
-                self.investigation_message_scroll = 0;
+                self.investigation_chat_follow = true;
                 self.status = format!("Saved investigation question #{id}");
                 self.start_investigation_agent();
+                self.investigation_message_scroll =
+                    crate::tui::render::investigation_scroll_max(self);
             }
             Err(error) => self.status = format!("Cannot save question: {error}"),
         }

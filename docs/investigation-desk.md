@@ -108,7 +108,10 @@ thread of recent analyst and Knife messages rather than exposing protocol tool
 transcripts as chat. Up/Down scroll the visible thread, Ctrl+Up/Down scroll it
 three rows at a time, Home/End jump to its beginning/end, and PgUp/PgDn browse
 older/newer messages. Scrolling is clamped so the conversation cannot disappear
-into an empty pane. Use `j`/`k` or Shift+Up/Down to select evidence.
+into an empty pane. The latest 32 non-tool messages form the bounded visible
+window. New answers follow the bottom automatically; scrolling upward changes
+the title to `HISTORY`, and reaching the bottom or pressing End restores `LIVE`.
+Use `j`/`k` or Shift+Up/Down to select evidence.
 Press `e` to inspect selected evidence in the upper panel: producer, typed hex
 locations, observation/inference/unknown statements, confidence and limitations.
 The same scrolling keys move through these details; `e` returns to conversation. Sending a new

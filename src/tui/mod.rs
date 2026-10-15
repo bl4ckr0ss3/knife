@@ -436,6 +436,10 @@ pub struct App {
     pub investigation_selection: usize,
     pub investigation_message_offset: usize,
     pub investigation_message_scroll: u16,
+    /// Whether new agent output keeps the conversation pinned to its newest
+    /// rendered line. Scrolling upward pauses this until End or the bottom is
+    /// reached again.
+    pub investigation_chat_follow: bool,
     pub investigation_evidence_detail: bool,
     pub investigation_worker: Option<std::sync::mpsc::Receiver<Result<serde_json::Value>>>,
     pub investigation_activity: String,
@@ -606,6 +610,7 @@ impl App {
             investigation_selection: 0,
             investigation_message_offset: 0,
             investigation_message_scroll: 0,
+            investigation_chat_follow: true,
             investigation_evidence_detail: false,
             investigation_worker: None,
             investigation_activity: String::new(),
@@ -2584,21 +2589,26 @@ impl App {
                     self.investigation_message_offset = (self.investigation_message_offset + 1)
                         .min(conversation_len.saturating_sub(1));
                     self.investigation_message_scroll = 0;
+                    self.investigation_chat_follow = false;
                 }
                 KeyCode::PageDown => {
                     self.investigation_message_offset =
                         self.investigation_message_offset.saturating_sub(1);
                     self.investigation_message_scroll = 0;
+                    self.investigation_chat_follow = false;
                 }
                 KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.investigation_message_scroll =
-                        self.investigation_message_scroll.saturating_sub(3)
+                        render::investigation_scroll_position(self).saturating_sub(3);
+                    self.investigation_chat_follow = false;
                 }
                 KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.investigation_message_scroll = self
-                        .investigation_message_scroll
+                    let maximum = render::investigation_scroll_max(self);
+                    self.investigation_message_scroll = render::investigation_scroll_position(self)
                         .saturating_add(3)
-                        .min(render::investigation_scroll_max(self))
+                        .min(maximum);
+                    self.investigation_chat_follow = self.investigation_message_offset == 0
+                        && self.investigation_message_scroll == maximum;
                 }
                 KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
                     self.investigation_selection = self.investigation_selection.saturating_sub(1)
@@ -2607,9 +2617,14 @@ impl App {
                     self.investigation_selection = (self.investigation_selection + 1)
                         .min(self.investigation.evidence.len().saturating_sub(1))
                 }
-                KeyCode::Home => self.investigation_message_scroll = 0,
+                KeyCode::Home => {
+                    self.investigation_message_scroll = 0;
+                    self.investigation_chat_follow = false;
+                }
                 KeyCode::End => {
-                    self.investigation_message_scroll = render::investigation_scroll_max(self)
+                    self.investigation_message_offset = 0;
+                    self.investigation_message_scroll = render::investigation_scroll_max(self);
+                    self.investigation_chat_follow = true;
                 }
                 KeyCode::Esc => {
                     self.investigation_open = false;
@@ -2618,13 +2633,16 @@ impl App {
                 }
                 KeyCode::Up => {
                     self.investigation_message_scroll =
-                        self.investigation_message_scroll.saturating_sub(1)
+                        render::investigation_scroll_position(self).saturating_sub(1);
+                    self.investigation_chat_follow = false;
                 }
                 KeyCode::Down => {
-                    self.investigation_message_scroll = self
-                        .investigation_message_scroll
+                    let maximum = render::investigation_scroll_max(self);
+                    self.investigation_message_scroll = render::investigation_scroll_position(self)
                         .saturating_add(1)
-                        .min(render::investigation_scroll_max(self))
+                        .min(maximum);
+                    self.investigation_chat_follow = self.investigation_message_offset == 0
+                        && self.investigation_message_scroll == maximum;
                 }
                 KeyCode::Char('k') => {
                     self.investigation_selection = self.investigation_selection.saturating_sub(1)
@@ -3215,13 +3233,17 @@ impl App {
                 match m.kind {
                     MouseEventKind::ScrollUp => {
                         self.investigation_message_scroll =
-                            self.investigation_message_scroll.saturating_sub(3)
+                            render::investigation_scroll_position(self).saturating_sub(3);
+                        self.investigation_chat_follow = false;
                     }
                     MouseEventKind::ScrollDown => {
-                        self.investigation_message_scroll = self
-                            .investigation_message_scroll
-                            .saturating_add(3)
-                            .min(render::investigation_scroll_max(self))
+                        let maximum = render::investigation_scroll_max(self);
+                        self.investigation_message_scroll =
+                            render::investigation_scroll_position(self)
+                                .saturating_add(3)
+                                .min(maximum);
+                        self.investigation_chat_follow = self.investigation_message_offset == 0
+                            && self.investigation_message_scroll == maximum;
                     }
                     _ => {}
                 }
@@ -5067,16 +5089,20 @@ mod tests {
         let maximum = render::investigation_scroll_max(&app);
         assert!(maximum > 1);
 
+        app.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
         app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.investigation_message_scroll, 1);
+        assert!(!app.investigation_chat_follow);
         app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
         assert_eq!(app.investigation_message_scroll, maximum);
+        assert!(app.investigation_chat_follow);
         app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.investigation_message_scroll, maximum);
         app.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
         assert_eq!(app.investigation_message_scroll, 0);
         app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.investigation_message_scroll, 0);
+        assert!(!app.investigation_chat_follow);
     }
 
     #[test]
@@ -5119,7 +5145,7 @@ mod tests {
         let docked = app.panes(ratatui::layout::Rect::new(0, 0, 160, 40));
         assert!(docked.agent.width > 0);
         assert!(docked.listing.width > 0);
-        assert!(rendered(&mut app, 160, 40).contains("Chat · Knife Agent · FOCUSED"));
+        assert!(rendered(&mut app, 160, 40).contains("Chat · Knife Agent · LIVE · FOCUSED"));
 
         app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
         let zoomed = app.panes(ratatui::layout::Rect::new(0, 0, 160, 40));

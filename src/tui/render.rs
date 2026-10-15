@@ -215,8 +215,13 @@ fn investigation_desk(f: &mut Frame, app: &App) {
                         " Evidence detail · e: chat ".to_string()
                     } else if app.investigation_focused {
                         format!(
-                            " Chat · {} · FOCUSED ",
-                            app.agent_config.model_display_name()
+                            " Chat · {}{} · FOCUSED ",
+                            app.agent_config.model_display_name(),
+                            if app.investigation_chat_follow {
+                                " · LIVE"
+                            } else {
+                                " · HISTORY"
+                            }
                         )
                     } else {
                         format!(" Chat · {} ", app.agent_config.model_display_name())
@@ -224,7 +229,7 @@ fn investigation_desk(f: &mut Frame, app: &App) {
             )
             .style(Style::default().fg(accent()).bg(panel()))
             .wrap(Wrap { trim: false })
-            .scroll((app.investigation_message_scroll, 0)),
+            .scroll((investigation_scroll_position(app), 0)),
         conversation_area,
     );
     let desk = evidence_area;
@@ -268,7 +273,7 @@ fn investigation_desk(f: &mut Frame, app: &App) {
         ]),
         TLine::from(Span::styled(
             if app.investigation_focused {
-                " ↑↓ scroll chat · j/k evidence · i chat · S setup · z maximize"
+                " ↑↓ chat · End latest · j/k evidence · i ask · S setup · z maximize"
             } else {
                 " Ctrl+Tab or F6 focuses this desk"
             },
@@ -489,7 +494,7 @@ fn agent_conversation(app: &App) -> Vec<TLine<'static>> {
         .rev()
         .filter(|message| message.role != crate::api::investigation::Role::Tool)
         .skip(app.investigation_message_offset)
-        .take(4)
+        .take(32)
         .collect::<Vec<_>>();
     if messages.is_empty() {
         let mut lines = vec![
@@ -628,6 +633,15 @@ pub(super) fn investigation_scroll_max(app: &App) -> u16 {
         .wrap(Wrap { trim: false })
         .line_count(inner_width);
     u16::try_from(rows.saturating_sub(inner_height)).unwrap_or(u16::MAX)
+}
+
+pub(super) fn investigation_scroll_position(app: &App) -> u16 {
+    let maximum = investigation_scroll_max(app);
+    if app.investigation_chat_follow && !app.investigation_evidence_detail {
+        maximum
+    } else {
+        app.investigation_message_scroll.min(maximum)
+    }
 }
 
 fn conversation_body_line(
