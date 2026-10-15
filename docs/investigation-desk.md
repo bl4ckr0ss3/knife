@@ -88,9 +88,11 @@ The complete embedded investigator prompt is intentionally auditable at
 instructions for coding agents live in [`AGENTS.md`](../AGENTS.md); that file is
 not sent to model providers or loaded from an analyzed target's directory.
 
-The model begins with a small investigation tool set. Calling
+The model begins with a broad base investigation tool set: identity, triage,
+strings, raw bytes, IOCs, entropy, capabilities, signatures, imports, exports,
+and hashes are active immediately. Calling
 `discover_investigation_tools` adds schemas for the selected task on its next
-round. Tasks include triage, code, strings, validation, memory and external
+round. Tasks include code, validation, memory and external
 analysis; discovery reports availability and operation policy.
 
 Protocol reference: <https://docs.ollama.com/capabilities/tool-calling>

@@ -981,6 +981,18 @@ pub fn converse_with_ui_context(
         "investigation_get_evidence",
         "investigation_conflicts",
         "read_function_instructions",
+        // Data-only-safe scanners that nearly every triage needs. Keeping
+        // them in the base set saves a discovery round on the common path;
+        // niche and provider tools still require discover_investigation_tools.
+        "strings",
+        "read_bytes",
+        "iocs",
+        "entropy",
+        "capabilities",
+        "signatures",
+        "imports",
+        "exports",
+        "hashes",
     ]
     .into_iter()
     .map(str::to_string)
@@ -1447,7 +1459,9 @@ mod tests {
     impl ChatProvider for Scripted {
         fn complete(&mut self, _: &[Value], tools: &[Value]) -> Result<Value> {
             if self.index == 0 {
-                assert!(tools.len() <= 12);
+                // The base set stays bounded so the first request cannot
+                // balloon; discovery still gates niche and provider tools.
+                assert!(tools.len() <= 24);
             }
             let value = self.messages[self.index].clone();
             self.index += 1;
