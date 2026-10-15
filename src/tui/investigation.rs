@@ -116,6 +116,43 @@ impl App {
         self.investigation_worker = Some(receiver);
     }
 
+    /// Start one of the common reverse-engineering workflows without making
+    /// the analyst formulate a long prompt every time.
+    pub fn start_quick_investigation(&mut self, target_wide: bool) {
+        if self.investigation_worker.is_some() {
+            self.status = "Interrupt the active agent before starting another analysis".into();
+            return;
+        }
+        self.investigation_question(quick_investigation_prompt(target_wide).into());
+    }
+
+    /// Re-run the latest saved analyst request after a provider or transport
+    /// failure. This intentionally does not append a duplicate question.
+    pub fn retry_last_investigation(&mut self) {
+        if self.investigation_worker.is_some() {
+            self.status = "The agent is already working; Ctrl+C interrupts it".into();
+            return;
+        }
+        if !self
+            .investigation
+            .messages
+            .iter()
+            .rev()
+            .any(|message| message.role == Role::Analyst && !message.text.trim().is_empty())
+        {
+            self.status = "No previous agent question to retry; press i, a, or t".into();
+            return;
+        }
+        self.investigation_open = true;
+        self.investigation_focused = true;
+        self.investigation_evidence_detail = false;
+        self.investigation_message_offset = 0;
+        self.investigation_chat_follow = true;
+        self.investigation_activity = "Retrying the latest question".into();
+        self.start_investigation_agent();
+        self.investigation_message_scroll = crate::tui::render::investigation_scroll_max(self);
+    }
+
     pub fn start_agent_setup(&mut self) {
         if self.investigation_worker.is_some() {
             self.status = "Interrupt active agent work before changing its provider".into();
@@ -503,4 +540,32 @@ fn model_choices(provider: &str, current: &str) -> Vec<String> {
         }
     }
     choices
+}
+
+fn quick_investigation_prompt(target_wide: bool) -> &'static str {
+    if target_wide {
+        "Triage the complete target. Identify its format and security properties; inspect suspicious imports, strings, functions, embedded content, and likely validation or decryption logic; follow the strongest cross-references; then give prioritized next steps. Clearly separate observed evidence, inference, limitations, and unknowns."
+    } else {
+        "Analyze the current Knife selection in context. Explain what it does, trace its inputs, outputs, callers, callees, referenced strings, and validation or decryption behavior where supported. Clearly separate observed evidence, inference, limitations, and unknowns."
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quick_investigation_prompt;
+
+    #[test]
+    fn quick_prompts_request_evidence_and_honest_limits() {
+        for prompt in [
+            quick_investigation_prompt(false),
+            quick_investigation_prompt(true),
+        ] {
+            assert!(prompt.contains("observed evidence"));
+            assert!(prompt.contains("inference"));
+            assert!(prompt.contains("limitations"));
+            assert!(prompt.contains("unknowns"));
+        }
+        assert!(quick_investigation_prompt(true).contains("complete target"));
+        assert!(quick_investigation_prompt(false).contains("current Knife selection"));
+    }
 }

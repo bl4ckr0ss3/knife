@@ -2542,10 +2542,21 @@ impl App {
             || key.code == KeyCode::F(6)
             || (matches!(key.code, KeyCode::Left | KeyCode::Right)
                 && key.modifiers.contains(KeyModifiers::CONTROL));
-        if self.investigation_open && self.prompt.is_none() && focus_shortcut {
+        if self.prompt.is_none() && focus_shortcut {
+            let was_open = self.investigation_open;
+            if matches!(key.code, KeyCode::F(6) | KeyCode::Right)
+                || (matches!(key.code, KeyCode::Tab | KeyCode::BackTab) && !was_open)
+            {
+                self.investigation_open = true;
+            }
+            if !self.investigation_open {
+                return;
+            }
             self.investigation_focused = match key.code {
                 KeyCode::Right => true,
                 KeyCode::Left => false,
+                KeyCode::F(6) => true,
+                _ if !was_open => true,
                 _ => !self.investigation_focused,
             };
             if !self.investigation_focused {
@@ -2555,13 +2566,16 @@ impl App {
             self.status = if self.investigation_focused {
                 "investigation desk focused; z maximizes it, Tab returns to workspace".into()
             } else {
-                "analysis workspace focused; Ctrl+Tab or F6 returns to the desk".into()
+                "analysis workspace focused; F6, Ctrl+Right, or Ctrl+Tab enters the desk".into()
             };
             return;
         }
         if self.investigation_open && self.investigation_focused && self.prompt.is_none() {
             match key.code {
                 KeyCode::Char('i') => self.ask(Ask::AgentQuestion),
+                KeyCode::Char('a') => self.start_quick_investigation(false),
+                KeyCode::Char('t') => self.start_quick_investigation(true),
+                KeyCode::Char('r') => self.retry_last_investigation(),
                 KeyCode::Char('S') => self.start_agent_setup(),
                 KeyCode::Char('f') => self.investigation_follow = !self.investigation_follow,
                 KeyCode::Char('z') => self.toggle_pane_zoom(),
@@ -2570,7 +2584,8 @@ impl App {
                     self.investigation_follow = false;
                     self.investigation_zoomed = false;
                     self.status =
-                        "analysis workspace focused; Ctrl+Tab or F6 returns to the desk".into();
+                        "analysis workspace focused; F6, Ctrl+Right, or Ctrl+Tab enters the desk"
+                            .into();
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.execute_command("interrupt")
@@ -5137,6 +5152,34 @@ mod tests {
     }
 
     #[test]
+    fn retry_without_a_saved_question_is_explained() {
+        let mut app = two_functions();
+        app.splash = false;
+        app.execute_command("agent");
+        app.retry_last_investigation();
+        assert!(app.status.contains("No previous agent question"));
+        assert!(app.investigation_worker.is_none());
+    }
+
+    #[test]
+    fn agent_error_card_offers_retry_and_setup() {
+        let mut app = two_functions();
+        app.splash = false;
+        app.execute_command("agent");
+        app.investigation
+            .append(
+                crate::api::investigation::Role::Analyst,
+                "Analyze the selected function".into(),
+                vec![],
+            )
+            .unwrap();
+        app.investigation_activity = "Failed: provider unavailable".into();
+        let screen = rendered(&mut app, 160, 40);
+        assert!(screen.contains("r  retry last question"));
+        assert!(screen.contains("S  provider setup"));
+    }
+
+    #[test]
     fn investigation_desk_can_be_focused_and_zoomed() {
         let mut app = two_functions();
         app.splash = false;
@@ -5162,10 +5205,20 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
         assert!(app.investigation_focused);
         assert!(app.status.contains("desk focused"));
+        app.on_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
+        assert!(
+            app.investigation_focused,
+            "F6 focuses; it does not toggle away"
+        );
 
         app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
         assert!(!app.investigation_focused);
         app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+        assert!(app.investigation_focused);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.investigation_open);
+        app.on_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
+        assert!(app.investigation_open);
         assert!(app.investigation_focused);
     }
 

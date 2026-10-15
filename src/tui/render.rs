@@ -273,9 +273,9 @@ fn investigation_desk(f: &mut Frame, app: &App) {
         ]),
         TLine::from(Span::styled(
             if app.investigation_focused {
-                " ↑↓ chat · End latest · j/k evidence · i ask · S setup · z maximize"
+                " a analyze · t triage · i ask · r retry · S setup · z maximize"
             } else {
-                " Ctrl+Tab or F6 focuses this desk"
+                " F6, Ctrl+Right, or Ctrl+Tab focuses this desk"
             },
             Style::default().fg(faint()),
         )),
@@ -512,11 +512,11 @@ fn agent_conversation(app: &App) -> Vec<TLine<'static>> {
             TLine::from("validation logic, or request a complete evidence-led triage."),
             TLine::default(),
             TLine::from(Span::styled(
-                "i  ask a question     S  provider setup",
+                "a  analyze selection  t  triage target  i  custom question",
                 Style::default().fg(analyst_color()),
             )),
             TLine::from(Span::styled(
-                "z  maximize desk      e  inspect evidence",
+                "S  provider setup     z  maximize desk  e  inspect evidence",
                 Style::default().fg(faint()),
             )),
         ];
@@ -599,6 +599,12 @@ fn agent_conversation(app: &App) -> Vec<TLine<'static>> {
                 Style::default().fg(error_color()),
             ),
         ]));
+        lines.push(TLine::from(Span::styled(
+            "r  retry last question     S  provider setup",
+            Style::default()
+                .fg(warning_color())
+                .add_modifier(Modifier::BOLD),
+        )));
     }
     lines
 }

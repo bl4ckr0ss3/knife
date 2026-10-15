@@ -93,14 +93,18 @@ The worker reopens the saved project and checks that its workspace bytes match
 the TUI before collecting results. Navigation remains responsive. Evidence
 records and bounded tool responses are saved beside the annotation database in
 an `.investigation.json` file. Press `i` to compose an agent message in the
-ordinary command input. `Ctrl+Right` enters the desk and `Ctrl+Left` returns to
-analysis; `Ctrl+Tab` toggles between them. `F6` is an equivalent fallback for
-terminals that do not distinguish Ctrl+Tab. Focus changes preserve the thread,
+ordinary command input. `F6` and `Ctrl+Right` always open/focus the desk,
+`Ctrl+Left` always returns to analysis, and only `Ctrl+Tab` toggles between
+them. This makes repeated focus commands idempotent instead of unexpectedly
+sending the user back to disassembly. Focus changes preserve the thread,
 selection, and scroll position. The focused desk uses a bright rounded border and a `FOCUSED` label;
 press `z` there to maximize chat and evidence together, then `z` again to
-restore the side-by-side workspace. While follow mode is enabled, completed agent tools move the listing
+restore the side-by-side workspace. Press `a` for an evidence-led analysis of
+the current selection, `t` for complete-target triage, or `i` to write a custom
+question. After a provider or network failure, `r` retries the latest saved
+question without adding a duplicate ledger entry. While follow mode is enabled, completed agent tools move the listing
 to their first static evidence address. Manual focus on the listing pauses that
-behavior; `f` toggles it explicitly. Up/Down selects evidence; Enter navigates
+behavior; `f` toggles it explicitly. `j`/`k` or Shift+Up/Down selects evidence; Enter navigates
 to its first static location without closing the desk. Esc closes the desk;
 `:` opens command input while leaving it visible.
 The desk separates conversation from findings. Its chat pane shows a compact
