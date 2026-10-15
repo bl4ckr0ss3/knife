@@ -105,6 +105,10 @@ locations, observation/inference/unknown statements, confidence and limitations.
 Ctrl+Up/Down scrolls these details; `e` returns to conversation. Sending a new
 message and receiving an answer automatically return the upper pane to the
 conversation so an old evidence-detail selection cannot hide the response.
+Conversation badges identify `YOU` and the configured model by its readable
+name rather than a generic assistant label. Colors distinguish the two roles
+and call out observations, inferences, unknowns, limitations, and worker state;
+the text labels remain authoritative for monochrome or low-color terminals.
 
 `:interrupt` or Ctrl+C discards the active worker result and stops the model loop before
 its next request or tool call. An in-flight model request or analysis operation

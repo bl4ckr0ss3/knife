@@ -85,6 +85,53 @@ impl AgentConfig {
     pub fn has_api_key(&self) -> bool {
         !self.api_key.is_empty()
     }
+
+    /// Compact human-facing identity for the conversation UI. Requests keep
+    /// the exact model ID; this only removes registry prefixes and formats
+    /// common model-family names for display.
+    pub fn model_display_name(&self) -> String {
+        let raw = self
+            .model
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(64)
+            .collect::<String>();
+        if raw.trim().is_empty() {
+            return "Knife Agent".into();
+        }
+        let mut words = raw
+            .split(['-', '_'])
+            .filter(|word| !word.is_empty())
+            .peekable();
+        let mut display = Vec::new();
+        while let Some(word) = words.next() {
+            let lower = word.to_ascii_lowercase();
+            if matches!(lower.as_str(), "glm" | "gpt" | "llama") {
+                let family = lower.to_ascii_uppercase();
+                if let Some(version) = words.next_if(|next| {
+                    next.chars()
+                        .next()
+                        .is_some_and(|character| character.is_ascii_digit())
+                }) {
+                    display.push(format!("{family}{version}"));
+                } else {
+                    display.push(family);
+                }
+            } else if lower.starts_with("qwen") {
+                display.push(format!("Qwen{}", &word[4..]));
+            } else {
+                let mut characters = word.chars();
+                display.push(match characters.next() {
+                    Some(first) => format!("{}{}", first.to_uppercase(), characters.as_str()),
+                    None => String::new(),
+                });
+            }
+        }
+        display.join(" ")
+    }
 }
 
 impl ConfiguredProvider {
@@ -846,6 +893,23 @@ mod tests {
         assert!(validate_remote_endpoint("http://localhost:8080/v1/chat/completions").is_ok());
         assert!(validate_remote_endpoint("http://example.test/v1/chat/completions").is_err());
         assert!(validate_remote_endpoint("https://key@example.test/v1/chat/completions").is_err());
+    }
+
+    #[test]
+    fn model_ids_get_safe_readable_conversation_names() {
+        let mut config = AgentConfig {
+            provider: "openrouter".into(),
+            model: "z-ai/glm-5.3-flash".into(),
+            api_key: "unused".into(),
+            base_url: String::new(),
+        };
+        assert_eq!(config.model_display_name(), "GLM5.3 Flash");
+        config.model = "anthropic/claude-sonnet-4".into();
+        assert_eq!(config.model_display_name(), "Claude Sonnet 4");
+        config.model = "vendor/qwen3-coder\nspoof".into();
+        assert_eq!(config.model_display_name(), "Qwen3 Coderspoof");
+        config.model.clear();
+        assert_eq!(config.model_display_name(), "Knife Agent");
     }
 
     #[test]

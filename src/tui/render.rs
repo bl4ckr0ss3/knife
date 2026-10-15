@@ -8,7 +8,7 @@ use super::{
 };
 use crate::listing::Annot;
 use iced_x86::FlowControl;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line as TLine, Span};
 use ratatui::widgets::{
@@ -39,6 +39,24 @@ pub(crate) fn canvas() -> Color {
 }
 pub(crate) fn panel() -> Color {
     Color::Rgb(0x12, 0x12, 0x12)
+}
+
+// The analysis workspace stays deliberately monochrome. Conversation roles
+// get a small, stable amount of color so long investigations remain scannable.
+fn analyst_color() -> Color {
+    Color::Rgb(0x72, 0xd7, 0xff)
+}
+fn model_color() -> Color {
+    Color::Rgb(0xc9, 0xa0, 0xff)
+}
+fn success_color() -> Color {
+    Color::Rgb(0x82, 0xe0, 0xaa)
+}
+fn warning_color() -> Color {
+    Color::Rgb(0xff, 0xd1, 0x66)
+}
+fn error_color() -> Color {
+    Color::Rgb(0xff, 0x78, 0x78)
 }
 pub(crate) fn selected() -> Style {
     Style::default()
@@ -161,44 +179,23 @@ pub fn draw(f: &mut Frame, app: &App) {
 
 fn investigation_desk(f: &mut Frame, app: &App) {
     let desk = app.panes(f.area()).agent;
-    let width = desk.width;
     f.render_widget(Clear, desk);
-    let conversation_height = desk.height / 2;
-    let conversation_area = Rect::new(desk.x, desk.y, desk.width, conversation_height);
+    let (conversation_area, evidence_area) = if app.investigation_zoomed && desk.width >= 100 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(desk);
+        (columns[0], columns[1])
+    } else {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(desk);
+        (rows[0], rows[1])
+    };
     let conversation = agent_conversation(app);
     let conversation = if app.investigation_evidence_detail {
-        app.investigation
-            .evidence
-            .values()
-            .nth(app.investigation_selection)
-            .map(|record| {
-                let mut text = format!(
-                    "{}\nProducer: {}\n{}\n",
-                    record.id.0, record.producer, record.summary
-                );
-                for location in &record.locations {
-                    if let Some(address) = location.static_address {
-                        text.push_str(&format!("Static: 0x{:x}\n", address.get()));
-                    }
-                    if let Some(offset) = location.file_offset {
-                        text.push_str(&format!("File: 0x{:x}\n", offset.get()));
-                    }
-                    if let Some(address) = location.runtime_address {
-                        text.push_str(&format!("Runtime: 0x{:x}\n", address.get()));
-                    }
-                }
-                for statement in &record.statements {
-                    text.push_str(&format!(
-                        "{:?} / {:?}: {}\n",
-                        statement.kind, statement.confidence, statement.text
-                    ));
-                }
-                for limitation in &record.limitations {
-                    text.push_str(&format!("Limitation: {limitation}\n"));
-                }
-                text
-            })
-            .unwrap_or_else(|| "No evidence selected. Press e to return to conversation.".into())
+        evidence_detail_lines(app)
     } else {
         conversation
     };
@@ -215,11 +212,14 @@ fn investigation_desk(f: &mut Frame, app: &App) {
                     .border_type(BorderType::Rounded)
                     .border_style(desk_border)
                     .title(if app.investigation_evidence_detail {
-                        " Investigation desk — Evidence detail · e: chat "
+                        " Evidence detail · e: chat ".to_string()
                     } else if app.investigation_focused {
-                        " Investigation desk — Agent chat · FOCUSED "
+                        format!(
+                            " Chat · {} · FOCUSED ",
+                            app.agent_config.model_display_name()
+                        )
                     } else {
-                        " Investigation desk — Agent chat "
+                        format!(" Chat · {} ", app.agent_config.model_display_name())
                     }),
             )
             .style(Style::default().fg(accent()).bg(panel()))
@@ -227,41 +227,46 @@ fn investigation_desk(f: &mut Frame, app: &App) {
             .scroll((app.investigation_message_scroll, 0)),
         conversation_area,
     );
-    let desk = Rect::new(
-        desk.x,
-        desk.y.saturating_add(conversation_height),
-        desk.width,
-        desk.height.saturating_sub(conversation_height),
-    );
+    let desk = evidence_area;
+    let width = desk.width;
     let mut lines = vec![
-        TLine::from(format!(
-            " {}  i: chat  S: setup  f: follow {}",
+        TLine::from(vec![
+            Span::styled(" ● ", activity_style(app)),
+            Span::styled(
+                activity_label(app),
+                activity_style(app).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {}", app.investigation_activity),
+                Style::default().fg(muted()),
+            ),
+        ]),
+        TLine::from(vec![
+            Span::styled(
+                format!(" {} ", app.agent_config.model_display_name()),
+                Style::default()
+                    .fg(canvas())
+                    .bg(model_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {}", app.agent_config.status()),
+                Style::default().fg(muted()),
+            ),
+        ]),
+        TLine::from(Span::styled(
             if app.investigation_focused {
-                "FOCUSED"
+                " i chat · S setup · f follow · z maximize · Tab workspace"
             } else {
-                "Ctrl+Tab/F6: focus"
+                " Ctrl+Tab or F6 focuses this desk"
             },
-            if app.investigation_follow {
-                "ON"
-            } else {
-                "OFF"
-            }
+            Style::default().fg(faint()),
         )),
-        TLine::from(if app.investigation_focused {
-            " Ctrl+Tab/F6/Tab: workspace  z: maximize/restore"
-        } else {
-            " Focus the desk to navigate evidence or maximize it"
-        }),
-        TLine::from(" Findings and activity"),
+        TLine::from(Span::styled(
+            " FINDINGS & ACTIVITY",
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+        )),
     ];
-    lines.insert(
-        1,
-        TLine::from(format!(" Activity: {}", app.investigation_activity)),
-    );
-    lines.insert(
-        2,
-        TLine::from(format!(" Provider: {}", app.agent_config.status())),
-    );
     lines.push(TLine::from(if app.investigation_conflicts_only {
         " Conflicting evidence — review required"
     } else {
@@ -308,9 +313,10 @@ fn investigation_desk(f: &mut Frame, app: &App) {
             lines.push(TLine::from(format!(" {} supporting / {} contradicting records (#{}); inspect via MCP investigation_conflicts",hypothesis.supports.len(),hypothesis.contradicts.len(),hypothesis.id)));
         }
     }
-    lines.push(TLine::from(
-        " Evidence — Up/Down; e inspects; Enter follows",
-    ));
+    lines.push(TLine::from(Span::styled(
+        " EVIDENCE  ↑↓ select · e inspect · Enter follow",
+        Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+    )));
     let evidence_height = usize::from(desk.height.saturating_sub(2)).saturating_sub(lines.len());
     let evidence_start = viewport_start(
         app.investigation_selection,
@@ -336,7 +342,7 @@ fn investigation_desk(f: &mut Frame, app: &App) {
                 desk_preview(&record.summary, usize::from(width.saturating_sub(6)))
             ),
             Style::default().fg(if index == app.investigation_selection {
-                accent()
+                warning_color()
             } else {
                 muted()
             }),
@@ -349,7 +355,7 @@ fn investigation_desk(f: &mut Frame, app: &App) {
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(desk_border)
-                    .title(" Investigation desk — Evidence & activity "),
+                    .title(" Evidence & activity "),
             )
             .style(Style::default().fg(accent()).bg(panel()))
             .wrap(Wrap { trim: false }),
@@ -357,7 +363,7 @@ fn investigation_desk(f: &mut Frame, app: &App) {
     );
 }
 
-fn agent_conversation(app: &App) -> String {
+fn agent_conversation(app: &App) -> Vec<TLine<'static>> {
     let mut messages = app
         .investigation
         .messages
@@ -368,24 +374,238 @@ fn agent_conversation(app: &App) -> String {
         .take(4)
         .collect::<Vec<_>>();
     if messages.is_empty() {
-        return format!(
-            "{}\n\nPress S to configure provider/model/API key.\nPress i anywhere to speak to the agent.\nPgUp/PgDn: older/newer chat\nCtrl+Up/Down: scroll\nEnter: follow selected evidence\nCtrl+Tab or F6: switch workspace/desk\nz: maximize the focused desk\nf: toggle live following\nCtrl+C: interrupt agent",
-            app.agent_config.status()
-        );
+        let mut lines = vec![
+            TLine::from(Span::styled(
+                format!(
+                    "{} is ready to investigate",
+                    app.agent_config.model_display_name()
+                ),
+                Style::default()
+                    .fg(model_color())
+                    .add_modifier(Modifier::BOLD),
+            )),
+            TLine::default(),
+            TLine::from("Ask about the selected function, a suspicious string, imports,"),
+            TLine::from("validation logic, or request a complete evidence-led triage."),
+            TLine::default(),
+            TLine::from(Span::styled(
+                "i  ask a question     S  provider setup",
+                Style::default().fg(analyst_color()),
+            )),
+            TLine::from(Span::styled(
+                "z  maximize desk      e  inspect evidence",
+                Style::default().fg(faint()),
+            )),
+        ];
+        if let Some(address) = app.cur {
+            lines.push(TLine::default());
+            lines.push(TLine::from(vec![
+                Span::styled("TRY  ", Style::default().fg(warning_color())),
+                Span::styled(
+                    format!(
+                        "Analyze {} and trace its inputs and callers",
+                        app.an.label(address)
+                    ),
+                    Style::default().fg(muted()),
+                ),
+            ]));
+        }
+        return lines;
     }
     messages.reverse();
-    messages
-        .into_iter()
-        .map(|message| {
-            let speaker = match message.role {
-                crate::api::investigation::Role::Analyst => "YOU",
-                crate::api::investigation::Role::Assistant => "KNIFE",
-                crate::api::investigation::Role::Tool => "TOOL",
-            };
-            format!("{speaker}\n{}", message.text)
+    let mut lines = Vec::new();
+    for (index, message) in messages.into_iter().enumerate() {
+        if index > 0 {
+            lines.push(TLine::default());
+        }
+        let (speaker, color) = match message.role {
+            crate::api::investigation::Role::Analyst => ("YOU".to_string(), analyst_color()),
+            crate::api::investigation::Role::Assistant => {
+                (app.agent_config.model_display_name(), model_color())
+            }
+            crate::api::investigation::Role::Tool => ("TOOL".to_string(), warning_color()),
+        };
+        lines.push(TLine::from(Span::styled(
+            format!(" {speaker} "),
+            Style::default()
+                .fg(canvas())
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for body_line in message.text.lines() {
+            lines.push(conversation_body_line(body_line, message.role, color));
+        }
+    }
+    if app.investigation_worker.is_some() {
+        lines.push(TLine::default());
+        lines.push(TLine::from(Span::styled(
+            format!(" {} ", app.agent_config.model_display_name()),
+            Style::default()
+                .fg(canvas())
+                .bg(model_color())
+                .add_modifier(Modifier::BOLD),
+        )));
+        lines.push(TLine::from(vec![
+            Span::styled("● ", Style::default().fg(warning_color())),
+            Span::styled(
+                app.investigation_activity.clone(),
+                Style::default().fg(muted()).add_modifier(Modifier::ITALIC),
+            ),
+        ]));
+    } else if activity_label(app) == "ERROR" {
+        lines.push(TLine::default());
+        lines.push(TLine::from(vec![
+            Span::styled(
+                " ERROR ",
+                Style::default()
+                    .fg(canvas())
+                    .bg(error_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {}", app.investigation_activity),
+                Style::default().fg(error_color()),
+            ),
+        ]));
+    }
+    lines
+}
+
+fn conversation_body_line(
+    text: &str,
+    role: crate::api::investigation::Role,
+    role_color: Color,
+) -> TLine<'static> {
+    let trimmed = text.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    let style = if role == crate::api::investigation::Role::Assistant
+        && (lower.starts_with("observed") || lower.starts_with("observation"))
+    {
+        Style::default()
+            .fg(success_color())
+            .add_modifier(Modifier::BOLD)
+    } else if role == crate::api::investigation::Role::Assistant && lower.starts_with("inference") {
+        Style::default()
+            .fg(warning_color())
+            .add_modifier(Modifier::BOLD)
+    } else if role == crate::api::investigation::Role::Assistant
+        && (lower.starts_with("unknown") || lower.starts_with("limitation"))
+    {
+        Style::default()
+            .fg(error_color())
+            .add_modifier(Modifier::BOLD)
+    } else if trimmed.starts_with('#') {
+        Style::default().fg(role_color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(if role == crate::api::investigation::Role::Analyst {
+            analyst_color()
+        } else {
+            accent()
         })
-        .collect::<Vec<_>>()
-        .join("\n\n")
+    };
+    TLine::from(Span::styled(text.to_string(), style))
+}
+
+fn evidence_detail_lines(app: &App) -> Vec<TLine<'static>> {
+    let Some(record) = app
+        .investigation
+        .evidence
+        .values()
+        .nth(app.investigation_selection)
+    else {
+        return vec![TLine::from(Span::styled(
+            "No evidence selected. Press e to return to conversation.",
+            Style::default().fg(faint()),
+        ))];
+    };
+    let mut lines = vec![
+        TLine::from(Span::styled(
+            record.summary.clone(),
+            Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+        )),
+        TLine::from(vec![
+            Span::styled("ID  ", Style::default().fg(faint())),
+            Span::styled(record.id.0.clone(), Style::default().fg(muted())),
+        ]),
+        TLine::from(vec![
+            Span::styled("BY  ", Style::default().fg(faint())),
+            Span::styled(record.producer.clone(), Style::default().fg(model_color())),
+        ]),
+    ];
+    for location in &record.locations {
+        if let Some(address) = location.static_address {
+            lines.push(TLine::from(Span::styled(
+                format!("STATIC   0x{:x}", address.get()),
+                Style::default().fg(analyst_color()),
+            )));
+        }
+        if let Some(offset) = location.file_offset {
+            lines.push(TLine::from(Span::styled(
+                format!("FILE     0x{:x}", offset.get()),
+                Style::default().fg(analyst_color()),
+            )));
+        }
+        if let Some(address) = location.runtime_address {
+            lines.push(TLine::from(Span::styled(
+                format!("RUNTIME  0x{:x}", address.get()),
+                Style::default().fg(warning_color()),
+            )));
+        }
+    }
+    for statement in &record.statements {
+        let color = match statement.kind {
+            crate::api::evidence::StatementKind::Observation => success_color(),
+            crate::api::evidence::StatementKind::Inference => warning_color(),
+            crate::api::evidence::StatementKind::Unknown => error_color(),
+        };
+        lines.push(TLine::from(vec![
+            Span::styled(
+                format!("{:?} / {:?}  ", statement.kind, statement.confidence),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(statement.text.clone(), Style::default().fg(muted())),
+        ]));
+    }
+    for limitation in &record.limitations {
+        lines.push(TLine::from(vec![
+            Span::styled(
+                "LIMITATION  ",
+                Style::default()
+                    .fg(error_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(limitation.clone(), Style::default().fg(muted())),
+        ]));
+    }
+    lines
+}
+
+fn activity_label(app: &App) -> &'static str {
+    let activity = app.investigation_activity.to_ascii_lowercase();
+    if app.investigation_worker.is_some() {
+        "WORKING"
+    } else if activity.starts_with("failed")
+        || activity.starts_with("could not")
+        || activity.starts_with("offline")
+    {
+        "ERROR"
+    } else if activity.starts_with("partial") {
+        "PARTIAL"
+    } else if activity.starts_with("completed") || activity.starts_with("ready") {
+        "READY"
+    } else {
+        "IDLE"
+    }
+}
+
+fn activity_style(app: &App) -> Style {
+    let color = match activity_label(app) {
+        "WORKING" | "PARTIAL" => warning_color(),
+        "ERROR" => error_color(),
+        "READY" => success_color(),
+        _ => faint(),
+    };
+    Style::default().fg(color)
 }
 
 fn desk_preview(text: &str, limit: usize) -> String {
@@ -1433,21 +1653,32 @@ fn xrefs(f: &mut Frame, area: Rect, app: &App) {
 
 fn footer(f: &mut Frame, area: Rect, app: &App) {
     if let Some(p) = &app.prompt {
+        let (label, input_color) = if p.ask == super::Ask::Command {
+            (" : ".into(), accent())
+        } else if p.ask == super::Ask::AgentQuestion {
+            (
+                format!(" YOU → {}: ", app.agent_config.model_display_name()),
+                analyst_color(),
+            )
+        } else {
+            (format!(" {}: ", p.ask.label()), accent())
+        };
         let line = TLine::from(vec![
             Span::styled(
-                if p.ask == super::Ask::Command {
-                    " : ".into()
-                } else {
-                    format!(" {}: ", p.ask.label())
-                },
-                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+                label,
+                Style::default()
+                    .fg(input_color)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(if p.ask == super::Ask::AgentApiKey {
-                "•".repeat(p.input.chars().count())
-            } else {
-                p.input.clone()
-            }),
-            Span::styled("█", Style::default().fg(accent())),
+            Span::styled(
+                if p.ask == super::Ask::AgentApiKey {
+                    "•".repeat(p.input.chars().count())
+                } else {
+                    p.input.clone()
+                },
+                Style::default().fg(input_color),
+            ),
+            Span::styled("█", Style::default().fg(input_color)),
             Span::styled(format!("  {}", app.status), Style::default().fg(muted())),
         ]);
         f.render_widget(Paragraph::new(line), area);
@@ -1726,5 +1957,23 @@ mod tests {
                 "{ty} should use the recovered-fact color"
             );
         }
+    }
+
+    #[test]
+    fn conversation_semantics_have_distinct_explicit_colors() {
+        use crate::api::investigation::Role;
+
+        let observed =
+            conversation_body_line("Observation: direct call", Role::Assistant, model_color());
+        let inferred =
+            conversation_body_line("Inference: likely gate", Role::Assistant, model_color());
+        let unknown =
+            conversation_body_line("Unknown: runtime value", Role::Assistant, model_color());
+        let analyst = conversation_body_line("Can we prove it?", Role::Analyst, analyst_color());
+
+        assert_eq!(observed.spans[0].style.fg, Some(success_color()));
+        assert_eq!(inferred.spans[0].style.fg, Some(warning_color()));
+        assert_eq!(unknown.spans[0].style.fg, Some(error_color()));
+        assert_eq!(analyst.spans[0].style.fg, Some(analyst_color()));
     }
 }

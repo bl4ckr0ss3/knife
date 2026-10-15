@@ -289,6 +289,9 @@ provider, model, base URL and a masked memory-only API key inside the TUI. No
 provider is contacted until you configure one and submit a message.
 Use `Ctrl+Tab` (or terminal-friendly `F6`) to focus the desk, then `z` to
 maximize its chat and evidence panes; `z` restores the side-by-side layout.
+The conversation labels replies with the configured model's readable name
+(for example `GLM5.3 Flash`) and uses restrained role and evidence colors to
+separate analyst input, model output, observations, inferences, and limits.
 
 ## Kernel drivers & BYOVD
 

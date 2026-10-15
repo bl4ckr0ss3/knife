@@ -5,6 +5,10 @@
 - The investigation desk is now a first-class focus and zoom target:
   `Ctrl+Tab` or `F6` focuses it, a visible active border confirms focus, and
   `z` maximizes/restores the complete chat-and-evidence workspace.
+- Agent conversations now show the configured model's readable identity (such
+  as `GLM5.3 Flash`) instead of a generic assistant name. Role badges, semantic
+  evidence colors, worker-state indicators, and a wide fullscreen layout make
+  long investigations easier to scan without relying on color alone.
 - The TUI now opens with its investigation desk visible, and `i` starts an
   agent message from anywhere in the workspace. Provider readiness is shown in
   the chat pane.

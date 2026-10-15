@@ -4958,15 +4958,17 @@ mod tests {
                 vec![],
             )
             .unwrap();
+        app.agent_config.model = "z-ai/glm-5.3-flash".into();
         app.execute_command("investigation");
-        assert!(rendered(&mut app, 110, 30).contains("Investigation desk"));
+        assert!(rendered(&mut app, 110, 30).contains("GLM5.3 Flash"));
+        assert!(rendered(&mut app, 110, 30).contains("YOU"));
         assert!(rendered(&mut app, 110, 30).contains("Follow both successors"));
         app.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
         assert_eq!(app.investigation_message_offset, 1);
         assert!(rendered(&mut app, 110, 30).contains("Explain this comparison"));
         app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
         assert!(app.investigation_evidence_detail);
-        assert!(rendered(&mut app, 110, 30).contains("Static: 0x1000"));
+        assert!(rendered(&mut app, 110, 30).contains("STATIC   0x1000"));
         app.follow_investigation_evidence();
         assert!(app.investigation_open);
         assert!(!app.investigation_focused);
@@ -4999,7 +5001,9 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
         app.on_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
         assert_eq!(app.prompt.as_ref().unwrap().ask, Ask::AgentQuestion);
-        assert!(rendered(&mut app, 160, 40).contains("Agent chat"));
+        let screen = rendered(&mut app, 160, 40);
+        assert!(screen.contains("Chat"));
+        assert!(screen.contains("YOU → Knife Agent"));
     }
 
     #[test]
@@ -5011,7 +5015,7 @@ mod tests {
         let docked = app.panes(ratatui::layout::Rect::new(0, 0, 160, 40));
         assert!(docked.agent.width > 0);
         assert!(docked.listing.width > 0);
-        assert!(rendered(&mut app, 160, 40).contains("Agent chat · FOCUSED"));
+        assert!(rendered(&mut app, 160, 40).contains("Chat · Knife Agent · FOCUSED"));
 
         app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
         let zoomed = app.panes(ratatui::layout::Rect::new(0, 0, 160, 40));
