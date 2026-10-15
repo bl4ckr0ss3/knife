@@ -18,6 +18,10 @@
   printable letter available to start a message. Questions beginning with
   action-like words such as "analyze", "trace", or "explain" no longer trigger
   a shortcut or lose their first character.
+- The inline agent composer now supports Unicode-safe cursor editing,
+  Home/End, Delete/Backspace, Ctrl+U, Shift+Enter multiline drafts, and bounded
+  bracketed paste. Model/tool progress redraws every 100 ms while active, so a
+  completed response no longer waits for an unrelated keypress to appear.
 - Plain Up/Down now scrolls the focused agent chat or evidence detail, with
   Ctrl+Up/Down for faster movement and Home/End for bounds. `j`/`k` or
   Shift+Up/Down selects findings, and scrolling is clamped before blank space.

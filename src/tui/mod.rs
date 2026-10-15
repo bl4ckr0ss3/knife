@@ -296,10 +296,81 @@ struct VariableRef {
 pub struct Prompt {
     pub ask: Ask,
     pub input: String,
+    /// UTF-8 byte offset kept on a character boundary.
+    pub cursor: usize,
     /// The address a name or note will attach to.
     pub at: u64,
     field: Option<FieldRef>,
     variable: Option<VariableRef>,
+}
+
+impl Prompt {
+    fn set_input(&mut self, input: String) {
+        self.cursor = input.len();
+        self.input = input;
+    }
+
+    fn insert(&mut self, text: &str) {
+        let limit: usize = if self.ask == Ask::AgentQuestion {
+            32 * 1024
+        } else {
+            4 * 1024
+        };
+        let available = limit.saturating_sub(self.input.len());
+        if available == 0 {
+            return;
+        }
+        let mut inserted = String::new();
+        for character in text.chars() {
+            let character = match character {
+                '\r' => continue,
+                '\n' if self.ask == Ask::AgentQuestion => '\n',
+                '\n' | '\t' => ' ',
+                character if character.is_control() => continue,
+                character => character,
+            };
+            if inserted.len() + character.len_utf8() > available {
+                break;
+            }
+            inserted.push(character);
+        }
+        self.input.insert_str(self.cursor, &inserted);
+        self.cursor += inserted.len();
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.input[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+    }
+
+    fn move_right(&mut self) {
+        self.cursor = self.input[self.cursor..]
+            .char_indices()
+            .nth(1)
+            .map(|(index, _)| self.cursor + index)
+            .unwrap_or(self.input.len());
+    }
+
+    fn backspace(&mut self) {
+        let end = self.cursor;
+        self.move_left();
+        if self.cursor < end {
+            self.input.drain(self.cursor..end);
+        }
+    }
+
+    fn delete(&mut self) {
+        let start = self.cursor;
+        self.move_right();
+        let end = self.cursor;
+        self.cursor = start;
+        if start < end {
+            self.input.drain(start..end);
+        }
+    }
 }
 
 /// What the analysis worker computes: the engine's view, the ranked sink
@@ -2400,6 +2471,10 @@ impl App {
         self.reloading.is_some()
     }
 
+    fn needs_background_poll(&self) -> bool {
+        self.reloading.is_some() || self.investigation_worker.is_some()
+    }
+
     /// Collect a finished reload, if there is one. Applied state replaces the
     /// session wholesale; a failure keeps the old session untouched.
     pub fn poll_reload(&mut self) {
@@ -2688,7 +2763,7 @@ impl App {
                     // and keep the first character the analyst entered.
                     self.ask(Ask::AgentQuestion);
                     if let Some(prompt) = &mut self.prompt {
-                        prompt.input.push(character);
+                        prompt.insert(&character.to_string());
                     }
                 }
                 _ => return,
@@ -2723,7 +2798,7 @@ impl App {
                         && !self.agent_setup_choices.is_empty() =>
                 {
                     self.agent_setup_selection = self.agent_setup_selection.saturating_sub(1);
-                    p.input = self.agent_setup_choices[self.agent_setup_selection].clone();
+                    p.set_input(self.agent_setup_choices[self.agent_setup_selection].clone());
                 }
                 KeyCode::Down
                     if matches!(p.ask, Ask::AgentProvider | Ask::AgentModel)
@@ -2731,37 +2806,59 @@ impl App {
                 {
                     self.agent_setup_selection =
                         (self.agent_setup_selection + 1).min(self.agent_setup_choices.len() - 1);
-                    p.input = self.agent_setup_choices[self.agent_setup_selection].clone();
+                    p.set_input(self.agent_setup_choices[self.agent_setup_selection].clone());
                 }
                 KeyCode::Up if p.ask == Ask::Command => {
-                    p.input = self.command_history.previous(&p.input);
+                    p.set_input(self.command_history.previous(&p.input));
                 }
                 KeyCode::Down if p.ask == Ask::Command => {
-                    p.input = self.command_history.next(&p.input);
+                    p.set_input(self.command_history.next(&p.input));
                 }
                 KeyCode::Tab if p.ask == Ask::Command => {
                     let matches = command::complete(&p.input);
                     if matches.len() == 1 {
-                        p.input = format!("{} ", matches[0]);
+                        p.set_input(format!("{} ", matches[0]));
                     } else {
                         self.status = matches.join("  ");
                     }
                 }
                 KeyCode::Esc => self.prompt = None,
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.prompt = None
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    p.input.clear();
+                    p.cursor = 0;
+                }
+                KeyCode::Left => p.move_left(),
+                KeyCode::Right => p.move_right(),
+                KeyCode::Home => p.cursor = 0,
+                KeyCode::End => p.cursor = p.input.len(),
+                KeyCode::Delete => p.delete(),
+                KeyCode::Enter
+                    if p.ask == Ask::AgentQuestion
+                        && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    p.insert("\n")
+                }
                 KeyCode::Enter => {
                     let p = self.prompt.take().expect("checked above");
                     self.commit_with_context(p.ask, p.at, p.input, p.field, p.variable);
                 }
                 KeyCode::Backspace => {
-                    p.input.pop();
+                    p.backspace();
                     // A filter should react as it is typed.
                     if p.ask == Ask::Filter {
                         let text = p.input.clone();
                         self.set_filter(text);
                     }
                 }
-                KeyCode::Char(c) => {
-                    p.input.push(c);
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    p.insert(&c.to_string());
                     if p.ask == Ask::Filter {
                         let text = p.input.clone();
                         self.set_filter(text);
@@ -3158,11 +3255,26 @@ impl App {
         };
         self.prompt = Some(Prompt {
             ask,
+            cursor: input.len(),
             input,
             at,
             field,
             variable,
         });
+    }
+
+    pub fn on_paste(&mut self, text: &str) {
+        if self.reloading.is_some() {
+            return;
+        }
+        let Some(prompt) = &mut self.prompt else {
+            return;
+        };
+        prompt.insert(text);
+        if prompt.ask == Ask::Filter {
+            let filter = prompt.input.clone();
+            self.set_filter(filter);
+        }
     }
 
     fn current_instruction(&self, displayed: u64) -> Option<&crate::analysis::engine::EngineInsn> {
@@ -3575,7 +3687,11 @@ pub fn run(source: TargetSource, bin: Binary, bytes: Vec<u8>, db: Db, title: Str
     // restores the terminal, so a crash cannot leave the shell in raw mode.
     let mut term = ratatui::try_init()
         .map_err(|e| anyhow::anyhow!("cannot start the interactive view: {e}"))?;
-    let _ = ratatui::crossterm::execute!(&mut stdout(), event::EnableMouseCapture);
+    let _ = ratatui::crossterm::execute!(
+        &mut stdout(),
+        event::EnableMouseCapture,
+        event::EnableBracketedPaste
+    );
 
     // No invented percent complete: the worker does not expose work-unit counts.
     let started = Instant::now();
@@ -3620,12 +3736,20 @@ pub fn run(source: TargetSource, bin: Binary, bytes: Vec<u8>, db: Db, title: Str
     } = match ready {
         Ok(Some(ready)) => ready,
         Ok(None) => {
-            let _ = ratatui::crossterm::execute!(&mut stdout(), event::DisableMouseCapture);
+            let _ = ratatui::crossterm::execute!(
+                &mut stdout(),
+                event::DisableMouseCapture,
+                event::DisableBracketedPaste
+            );
             ratatui::restore();
             return Ok(());
         }
         Err(e) => {
-            let _ = ratatui::crossterm::execute!(&mut stdout(), event::DisableMouseCapture);
+            let _ = ratatui::crossterm::execute!(
+                &mut stdout(),
+                event::DisableMouseCapture,
+                event::DisableBracketedPaste
+            );
             ratatui::restore();
             return Err(e);
         }
@@ -3648,13 +3772,16 @@ pub fn run(source: TargetSource, bin: Binary, bytes: Vec<u8>, db: Db, title: Str
         }
         app.poll_reload();
         app.poll_investigation();
-        if app.is_reloading() {
-            // A reload has a worker in flight: poll with a timeout so the
-            // result is applied promptly instead of waiting for input.
+        if app.needs_background_poll() {
+            // Background work has a worker in flight: poll with a timeout so
+            // progress and the final result redraw promptly without requiring
+            // the analyst to press an unrelated key.
             match event::poll(Duration::from_millis(100)) {
                 Ok(true) => match event::read() {
                     Ok(Event::Key(k)) => app.on_key(k),
-                    Ok(Event::Mouse(_)) | Ok(_) => {}
+                    Ok(Event::Mouse(m)) => app.on_mouse(m),
+                    Ok(Event::Paste(text)) => app.on_paste(&text),
+                    Ok(_) => {}
                     Err(e) => break Err(e.into()),
                 },
                 Ok(false) => {}
@@ -3665,6 +3792,7 @@ pub fn run(source: TargetSource, bin: Binary, bytes: Vec<u8>, db: Db, title: Str
             match event::read() {
                 Ok(Event::Key(k)) => app.on_key(k),
                 Ok(Event::Mouse(m)) => app.on_mouse(m),
+                Ok(Event::Paste(text)) => app.on_paste(&text),
                 Ok(_) => {}
                 Err(e) => break Err(e.into()),
             }
@@ -3673,7 +3801,11 @@ pub fn run(source: TargetSource, bin: Binary, bytes: Vec<u8>, db: Db, title: Str
             break Ok(());
         }
     };
-    let _ = ratatui::crossterm::execute!(&mut stdout(), event::DisableMouseCapture);
+    let _ = ratatui::crossterm::execute!(
+        &mut stdout(),
+        event::DisableMouseCapture,
+        event::DisableBracketedPaste
+    );
     ratatui::restore();
     res
 }
@@ -5371,6 +5503,7 @@ mod tests {
         app.prompt = Some(Prompt {
             ask: Ask::Name,
             input: "parse_header".into(),
+            cursor: "parse_header".len(),
             at: 0x1000,
             field: None,
             variable: None,
@@ -5503,6 +5636,39 @@ mod tests {
         assert!(app.prompt.is_none(), "escape abandons without saving");
         assert!(app.db.names.is_empty());
         assert!(!app.quit, "escape closed the prompt, it did not quit");
+    }
+
+    #[test]
+    fn agent_composer_edits_unicode_at_the_cursor_and_accepts_multiline_paste() {
+        let mut app = two_functions();
+        app.splash = false;
+        app.execute_command("agent");
+        app.on_key(KeyEvent::from(KeyCode::Char('a')));
+        app.on_paste("β\r\nline");
+        assert_eq!(app.prompt.as_ref().unwrap().input, "aβ\nline");
+
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.prompt.as_ref().unwrap().input, "aβ\nlie");
+        app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.on_paste("next");
+        assert_eq!(app.prompt.as_ref().unwrap().input, "aβ\nlie\nnext");
+
+        let screen = rendered(&mut app, 100, 28);
+        assert!(screen.contains("aβ"));
+        assert!(screen.contains("lie"));
+        assert!(screen.contains("next"));
+        assert!(screen.contains("Shift+Enter newline"));
+    }
+
+    #[test]
+    fn active_agent_work_uses_the_timed_event_loop() {
+        let mut app = two_functions();
+        assert!(!app.needs_background_poll());
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        app.investigation_worker = Some(receiver);
+        assert!(app.needs_background_poll());
     }
 
     #[test]

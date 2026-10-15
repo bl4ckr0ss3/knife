@@ -60,7 +60,9 @@ investigation.
 
 The model can invoke registered analysis reads. Tool activity appears while it
 works; the resulting answer, tool-response previews, and evidence records are
-persisted. The prompt requires observed facts, inferences, unknowns, evidence
+persisted. While a model or tool worker is active, the TUI polls and redraws at
+100 ms intervals, so progress and completed answers appear without an extra
+keypress. The prompt requires observed facts, inferences, unknowns, evidence
 IDs, and static addresses. Model compliance with those instructions still needs
 to be assessed by the analyst. Project mutation and target execution are not
 available to this initial loop. Responses currently arrive after each complete
@@ -102,7 +104,9 @@ the full agent workspace and the side-by-side analysis layout. With the desk
 focused, every ordinary printable letter belongs to the inline chat composer,
 including the first character; `Enter` sends and `Esc` cancels. This means a
 question beginning with "analyze", "trace", or "explain" cannot accidentally
-trigger a pane action. Press `Alt+A` for an evidence-led analysis of the current
+trigger a pane action. The composer supports Unicode-safe Left/Right,
+Home/End, Delete/Backspace, `Ctrl+U` to clear, `Shift+Enter` for a newline, and
+bounded bracketed paste (32 KiB for agent questions). Press `Alt+A` for an evidence-led analysis of the current
 selection or `Alt+T` for complete-target triage. After a provider or network failure, `Alt+R` retries the latest saved
 question without adding a duplicate ledger entry. While follow mode is enabled, completed agent tools move the listing
 to their first static evidence address. Manual focus on the listing pauses that

@@ -638,13 +638,31 @@ fn append_agent_composer(lines: &mut Vec<TLine<'static>>, app: &App) {
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
     ]));
+    let (before, after) = prompt.input.split_at(prompt.cursor);
+    let mut before_lines = before.split('\n').collect::<Vec<_>>();
+    let current = before_lines.pop().unwrap_or_default();
+    for line in before_lines {
+        lines.push(TLine::from(vec![
+            Span::styled(" │ ", Style::default().fg(color)),
+            Span::styled(line.to_string(), Style::default().fg(color)),
+        ]));
+    }
+    let mut after_lines = after.split('\n');
+    let suffix = after_lines.next().unwrap_or_default();
     lines.push(TLine::from(vec![
         Span::styled(" │ ", Style::default().fg(color)),
-        Span::styled(prompt.input.clone(), Style::default().fg(color)),
+        Span::styled(current.to_string(), Style::default().fg(color)),
         Span::styled("█", Style::default().fg(color)),
+        Span::styled(suffix.to_string(), Style::default().fg(color)),
     ]));
+    for line in after_lines {
+        lines.push(TLine::from(vec![
+            Span::styled(" │ ", Style::default().fg(color)),
+            Span::styled(line.to_string(), Style::default().fg(color)),
+        ]));
+    }
     lines.push(TLine::from(Span::styled(
-        "   Enter send  ·  Esc cancel  ·  Backspace edit",
+        "   Enter send  ·  Shift+Enter newline  ·  Esc cancel",
         Style::default().fg(faint()),
     )));
 }
@@ -1896,6 +1914,15 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
         } else {
             (format!(" {}: ", p.ask.label()), accent())
         };
+        let (before, after) = p.input.split_at(p.cursor);
+        let (before, after) = if p.ask == super::Ask::AgentApiKey {
+            (
+                "•".repeat(before.chars().count()),
+                "•".repeat(after.chars().count()),
+            )
+        } else {
+            (before.to_string(), after.to_string())
+        };
         let line = TLine::from(vec![
             Span::styled(
                 label,
@@ -1903,15 +1930,9 @@ fn footer(f: &mut Frame, area: Rect, app: &App) {
                     .fg(input_color)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                if p.ask == super::Ask::AgentApiKey {
-                    "•".repeat(p.input.chars().count())
-                } else {
-                    p.input.clone()
-                },
-                Style::default().fg(input_color),
-            ),
+            Span::styled(before, Style::default().fg(input_color)),
             Span::styled("█", Style::default().fg(input_color)),
+            Span::styled(after, Style::default().fg(input_color)),
             Span::styled(format!("  {}", app.status), Style::default().fg(muted())),
         ]);
         f.render_widget(Paragraph::new(line), area);
