@@ -5293,6 +5293,7 @@ mod tests {
         app.investigation_follow = true;
         app.apply_agent_event(crate::agent::AgentEvent::ToolCompleted {
             name: "explain_function".into(),
+            arguments: "{}".into(),
             static_address: Some(0x100b),
         });
         assert_eq!(app.cursor_addr(), Some(0x100b));
@@ -5301,6 +5302,7 @@ mod tests {
         assert!(!app.investigation_follow);
         app.apply_agent_event(crate::agent::AgentEvent::ToolCompleted {
             name: "explain_function".into(),
+            arguments: "{}".into(),
             static_address: Some(0x1000),
         });
         assert_eq!(app.cursor_addr(), Some(0x100b));
@@ -5323,6 +5325,7 @@ mod tests {
         for index in 0..12 {
             app.apply_agent_event(crate::agent::AgentEvent::ToolCompleted {
                 name: format!("tool_{index}"),
+                arguments: "{}".into(),
                 static_address: Some(0x1000 + index),
             });
         }
@@ -5378,6 +5381,37 @@ mod tests {
         let screen = rendered(&mut app, 160, 40);
         assert!(screen.contains("Alt+R  retry last question"));
         assert!(screen.contains("Alt+S  provider setup"));
+    }
+
+    #[test]
+    fn agent_tool_calls_are_logged_to_a_jsonl_audit_file() {
+        let mut app = two_functions();
+        app.splash = false;
+        let root = std::env::temp_dir().join(format!(
+            "knife-agentlog-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        app.db = crate::db::Db::load(
+            "stub-hash",
+            "fixture.elf",
+            Some(root.join("workspace.json").to_str().unwrap()),
+        )
+        .unwrap();
+        app.apply_agent_event(crate::agent::AgentEvent::ToolCompleted {
+            name: "read_bytes".into(),
+            arguments: r#"{"selector":"0x14002e088"}"#.into(),
+            static_address: Some(0x14002e088),
+        });
+        let log = std::fs::read_to_string(root.join("workspace.agentlog.jsonl")).unwrap();
+        assert!(log.contains("read_bytes"), "{log}");
+        assert!(log.contains("0x14002e088"), "{log}");
+        assert!(log.contains("\"ts\""), "{log}");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

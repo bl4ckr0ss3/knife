@@ -39,6 +39,8 @@ pub enum AgentEvent {
     Activity(String),
     ToolCompleted {
         name: String,
+        /// Compact bounded arguments as sent, so call logs show what was asked.
+        arguments: String,
         static_address: Option<u64>,
     },
 }
@@ -1124,8 +1126,12 @@ pub fn converse_with_ui_context(
             };
             let (matching_evidence, static_address) = matching_evidence(&result, &expected_target);
             evidence.extend(matching_evidence);
+            let arguments = serde_json::to_string(&args)
+                .map(|encoded| encoded.chars().take(240).collect::<String>())
+                .unwrap_or_default();
             events(AgentEvent::ToolCompleted {
                 name: name.into(),
+                arguments,
                 static_address,
             });
             if name == "discover_investigation_tools" {
@@ -1460,6 +1466,45 @@ mod tests {
                 .count(),
             MAX_CONTINUATION_NUDGES
         );
+    }
+
+    #[test]
+    fn tool_completed_events_carry_bounded_arguments() {
+        let bytes = crate::formats::fixture::pe_with_driver();
+        let bin = crate::formats::analyze("fixture.exe", &bytes).unwrap();
+        let db = crate::db::Db::default();
+        let an = crate::analysis::engine::analyze(&bin, &bytes, 200_000, &db);
+        let session = Session {
+            bin,
+            bytes,
+            db,
+            an,
+            code_analyzed: true,
+        };
+        let mut ledger = Investigation::new("fixture");
+        ledger.append(Role::Analyst, "Look".into(), vec![]).unwrap();
+        let mut provider = Scripted {
+            messages: vec![
+                json!({"role":"assistant","tool_calls":[{"function":{"name":"session_status","arguments":{"round":1}}}]}),
+                json!({"role":"assistant","content":"Session established."}),
+            ],
+            index: 0,
+        };
+        let cancellation = crate::api::execution::CancellationToken::default();
+        let mut seen = None;
+        let _ = converse_with_events(&mut provider, &session, &ledger, &cancellation, |event| {
+            if let AgentEvent::ToolCompleted {
+                name,
+                arguments,
+                static_address,
+            } = event
+            {
+                seen = Some((name, arguments, static_address));
+            }
+        });
+        let (name, arguments, _static_address) = seen.expect("tool completion was announced");
+        assert_eq!(name, "session_status");
+        assert_eq!(arguments, r#"{"round":1}"#);
     }
 
     struct Scripted {

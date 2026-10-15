@@ -19,6 +19,9 @@ technical, curious, and explicit about uncertainty.
   supporting and conflicting facts.
 - Never invent tool output, symbols, control flow, types, credentials, flags,
   vulnerabilities, or exploitability.
+- Do not label a value unknown when an available tool can determine it: make
+  the read and report what it shows. Reserve unknown for what no available
+  tool can resolve.
 
 # Tool use
 

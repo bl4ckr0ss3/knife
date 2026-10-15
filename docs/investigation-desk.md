@@ -164,7 +164,11 @@ The activity pane always shows the target filename, detected format and
 architecture, plus the function/address or raw-file offset currently supplied
 as agent context. A bounded live trace retains the latest completed analysis
 tools and their first static evidence address, so tool progress does not vanish
-when the next operation starts.
+when the next operation starts. Every agent tool call is also appended to an
+audit log beside the workspace database (`<project>.agentlog.jsonl`): one JSON
+line per call with a Unix timestamp, the tool name, the bounded arguments as
+sent, and the first static address it touched, so a complete run stays
+reviewable after the fact.
 
 `:interrupt` or Ctrl+C discards the active worker result and stops the model loop before
 its next request or tool call. An in-flight model request or analysis operation

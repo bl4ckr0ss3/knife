@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Every agent tool call is appended to `<project>.agentlog.jsonl` beside the
+  workspace database — timestamp, tool name, bounded arguments, and the first
+  static address — so a complete investigation stays auditable after the run.
+- The evidence contract now forbids fake unknowns: a value an available tool
+  can determine must be read and reported, and `unknown` is reserved for what
+  no available tool can resolve. Quick triage prompts say the same.
 - Tool-call budgets grew from 24 to 48 per investigation: local analysis calls
   cost milliseconds while model rounds cost a provider request, so deep
   analyses stop dying at the budget before finishing their reads.

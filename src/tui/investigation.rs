@@ -554,6 +554,7 @@ impl App {
             crate::agent::AgentEvent::Activity(message) => self.investigation_activity = message,
             crate::agent::AgentEvent::ToolCompleted {
                 name,
+                arguments,
                 static_address,
             } => {
                 self.investigation_activity = format!("Completed {name}");
@@ -562,12 +563,41 @@ impl App {
                 if self.investigation_tool_trace.len() > 8 {
                     self.investigation_tool_trace.remove(0);
                 }
+                self.log_agent_tool_call(&name, &arguments, static_address);
                 if self.investigation_open && self.investigation_follow {
                     if let Some(address) = static_address {
                         self.execute_command(&format!("goto 0x{address:x}"));
                     }
                 }
             }
+        }
+    }
+
+    /// Append one agent tool call to the JSONL audit log beside the workspace
+    /// database, so every tool invocation — name, arguments, address, time —
+    /// stays reviewable after the run. Best effort: logging never breaks a run.
+    fn log_agent_tool_call(&self, name: &str, arguments: &str, static_address: Option<u64>) {
+        use std::io::Write;
+        let Some(database) = self.db.path() else {
+            return;
+        };
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or_default();
+        let line = serde_json::to_string(&serde_json::json!({
+            "ts": timestamp,
+            "tool": name,
+            "arguments": arguments,
+            "static_address": static_address,
+        }))
+        .unwrap_or_else(|_| format!("{{\"tool\":\"{name}\"}}"));
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(database.with_extension("agentlog.jsonl"))
+        {
+            let _ = writeln!(file, "{line}");
         }
     }
 
@@ -628,9 +658,9 @@ fn model_choices(provider: &str, current: &str) -> Vec<String> {
 
 fn quick_investigation_prompt(target_wide: bool) -> &'static str {
     if target_wide {
-        "Triage the complete target. Identify its format and security properties; inspect suspicious imports, strings, functions, embedded content, and likely validation or decryption logic; follow the strongest cross-references; then give prioritized next steps. Clearly separate observed evidence, inference, limitations, and unknowns."
+        "Triage the complete target. Identify its format and security properties; inspect suspicious imports, strings, functions, embedded content, and likely validation or decryption logic; follow the strongest cross-references; read addressable constants with byte reads before calling them unknown; then give prioritized next steps. Clearly separate observed evidence, inference, limitations, and unknowns."
     } else {
-        "Analyze the current Knife selection in context. Explain what it does, trace its inputs, outputs, callers, callees, referenced strings, and validation or decryption behavior where supported. Clearly separate observed evidence, inference, limitations, and unknowns."
+        "Analyze the current Knife selection in context. Explain what it does, trace its inputs, outputs, callers, callees, referenced strings, and validation or decryption behavior where supported. Read addressable constants with byte reads before calling them unknown. Clearly separate observed evidence, inference, limitations, and unknowns."
     }
 }
 
