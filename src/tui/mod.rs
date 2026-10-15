@@ -422,6 +422,9 @@ pub struct App {
     pub agent_config: crate::agent::AgentConfig,
     pub investigation_open: bool,
     pub investigation_focused: bool,
+    /// The investigation desk owns the full content area. Kept separate from
+    /// the analysis-pane zoom because the desk is not an analysis `Focus`.
+    pub investigation_zoomed: bool,
     pub investigation_follow: bool,
     pub investigation_agent_events: Option<std::sync::mpsc::Receiver<crate::agent::AgentEvent>>,
     pub investigation_conflicts_only: bool,
@@ -578,6 +581,7 @@ impl App {
             agent_config: crate::agent::AgentConfig::from_environment(),
             investigation_open: false,
             investigation_focused: true,
+            investigation_zoomed: false,
             investigation_follow: true,
             investigation_agent_events: None,
             investigation_conflicts_only: false,
@@ -2480,13 +2484,20 @@ impl App {
         }
         if self.investigation_open
             && self.prompt.is_none()
-            && key.code == KeyCode::Tab
-            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && (matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.code == KeyCode::F(6))
         {
             self.investigation_focused = !self.investigation_focused;
             if !self.investigation_focused {
                 self.investigation_follow = false;
+                self.investigation_zoomed = false;
             }
+            self.status = if self.investigation_focused {
+                "investigation desk focused; z maximizes it, Tab returns to workspace".into()
+            } else {
+                "analysis workspace focused; Ctrl+Tab or F6 returns to the desk".into()
+            };
             return;
         }
         if self.investigation_open && self.investigation_focused && self.prompt.is_none() {
@@ -2494,9 +2505,13 @@ impl App {
                 KeyCode::Char('i') => self.ask(Ask::AgentQuestion),
                 KeyCode::Char('S') => self.start_agent_setup(),
                 KeyCode::Char('f') => self.investigation_follow = !self.investigation_follow,
+                KeyCode::Char('z') => self.toggle_pane_zoom(),
                 KeyCode::Tab => {
                     self.investigation_focused = false;
                     self.investigation_follow = false;
+                    self.investigation_zoomed = false;
+                    self.status =
+                        "analysis workspace focused; Ctrl+Tab or F6 returns to the desk".into();
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.execute_command("interrupt")
@@ -2532,6 +2547,7 @@ impl App {
                 KeyCode::Esc => {
                     self.investigation_open = false;
                     self.investigation_follow = false;
+                    self.investigation_zoomed = false;
                 }
                 KeyCode::Up => {
                     self.investigation_selection = self.investigation_selection.saturating_sub(1)
@@ -4984,6 +5000,34 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
         assert_eq!(app.prompt.as_ref().unwrap().ask, Ask::AgentQuestion);
         assert!(rendered(&mut app, 160, 40).contains("Agent chat"));
+    }
+
+    #[test]
+    fn investigation_desk_can_be_focused_and_zoomed() {
+        let mut app = two_functions();
+        app.splash = false;
+        app.execute_command("agent");
+
+        let docked = app.panes(ratatui::layout::Rect::new(0, 0, 160, 40));
+        assert!(docked.agent.width > 0);
+        assert!(docked.listing.width > 0);
+        assert!(rendered(&mut app, 160, 40).contains("Agent chat · FOCUSED"));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        let zoomed = app.panes(ratatui::layout::Rect::new(0, 0, 160, 40));
+        assert!(app.investigation_zoomed);
+        assert_eq!(zoomed.agent.width, 160);
+        assert_eq!(zoomed.listing.width, 0);
+
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
+        let restored = app.panes(ratatui::layout::Rect::new(0, 0, 160, 40));
+        assert!(!app.investigation_focused);
+        assert!(!app.investigation_zoomed);
+        assert!(restored.listing.width > 0);
+
+        app.on_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
+        assert!(app.investigation_focused);
+        assert!(app.status.contains("desk focused"));
     }
 
     #[test]

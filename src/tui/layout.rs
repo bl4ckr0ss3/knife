@@ -45,6 +45,18 @@ impl App {
                 Constraint::Length(1),
             ])
             .split(area);
+        if self.investigation_open && self.investigation_zoomed {
+            return Panes {
+                agent: rows[1],
+                header: rows[0],
+                footer: rows[2],
+                functions: Rect::default(),
+                listing: Rect::default(),
+                listing_right: Rect::default(),
+                references: Rect::default(),
+                detail: Rect::default(),
+            };
+        }
         let (content, agent) = if self.investigation_open {
             if area.width >= 100 {
                 let width = (area.width * 2 / 5).clamp(36, 60);
@@ -227,6 +239,17 @@ impl App {
     }
 
     pub fn toggle_pane_zoom(&mut self) {
+        if self.investigation_open && self.investigation_focused {
+            self.investigation_zoomed = !self.investigation_zoomed;
+            self.pane_settings.zoom = None;
+            self.status = if self.investigation_zoomed {
+                "investigation desk maximized; z restores the workspace".into()
+            } else {
+                "restored analysis workspace beside the investigation desk".into()
+            };
+            return;
+        }
+        self.investigation_zoomed = false;
         if self.pane_settings.zoom.is_some() {
             self.pane_settings.zoom = None;
             self.status = "restored pane layout".into();

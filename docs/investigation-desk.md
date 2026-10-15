@@ -88,7 +88,10 @@ the TUI before collecting results. Navigation remains responsive. Evidence
 records and bounded tool responses are saved beside the annotation database in
 an `.investigation.json` file. Press `i` to compose an agent message in the
 ordinary command input, and Ctrl+Tab to move focus between the dock and the
-listing. While follow mode is enabled, completed agent tools move the listing
+listing. `F6` is an equivalent fallback for terminals that do not distinguish
+Ctrl+Tab. The focused desk uses a bright rounded border and a `FOCUSED` label;
+press `z` there to maximize chat and evidence together, then `z` again to
+restore the side-by-side workspace. While follow mode is enabled, completed agent tools move the listing
 to their first static evidence address. Manual focus on the listing pauses that
 behavior; `f` toggles it explicitly. Up/Down selects evidence; Enter navigates
 to its first static location without closing the desk. Esc closes the desk;

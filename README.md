@@ -98,6 +98,7 @@ closes it), and `:` opens command mode. The essentials:
 | `Tab` / `Shift+Tab` | focus the next / previous pane, skipping empty xrefs |
 | `+` / `-` | grow / shrink the focused pane |
 | `z` | maximize the focused pane; press again to restore |
+| `Ctrl+Tab` / `F6` | move between the analysis workspace and investigation desk |
 | `g` | goto a symbol; `va:0x..` static VA, `off:0x..` file offset |
 | `/` | filter the function list, or search the listing |
 | `d` / `f` | pseudocode / spatial CFG view |
@@ -286,6 +287,8 @@ OpenAI-compatible endpoint; the agent can call Knife's bounded analysis tools
 and save its evidence into the project ledger. Press `S` to configure the
 provider, model, base URL and a masked memory-only API key inside the TUI. No
 provider is contacted until you configure one and submit a message.
+Use `Ctrl+Tab` (or terminal-friendly `F6`) to focus the desk, then `z` to
+maximize its chat and evidence panes; `z` restores the side-by-side layout.
 
 ## Kernel drivers & BYOVD
 

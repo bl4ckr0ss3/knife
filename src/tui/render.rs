@@ -202,15 +202,26 @@ fn investigation_desk(f: &mut Frame, app: &App) {
     } else {
         conversation
     };
+    let desk_border = if app.investigation_focused {
+        Style::default().fg(accent()).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(faint())
+    };
     f.render_widget(
         Paragraph::new(conversation)
-            .block(Block::default().borders(Borders::ALL).title(
-                if app.investigation_evidence_detail {
-                    " Investigation desk — evidence (e: back to chat) "
-                } else {
-                    " Investigation desk — Agent chat "
-                },
-            ))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(desk_border)
+                    .title(if app.investigation_evidence_detail {
+                        " Investigation desk — Evidence detail · e: chat "
+                    } else if app.investigation_focused {
+                        " Investigation desk — Agent chat · FOCUSED "
+                    } else {
+                        " Investigation desk — Agent chat "
+                    }),
+            )
             .style(Style::default().fg(accent()).bg(panel()))
             .wrap(Wrap { trim: false })
             .scroll((app.investigation_message_scroll, 0)),
@@ -224,18 +235,23 @@ fn investigation_desk(f: &mut Frame, app: &App) {
     );
     let mut lines = vec![
         TLine::from(format!(
-            " i: chat  S: setup  f: follow {}  Ctrl+Tab: {}",
+            " {}  i: chat  S: setup  f: follow {}",
+            if app.investigation_focused {
+                "FOCUSED"
+            } else {
+                "Ctrl+Tab/F6: focus"
+            },
             if app.investigation_follow {
                 "ON"
             } else {
                 "OFF"
-            },
-            if app.investigation_focused {
-                "workspace"
-            } else {
-                "chat"
             }
         )),
+        TLine::from(if app.investigation_focused {
+            " Ctrl+Tab/F6/Tab: workspace  z: maximize/restore"
+        } else {
+            " Focus the desk to navigate evidence or maximize it"
+        }),
         TLine::from(" Findings and activity"),
     ];
     lines.insert(
@@ -331,7 +347,9 @@ fn investigation_desk(f: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(" Investigation desk "),
+                    .border_type(BorderType::Rounded)
+                    .border_style(desk_border)
+                    .title(" Investigation desk — Evidence & activity "),
             )
             .style(Style::default().fg(accent()).bg(panel()))
             .wrap(Wrap { trim: false }),
@@ -351,7 +369,7 @@ fn agent_conversation(app: &App) -> String {
         .collect::<Vec<_>>();
     if messages.is_empty() {
         return format!(
-            "{}\n\nPress S to configure provider/model/API key.\nPress i anywhere to speak to the agent.\nPgUp/PgDn: older/newer chat\nCtrl+Up/Down: scroll\nEnter: follow selected evidence\nCtrl+Tab: switch workspace/chat\nf: toggle live following\nCtrl+C: interrupt agent",
+            "{}\n\nPress S to configure provider/model/API key.\nPress i anywhere to speak to the agent.\nPgUp/PgDn: older/newer chat\nCtrl+Up/Down: scroll\nEnter: follow selected evidence\nCtrl+Tab or F6: switch workspace/desk\nz: maximize the focused desk\nf: toggle live following\nCtrl+C: interrupt agent",
             app.agent_config.status()
         );
     }

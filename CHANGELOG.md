@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- The investigation desk is now a first-class focus and zoom target:
+  `Ctrl+Tab` or `F6` focuses it, a visible active border confirms focus, and
+  `z` maximizes/restores the complete chat-and-evidence workspace.
 - The TUI now opens with its investigation desk visible, and `i` starts an
   agent message from anywhere in the workspace. Provider readiness is shown in
   the chat pane.
