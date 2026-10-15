@@ -19,8 +19,10 @@ prompt, implementation, or documentation.
   is not evidence of absence.
 - New agent-facing operations need deterministic JSON, safety metadata,
   evidence locations, limitations, pagination where appropriate, and tests.
-- Never persist or log model API keys. Hosted model use must be explicit, and
-  documentation must state what target-derived data leaves the machine.
+- Never persist model API keys in files or logs. Explicit in-TUI setup may use
+  only the operating system's credential vault; hosted model use must be
+  explicit, and documentation must state what target-derived data leaves the
+  machine.
 
 ## Implementation workflow
 

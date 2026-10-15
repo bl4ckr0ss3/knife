@@ -229,6 +229,18 @@ fn investigation_desk(f: &mut Frame, app: &App) {
     );
     let desk = evidence_area;
     let width = desk.width;
+    if app.prompt.as_ref().is_some_and(|prompt| {
+        matches!(
+            prompt.ask,
+            super::Ask::AgentProvider
+                | super::Ask::AgentModel
+                | super::Ask::AgentBaseUrl
+                | super::Ask::AgentApiKey
+        )
+    }) {
+        render_agent_setup(f, desk, app, desk_border);
+        return;
+    }
     let mut lines = vec![
         TLine::from(vec![
             Span::styled(" ● ", activity_style(app)),
@@ -363,6 +375,112 @@ fn investigation_desk(f: &mut Frame, app: &App) {
     );
 }
 
+fn render_agent_setup(f: &mut Frame, area: Rect, app: &App, border: Style) {
+    let prompt = app.prompt.as_ref().expect("setup prompt checked by caller");
+    let (step, title, help) = match prompt.ask {
+        super::Ask::AgentProvider => (
+            "1 / 4",
+            "Choose provider",
+            "↑/↓ selects · type for an exact value · Enter continues",
+        ),
+        super::Ask::AgentModel => (
+            "2 / 4",
+            "Choose model",
+            "↑/↓ selects · type any provider model ID · Enter continues",
+        ),
+        super::Ask::AgentBaseUrl => (
+            "3 / 4",
+            "Endpoint",
+            "Confirm the local or HTTPS endpoint in the input line",
+        ),
+        super::Ask::AgentApiKey => (
+            "4 / 4",
+            "Credential vault",
+            "Input is masked · blank keeps the saved key · Enter saves",
+        ),
+        _ => unreachable!("setup prompt checked by caller"),
+    };
+    let mut lines = vec![
+        TLine::from(vec![
+            Span::styled(
+                format!(" {step} "),
+                Style::default()
+                    .fg(canvas())
+                    .bg(model_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {title}"),
+                Style::default().fg(accent()).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        TLine::from(Span::styled(
+            format!(" {help}"),
+            Style::default().fg(faint()),
+        )),
+        TLine::default(),
+    ];
+    if matches!(
+        prompt.ask,
+        super::Ask::AgentProvider | super::Ask::AgentModel
+    ) {
+        for (index, choice) in app.agent_setup_choices.iter().enumerate() {
+            let selected = index == app.agent_setup_selection;
+            lines.push(TLine::from(vec![
+                Span::styled(
+                    if selected { " ▸ " } else { "   " },
+                    Style::default().fg(if selected { warning_color() } else { faint() }),
+                ),
+                Span::styled(
+                    choice.clone(),
+                    Style::default()
+                        .fg(if selected { accent() } else { muted() })
+                        .add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+            ]));
+        }
+    } else if prompt.ask == super::Ask::AgentApiKey {
+        lines.push(TLine::from(Span::styled(
+            if app.agent_config.has_api_key() {
+                " ✓ A saved credential is loaded; leave the field blank to keep it."
+            } else {
+                " No saved credential was found for this provider."
+            },
+            Style::default().fg(if app.agent_config.has_api_key() {
+                success_color()
+            } else {
+                warning_color()
+            }),
+        )));
+        lines.push(TLine::from(Span::styled(
+            " The key is stored by your OS, never in the Knife project or ledger.",
+            Style::default().fg(muted()),
+        )));
+    } else {
+        lines.push(TLine::from(vec![
+            Span::styled(" CURRENT  ", Style::default().fg(faint())),
+            Span::styled(prompt.input.clone(), Style::default().fg(analyst_color())),
+        ]));
+    }
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(border)
+                    .title(" Agent setup "),
+            )
+            .style(Style::default().bg(panel()))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn agent_conversation(app: &App) -> Vec<TLine<'static>> {
     let mut messages = app
         .investigation
@@ -397,7 +515,16 @@ fn agent_conversation(app: &App) -> Vec<TLine<'static>> {
                 Style::default().fg(faint()),
             )),
         ];
-        if let Some(address) = app.cur {
+        if app.raw_file {
+            lines.push(TLine::default());
+            lines.push(TLine::from(vec![
+                Span::styled("TRY  ", Style::default().fg(warning_color())),
+                Span::styled(
+                    "Triage this file, identify its content, and explain suspicious bytes",
+                    Style::default().fg(muted()),
+                ),
+            ]));
+        } else if let Some(address) = app.cur {
             lines.push(TLine::default());
             lines.push(TLine::from(vec![
                 Span::styled("TRY  ", Style::default().fg(warning_color())),
@@ -1759,7 +1886,7 @@ const HELP_LINES: &[&str] = &[
         "                 xrefs, callers, callees, types, rename NAME, comment TEXT, help",
         "                 catalogs: imports exports strings sections; ELF headers segments section-headers",
         "  i / S          message the agent / configure provider, model and API key",
-        "                 Ctrl+Tab switches workspace/chat; agent API keys stay memory-only",
+        "                 Ctrl+Left/Right or Ctrl+Tab switches workspace/chat; keys use the OS vault",
         "  b              toggle local bookmark; :bookmarks lists saved locations",
         "",
         "  /              filter the function list, or search the code when the",

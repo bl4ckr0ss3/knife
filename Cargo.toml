@@ -62,6 +62,7 @@ bincode = { version = "2", features = ["serde"] }
 regex = "1"
 owo-colors = "4"
 anyhow = "1"
+keyring = "4.2"               # API keys live in the native OS credential vault
 semver = "1"
 flate2 = "1"
 tar = "0.4"

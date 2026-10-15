@@ -98,7 +98,7 @@ closes it), and `:` opens command mode. The essentials:
 | `Tab` / `Shift+Tab` | focus the next / previous pane, skipping empty xrefs |
 | `+` / `-` | grow / shrink the focused pane |
 | `z` | maximize the focused pane; press again to restore |
-| `Ctrl+Tab` / `F6` | move between the analysis workspace and investigation desk |
+| `Ctrl+←` / `Ctrl+→`, `Ctrl+Tab`, `F6` | move between analysis and the investigation desk |
 | `g` | goto a symbol; `va:0x..` static VA, `off:0x..` file offset |
 | `/` | filter the function list, or search the listing |
 | `d` / `f` | pseudocode / spatial CFG view |
@@ -284,11 +284,14 @@ knife query sample.exe explain_function --args '{"selector":"main"}'
 The built-in [investigation desk](docs/investigation-desk.md) opens beside the
 listing. Press `i` to chat through local Ollama, OpenRouter, OpenAI, or another
 OpenAI-compatible endpoint; the agent can call Knife's bounded analysis tools
-and save its evidence into the project ledger. Press `S` to configure the
-provider, model, base URL and a masked memory-only API key inside the TUI. No
-provider is contacted until you configure one and submit a message.
-Use `Ctrl+Tab` (or terminal-friendly `F6`) to focus the desk, then `z` to
+and save its evidence into the project ledger. Press `S` to choose a provider
+and model from the setup sidebar (or type an exact model ID). Knife remembers
+provider/model preferences in its user config and stores hosted API keys only
+in the operating-system credential vault; keys remain masked and never enter
+the project ledger. No provider is contacted until you submit a message.
+Use `Ctrl+Right`, `Ctrl+Tab`, or terminal-friendly `F6` to focus the desk, then `z` to
 maximize its chat and evidence panes; `z` restores the side-by-side layout.
+`Ctrl+Left` returns to analysis without discarding the conversation.
 The conversation labels replies with the configured model's readable name
 (for example `GLM5.3 Flash`) and uses restrained role and evidence colors to
 separate analyst input, model output, observations, inferences, and limits.

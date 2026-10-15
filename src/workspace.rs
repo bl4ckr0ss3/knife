@@ -56,6 +56,35 @@ impl Session {
             code_analyzed: false,
         })
     }
+
+    /// Open any readable file for agent-led analysis. Unsupported, malformed,
+    /// or unknown containers retain an honest raw-byte view; supported native
+    /// architectures additionally receive the normal recovered-code analysis.
+    pub fn open_any(file: &str, db_path: Option<&str>, budget: usize) -> Result<Session> {
+        let original = std::fs::read(file).with_context(|| format!("cannot read {file}"))?;
+        let original_bin = formats::analyze_or_raw(file, &original);
+        let sha256 = hashes::sha256_hex(&original);
+        let store = db::Db::load(&sha256, file, db_path)?;
+        let bytes = store.apply_patches(original)?;
+        let bin = if store.patches.is_empty() {
+            original_bin
+        } else {
+            formats::analyze_or_raw(file, &bytes)
+        };
+        let code_analyzed = disasm::supported(bin.arch);
+        let an = if code_analyzed {
+            cache::load_or_analyze(&bin, &bytes, budget, &store, &workspace_sha(&bytes))
+        } else {
+            engine::Analysis::empty(bin.arch)
+        };
+        Ok(Session {
+            bin,
+            bytes,
+            db: store,
+            an,
+            code_analyzed,
+        })
+    }
 }
 
 fn workspace_sha(bytes: &[u8]) -> String {
@@ -91,6 +120,25 @@ mod tests {
         assert_eq!(session.db.patches.len(), 1);
         assert!(!session.an.functions.is_empty());
         assert_eq!(std::fs::read(&target).unwrap(), original);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn open_any_keeps_unknown_files_available_as_data() {
+        let root =
+            std::env::temp_dir().join(format!("knife-any-file-workspace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let target = root.join("sample.unknown");
+        let bytes = b"unrecognized file with a useful string\0";
+        std::fs::write(&target, bytes).unwrap();
+
+        let session = Session::open_any(target.to_str().unwrap(), None, 10_000).unwrap();
+        assert_eq!(session.bin.format, crate::model::Format::Unknown);
+        assert!(!session.code_analyzed);
+        assert!(session.an.functions.is_empty());
+        assert_eq!(session.bin.sections[0].name, ".file");
+        assert_eq!(session.bytes, bytes);
         let _ = std::fs::remove_dir_all(root);
     }
 }

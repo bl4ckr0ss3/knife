@@ -3,8 +3,9 @@
 ## Unreleased
 
 - The investigation desk is now a first-class focus and zoom target:
-  `Ctrl+Tab` or `F6` focuses it, a visible active border confirms focus, and
-  `z` maximizes/restores the complete chat-and-evidence workspace.
+  `Ctrl+Left`/`Ctrl+Right`, `Ctrl+Tab`, or `F6` moves between it and analysis,
+  a visible active border confirms focus, and `z` maximizes/restores the
+  complete chat-and-evidence workspace without losing conversation state.
 - Agent conversations now show the configured model's readable identity (such
   as `GLM5.3 Flash`) instead of a generic assistant name. Role badges, semantic
   evidence colors, worker-state indicators, and a wide fullscreen layout make
@@ -14,13 +15,19 @@
   the chat pane.
 - The embedded tool-using agent supports OpenRouter, OpenAI, and custom
   OpenAI-compatible chat-completions endpoints in addition to local Ollama.
-  Hosted API credentials remain ephemeral and are kept out of child process
-  command lines and saved investigation data.
-- Provider, model, base URL, and a masked memory-only API key can now be entered
-  with `S` directly in the investigation desk. Saved tool transcripts are
+  Hosted API credentials are kept out of child process command lines and saved
+  investigation data.
+- Provider setup now presents provider and model choices in the investigation
+  sidebar. Provider, model, and base URL are remembered in the user's Knife
+  config; API keys are stored separately in the operating-system credential
+  vault and remain masked in the TUI. Saved tool transcripts are
   excluded from model protocol history, recent conversation and live tool
   previews are bounded, and a new answer always switches the pane back from
   evidence detail to conversation.
+- The TUI and embedded agent can open any readable file. Unknown, malformed,
+  or unsupported containers receive an explicit data-only workspace with raw
+  bytes and non-code analysis tools instead of being rejected or pretending
+  that code recovery ran.
 - Reaching the agent's round or tool budget now triggers a tool-free synthesis
   turn rather than failing the investigation. If synthesis fails, Knife still
   saves a marked partial result and its evidence. The chat pane presents a

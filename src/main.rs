@@ -1443,20 +1443,14 @@ fn cmd_explorer(db_path: Option<&str>, start: Option<&str>) -> Result<()> {
 
 fn cmd_tui(file: &str, db_path: Option<&str>) -> Result<()> {
     let original = load(file)?;
-    let original_bin = parse(file, &original)?;
+    let original_bin = formats::analyze_or_raw(file, &original);
     let db = open_db(file, &original, db_path)?;
     let bytes = db.apply_patches(original)?;
     let bin = if db.patches.is_empty() {
         original_bin
     } else {
-        parse(file, &bytes).context("staged patches make the binary unparsable")?
+        formats::analyze_or_raw(file, &bytes)
     };
-    if !disasm::supported(bin.arch) {
-        anyhow::bail!(
-            "the interactive view needs x86, x64, or AArch64 disassembly; this is {}",
-            bin.arch.label()
-        );
-    }
     let title = basename(file).to_string();
     let source = tui::TargetSource {
         path: std::path::PathBuf::from(file),

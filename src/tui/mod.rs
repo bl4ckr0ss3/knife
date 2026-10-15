@@ -334,6 +334,38 @@ struct ReloadOutcome {
     elapsed_ms: u128,
 }
 
+fn build_work_result(bin: Binary, bytes: Vec<u8>, db: Db) -> WorkResult {
+    let code_supported = crate::analysis::disasm::supported(bin.arch);
+    let an = if code_supported {
+        engine::analyze(&bin, &bytes, crate::ANALYSIS_BUDGET, &db)
+    } else {
+        engine::Analysis::empty(bin.arch)
+    };
+    let mut sinks = if code_supported {
+        crate::analysis::audit::run(&an, &bin, &bytes)
+    } else {
+        Vec::new()
+    };
+    sinks.sort_by(|a, b| {
+        b.severity
+            .cmp(&a.severity)
+            .then(b.reachable.cmp(&a.reachable))
+            .then(a.addr.cmp(&b.addr))
+    });
+    let strings = listing::string_map(&bin, &bytes, engine::display_base(&bin));
+    let driver = (code_supported && crate::analysis::driver::plausibly_a_driver(&bin))
+        .then(|| crate::analysis::driver::report(&bin, &bytes, &an, &strings));
+    WorkResult {
+        bin,
+        bytes,
+        db,
+        an,
+        sinks,
+        strings,
+        driver,
+    }
+}
+
 /// Re-read the target from disk and run the full startup analysis pipeline
 /// on it. The annotation database follows content identity: an unchanged file
 /// reloads into the same database, a changed file starts a fresh one.
@@ -341,7 +373,7 @@ fn load_target(source: &TargetSource) -> Result<WorkResult> {
     let file = source.path.to_string_lossy().to_string();
     let original = std::fs::read(&source.path)
         .with_context(|| format!("cannot read {}", source.path.display()))?;
-    let original_bin = crate::formats::analyze(&file, &original)?;
+    let original_bin = crate::formats::analyze_or_raw(&file, &original);
     let db = Db::load(
         &crate::analysis::hashes::sha256_hex(&original),
         &file,
@@ -351,38 +383,9 @@ fn load_target(source: &TargetSource) -> Result<WorkResult> {
     let bin = if db.patches.is_empty() {
         original_bin
     } else {
-        crate::formats::analyze(&file, &bytes)
-            .context("staged patches make the binary unparsable")?
+        crate::formats::analyze_or_raw(&file, &bytes)
     };
-    if !crate::analysis::disasm::supported(bin.arch) {
-        anyhow::bail!(
-            "the interactive view needs x86, x64, or AArch64 disassembly; this is {}",
-            bin.arch.label()
-        );
-    }
-    let an = engine::analyze(&bin, &bytes, crate::ANALYSIS_BUDGET, &db);
-    let mut sinks = crate::analysis::audit::run(&an, &bin, &bytes);
-    sinks.sort_by(|a, b| {
-        b.severity
-            .cmp(&a.severity)
-            .then(b.reachable.cmp(&a.reachable))
-            .then(a.addr.cmp(&b.addr))
-    });
-    let strings = listing::string_map(&bin, &bytes, engine::display_base(&bin));
-    let driver = if crate::analysis::driver::plausibly_a_driver(&bin) {
-        Some(crate::analysis::driver::report(&bin, &bytes, &an, &strings))
-    } else {
-        None
-    };
-    Ok(WorkResult {
-        bin,
-        bytes,
-        db,
-        an,
-        sinks,
-        strings,
-        driver,
-    })
+    Ok(build_work_result(bin, bytes, db))
 }
 
 /// One listing pane's full state: what it shows, where its cursor is, and its
@@ -420,6 +423,8 @@ pub struct ListingViewRef<'a> {
 pub struct App {
     pub investigation: crate::api::investigation::Investigation,
     pub agent_config: crate::agent::AgentConfig,
+    pub agent_setup_choices: Vec<String>,
+    pub agent_setup_selection: usize,
     pub investigation_open: bool,
     pub investigation_focused: bool,
     /// The investigation desk owns the full content area. Kept separate from
@@ -576,9 +581,22 @@ impl App {
                 format!("Investigation load failed: {error}"),
             ),
         };
+        #[cfg(not(test))]
+        let agent_config = crate::agent::AgentConfig::from_environment();
+        // Unit tests must not read a developer's real configuration or touch
+        // their credential vault merely by constructing the TUI.
+        #[cfg(test)]
+        let agent_config = crate::agent::AgentConfig {
+            provider: "ollama".into(),
+            model: String::new(),
+            api_key: String::new(),
+            base_url: "http://127.0.0.1:11434".into(),
+        };
         let mut app = App {
             investigation,
-            agent_config: crate::agent::AgentConfig::from_environment(),
+            agent_config,
+            agent_setup_choices: Vec::new(),
+            agent_setup_selection: 0,
             investigation_open: false,
             investigation_focused: true,
             investigation_zoomed: false,
@@ -662,6 +680,15 @@ impl App {
     /// A target with no recovered functions still opens: the first mapped
     /// bytes as a data view, so sections, strings and notes all still work.
     fn open_inspection_view(&mut self) {
+        if !crate::analysis::disasm::supported(self.bin.arch) && !self.bytes.is_empty() {
+            self.open_file_offset(0, false);
+            self.status = format!(
+                "{} / {} data-only view; code tools unavailable, byte and container tools ready",
+                self.bin.format.label(),
+                self.bin.arch.label()
+            );
+            return;
+        }
         let address = self
             .bin
             .entry
@@ -683,8 +710,17 @@ impl App {
                         .into();
             }
             None => {
-                self.status =
-                    "no functions or mapped data recovered; try :strings or :sections".into();
+                if self.bytes.is_empty() {
+                    self.status =
+                        "empty file; metadata and hashes remain available to the agent".into();
+                } else {
+                    self.open_file_offset(0, false);
+                    self.status = format!(
+                        "{} / {} data-only view; code tools unavailable, byte and container tools ready",
+                        self.bin.format.label(),
+                        self.bin.arch.label()
+                    );
+                }
             }
         }
     }
@@ -2316,7 +2352,11 @@ impl App {
     }
 
     pub fn reanalyze(&mut self) {
-        self.an = engine::analyze(&self.bin, &self.bytes, 2_000_000, &self.db);
+        self.an = if crate::analysis::disasm::supported(self.bin.arch) {
+            engine::analyze(&self.bin, &self.bytes, 2_000_000, &self.db)
+        } else {
+            engine::Analysis::empty(self.bin.arch)
+        };
         self.refilter();
         self.relist();
     }
@@ -2460,18 +2500,28 @@ impl App {
 
     /// Rebuild every view derived from target bytes after an interactive edit.
     fn refresh_analysis(&mut self) {
-        self.an = engine::analyze(&self.bin, &self.bytes, crate::ANALYSIS_BUDGET, &self.db);
+        let code_supported = crate::analysis::disasm::supported(self.bin.arch);
+        self.an = if code_supported {
+            engine::analyze(&self.bin, &self.bytes, crate::ANALYSIS_BUDGET, &self.db)
+        } else {
+            engine::Analysis::empty(self.bin.arch)
+        };
         self.strings = listing::string_map(&self.bin, &self.bytes, self.base);
-        self.sinks = crate::analysis::audit::run(&self.an, &self.bin, &self.bytes);
+        self.sinks = if code_supported {
+            crate::analysis::audit::run(&self.an, &self.bin, &self.bytes)
+        } else {
+            Vec::new()
+        };
         self.sinks.sort_by(|a, b| {
             b.severity
                 .cmp(&a.severity)
                 .then(b.reachable.cmp(&a.reachable))
                 .then(a.addr.cmp(&b.addr))
         });
-        self.driver = crate::analysis::driver::plausibly_a_driver(&self.bin).then(|| {
-            crate::analysis::driver::report(&self.bin, &self.bytes, &self.an, &self.strings)
-        });
+        self.driver = (code_supported && crate::analysis::driver::plausibly_a_driver(&self.bin))
+            .then(|| {
+                crate::analysis::driver::report(&self.bin, &self.bytes, &self.an, &self.strings)
+            });
         self.refilter();
         self.relist();
     }
@@ -2482,13 +2532,17 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return; // Windows reports releases too; acting on both double-fires
         }
-        if self.investigation_open
-            && self.prompt.is_none()
-            && (matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
-                && key.modifiers.contains(KeyModifiers::CONTROL)
-                || key.code == KeyCode::F(6))
-        {
-            self.investigation_focused = !self.investigation_focused;
+        let focus_shortcut = (matches!(key.code, KeyCode::Tab | KeyCode::BackTab)
+            && key.modifiers.contains(KeyModifiers::CONTROL))
+            || key.code == KeyCode::F(6)
+            || (matches!(key.code, KeyCode::Left | KeyCode::Right)
+                && key.modifiers.contains(KeyModifiers::CONTROL));
+        if self.investigation_open && self.prompt.is_none() && focus_shortcut {
+            self.investigation_focused = match key.code {
+                KeyCode::Right => true,
+                KeyCode::Left => false,
+                _ => !self.investigation_focused,
+            };
             if !self.investigation_focused {
                 self.investigation_follow = false;
                 self.investigation_zoomed = false;
@@ -2585,6 +2639,21 @@ impl App {
 
         if let Some(p) = &mut self.prompt {
             match key.code {
+                KeyCode::Up
+                    if matches!(p.ask, Ask::AgentProvider | Ask::AgentModel)
+                        && !self.agent_setup_choices.is_empty() =>
+                {
+                    self.agent_setup_selection = self.agent_setup_selection.saturating_sub(1);
+                    p.input = self.agent_setup_choices[self.agent_setup_selection].clone();
+                }
+                KeyCode::Down
+                    if matches!(p.ask, Ask::AgentProvider | Ask::AgentModel)
+                        && !self.agent_setup_choices.is_empty() =>
+                {
+                    self.agent_setup_selection =
+                        (self.agent_setup_selection + 1).min(self.agent_setup_choices.len() - 1);
+                    p.input = self.agent_setup_choices[self.agent_setup_selection].clone();
+                }
                 KeyCode::Up if p.ask == Ask::Command => {
                     p.input = self.command_history.previous(&p.input);
                 }
@@ -3412,29 +3481,7 @@ pub fn run(source: TargetSource, bin: Binary, bytes: Vec<u8>, db: Db, title: Str
     // Keep initial analysis, string mapping and driver reporting off the UI thread.
     let (tx, rx) = std::sync::mpsc::channel::<WorkResult>();
     std::thread::spawn(move || {
-        let an = engine::analyze(&bin, &bytes, crate::ANALYSIS_BUDGET, &db);
-        let mut sinks = crate::analysis::audit::run(&an, &bin, &bytes);
-        sinks.sort_by(|a, b| {
-            b.severity
-                .cmp(&a.severity)
-                .then(b.reachable.cmp(&a.reachable))
-                .then(a.addr.cmp(&b.addr))
-        });
-        let strings = listing::string_map(&bin, &bytes, engine::display_base(&bin));
-        let driver = if crate::analysis::driver::plausibly_a_driver(&bin) {
-            Some(crate::analysis::driver::report(&bin, &bytes, &an, &strings))
-        } else {
-            None
-        };
-        let _ = tx.send(WorkResult {
-            bin,
-            bytes,
-            db,
-            an,
-            sinks,
-            strings,
-            driver,
-        });
+        let _ = tx.send(build_work_result(bin, bytes, db));
     });
 
     // `try_init` rather than `init`, so running this with output piped fails
@@ -5032,6 +5079,11 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE));
         assert!(app.investigation_focused);
         assert!(app.status.contains("desk focused"));
+
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL));
+        assert!(!app.investigation_focused);
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL));
+        assert!(app.investigation_focused);
     }
 
     #[test]
@@ -5048,14 +5100,27 @@ mod tests {
         let screen = rendered(&mut app, 160, 40);
         assert!(!screen.contains("super-secret-key"));
         assert!(screen.contains("••••"));
-        app.prompt = None;
-        app.commit(Ask::AgentApiKey, 0, "super-secret-key".into());
-        assert!(app.prompt.is_none());
-        assert!(app
-            .agent_config
-            .status()
-            .contains("OpenRouter / example/model"));
+        // Do not touch the developer's credential vault from a unit test.
         assert!(!rendered(&mut app, 160, 40).contains("super-secret-key"));
+        assert!(screen.contains("Credential vault"));
+    }
+
+    #[test]
+    fn agent_setup_sidebar_supports_keyboard_model_selection() {
+        let mut app = two_functions();
+        app.splash = false;
+        app.start_agent_setup();
+        let provider_screen = rendered(&mut app, 160, 40);
+        assert!(provider_screen.contains("Choose provider"));
+        assert!(provider_screen.contains("openrouter"));
+
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let selected = app.prompt.as_ref().unwrap().input.clone();
+        assert_eq!(selected, app.agent_setup_choices[app.agent_setup_selection]);
+        app.commit(Ask::AgentProvider, 0, "openrouter".into());
+        let model_screen = rendered(&mut app, 160, 40);
+        assert!(model_screen.contains("Choose model"));
+        assert!(model_screen.contains("z-ai/glm-5.3-flash"));
     }
 
     #[test]

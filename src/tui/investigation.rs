@@ -51,7 +51,7 @@ impl App {
             .map(|path| path.to_string_lossy().into_owned());
         let expected = crate::analysis::hashes::sha256_hex(&self.bytes);
         let ledger = self.investigation.clone();
-        let ui_context = self.current_function().map(|function| {
+        let selection = if let Some(function) = self.current_function() {
             format!(
                 "function {} at static VA 0x{:x}; cursor static VA {}",
                 function.name,
@@ -60,7 +60,24 @@ impl App {
                     .map(|address| format!("0x{:x}", address.saturating_add(self.base)))
                     .unwrap_or_else(|| "unavailable".into())
             )
-        });
+        } else if self.raw_file {
+            let offset = self
+                .lines
+                .get(self.cursor)
+                .map(super::Line::addr)
+                .or(self.cur)
+                .unwrap_or(0);
+            format!("raw file view at file offset 0x{offset:x}")
+        } else {
+            self.cursor_addr()
+                .map(|address| format!("data at static VA 0x{:x}", address + self.base))
+                .unwrap_or_else(|| "no address selected".into())
+        };
+        let ui_context = Some(format!(
+            "{} / {} target; {selection}",
+            self.bin.format.label(),
+            self.bin.arch.label()
+        ));
         let activity = std::sync::Arc::new(std::sync::Mutex::new("Preparing model context".into()));
         self.investigation_live_activity = Some(activity.clone());
         let cancellation = crate::api::execution::CancellationToken::default();
@@ -70,11 +87,10 @@ impl App {
         self.investigation_agent_events = Some(progress_receiver);
         std::thread::spawn(move || {
             let result = (|| {
-                let session = crate::workspace::Session::open(
+                let session = crate::workspace::Session::open_any(
                     &path,
                     database.as_deref(),
                     crate::ANALYSIS_BUDGET,
-                    "investigation agent",
                 )?;
                 if crate::analysis::hashes::sha256_hex(&session.bytes) != expected {
                     anyhow::bail!("workspace changed; reload before starting the agent");
@@ -107,7 +123,20 @@ impl App {
         }
         self.investigation_open = true;
         self.investigation_focused = true;
-        self.status = "Provider setup stays in memory; credentials are not saved".into();
+        self.agent_setup_choices = vec![
+            "openrouter".into(),
+            "ollama".into(),
+            "openai".into(),
+            "compatible".into(),
+        ];
+        self.agent_setup_selection = self
+            .agent_setup_choices
+            .iter()
+            .position(|choice| choice == &self.agent_config.provider)
+            .unwrap_or(0);
+        self.status =
+            "Provider/model are remembered; API keys use the operating-system credential vault"
+                .into();
         self.ask(super::Ask::AgentProvider);
     }
 
@@ -121,15 +150,26 @@ impl App {
             self.ask(super::Ask::AgentProvider);
             return;
         }
-        self.agent_config.provider = if provider == "openai-compatible" {
+        let provider = if provider == "openai-compatible" {
             "compatible".into()
         } else {
             provider
         };
+        if provider != self.agent_config.provider {
+            self.agent_config.provider = provider;
+            self.agent_config.reload_api_key_from_vault();
+        }
         if self.agent_config.provider == "ollama" && self.agent_config.base_url.is_empty() {
             self.agent_config.base_url = "http://127.0.0.1:11434".into();
         }
-        self.status = "Choose the exact provider model identifier".into();
+        self.agent_setup_choices =
+            model_choices(&self.agent_config.provider, &self.agent_config.model);
+        self.agent_setup_selection = self
+            .agent_setup_choices
+            .iter()
+            .position(|choice| choice == &self.agent_config.model)
+            .unwrap_or(0);
+        self.status = "Choose with ↑/↓ or type an exact provider model identifier".into();
         self.ask(super::Ask::AgentModel);
     }
 
@@ -154,7 +194,8 @@ impl App {
                 self.status = if self.agent_config.has_api_key() {
                     "Enter a replacement API key, or leave blank to keep the loaded key".into()
                 } else {
-                    "Enter the API key; input is masked and retained in memory only".into()
+                    "Enter the API key; input is masked and saved in your OS credential vault"
+                        .into()
                 };
                 self.ask(super::Ask::AgentApiKey);
             }
@@ -169,23 +210,47 @@ impl App {
             self.status = if self.agent_config.has_api_key() {
                 "Enter a replacement API key, or leave blank to keep the loaded key".into()
             } else {
-                "Enter the API key; input is masked and retained in memory only".into()
+                "Enter the API key; input is masked and saved in your OS credential vault".into()
             };
             self.ask(super::Ask::AgentApiKey);
         }
     }
 
     pub fn agent_setup_api_key(&mut self, api_key: String) {
+        let changed = !api_key.is_empty();
         if !api_key.is_empty() {
             self.agent_config.api_key = api_key;
+        }
+        if changed {
+            if let Err(error) = self.agent_config.save_api_key() {
+                let preference_error = self.agent_config.save_preferences().err();
+                self.finish_agent_setup_without_status();
+                self.status = match preference_error {
+                    Some(preference_error) => format!(
+                        "Session ready, but preferences ({preference_error}) and OS vault key ({error}) could not be saved"
+                    ),
+                    None => format!(
+                        "Provider/model remembered, but the key is session-only because the OS vault failed: {error}"
+                    ),
+                };
+                return;
+            }
         }
         self.finish_agent_setup();
     }
 
     fn finish_agent_setup(&mut self) {
+        let saved = self.agent_config.save_preferences();
+        self.finish_agent_setup_without_status();
+        if let Err(error) = saved {
+            self.status = format!("Provider ready, but preferences could not be saved: {error}");
+        }
+    }
+
+    fn finish_agent_setup_without_status(&mut self) {
         self.investigation_activity = self.agent_config.status();
         self.status = match crate::agent::ConfiguredProvider::from_config(&self.agent_config) {
-            Ok(_) => "Agent provider ready; press i to start a conversation".into(),
+            Ok(_) => "Agent provider ready and remembered; press i to start a conversation".into(),
             Err(error) => format!("Provider setup incomplete: {error}"),
         };
     }
@@ -223,11 +288,10 @@ impl App {
         self.investigation_open = true;
         std::thread::spawn(move || {
             let result = (|| {
-                let session = crate::workspace::Session::open(
+                let session = crate::workspace::Session::open_any(
                     &path,
                     database.as_deref(),
                     crate::ANALYSIS_BUDGET,
-                    "investigation",
                 )?;
                 if crate::analysis::hashes::sha256_hex(&session.bytes) != expected {
                     anyhow::bail!("workspace changed since this TUI opened; reload before collecting evidence");
@@ -406,4 +470,27 @@ impl App {
             }
         }
     }
+}
+
+fn model_choices(provider: &str, current: &str) -> Vec<String> {
+    let suggestions: &[&str] = match provider {
+        "openrouter" => &[
+            "z-ai/glm-5.3-flash",
+            "z-ai/glm-5.3-flashx",
+            "openrouter/auto",
+        ],
+        "ollama" => &["qwen3", "qwen3-coder", "llama3.3"],
+        "openai" => &["gpt-5.4"],
+        _ => &[],
+    };
+    let mut choices = Vec::new();
+    if !current.trim().is_empty() {
+        choices.push(current.trim().to_string());
+    }
+    for suggestion in suggestions {
+        if !choices.iter().any(|choice| choice == suggestion) {
+            choices.push((*suggestion).to_string());
+        }
+    }
+    choices
 }

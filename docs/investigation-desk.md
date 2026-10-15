@@ -9,10 +9,14 @@ is configured, starts a background tool-using conversation.
 ## Model providers
 
 Press `S` in the TUI (or run `:agent-setup`) to enter the provider, model,
-optional base URL, and API key without leaving Knife. The API-key field is
-masked and the completed configuration remains in process memory only; it is
-not written to the project, investigation ledger, command history, or an
-environment file. Environment variables remain available for scripted startup.
+optional base URL, and API key without leaving Knife. Provider and model choices
+appear in the sidebar and can be selected with Up/Down; an exact provider model
+ID can still be typed. Knife remembers the non-secret settings in
+`$XDG_CONFIG_HOME/knife/agent.json` (or `~/.config/knife/agent.json`). The
+masked API key is stored separately by the operating-system credential vault,
+never in that JSON file, the project, investigation ledger, command history, or
+an environment file. Environment variables remain available and take
+precedence for scripted startup.
 
 Ollama remains the no-account local default:
 
@@ -38,7 +42,9 @@ Knife also accepts `KNIFE_AGENT_PROVIDER=openai` with `OPENAI_API_KEY`, or
 `KNIFE_AGENT_PROVIDER=compatible` with `KNIFE_AGENT_BASE_URL` and
 `KNIFE_AGENT_API_KEY`. Compatible endpoints must use HTTPS, except localhost
 HTTP. API keys are never saved in the investigation ledger or placed on the
-`curl` command line. The request still sends the recent conversation and tool
+`curl` command line. If the OS vault is unavailable, Knife clearly marks the
+key as session-only while still remembering the non-secret preferences. The
+request still sends the recent conversation and tool
 results to the configured service, so use Ollama for targets that must remain
 local. There is no default hosted model or account requirement.
 
@@ -87,9 +93,10 @@ The worker reopens the saved project and checks that its workspace bytes match
 the TUI before collecting results. Navigation remains responsive. Evidence
 records and bounded tool responses are saved beside the annotation database in
 an `.investigation.json` file. Press `i` to compose an agent message in the
-ordinary command input, and Ctrl+Tab to move focus between the dock and the
-listing. `F6` is an equivalent fallback for terminals that do not distinguish
-Ctrl+Tab. The focused desk uses a bright rounded border and a `FOCUSED` label;
+ordinary command input. `Ctrl+Right` enters the desk and `Ctrl+Left` returns to
+analysis; `Ctrl+Tab` toggles between them. `F6` is an equivalent fallback for
+terminals that do not distinguish Ctrl+Tab. Focus changes preserve the thread,
+selection, and scroll position. The focused desk uses a bright rounded border and a `FOCUSED` label;
 press `z` there to maximize chat and evidence together, then `z` again to
 restore the side-by-side workspace. While follow mode is enabled, completed agent tools move the listing
 to their first static evidence address. Manual focus on the listing pauses that

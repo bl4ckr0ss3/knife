@@ -48,6 +48,51 @@ pub fn analyze(path: &str, bytes: &[u8]) -> Result<Binary> {
     Ok(bin)
 }
 
+/// Open arbitrary bytes for the investigation workspace. Recognized formats
+/// retain their normal parser; an unrecognized or malformed container becomes
+/// an explicitly limited raw-file model rather than preventing byte, string,
+/// hash, entropy, signature, and artifact analysis.
+pub fn analyze_or_raw(path: &str, bytes: &[u8]) -> Binary {
+    match analyze(path, bytes) {
+        Ok(binary) => binary,
+        Err(error) => {
+            let mut binary = Binary::stub(Format::Unknown, crate::model::Arch::Other);
+            binary.path = path.to_string();
+            binary.size = bytes.len() as u64;
+            binary.overall_entropy = entropy(bytes);
+            if !bytes.is_empty() {
+                binary.sections.push(Section {
+                    name: ".file".into(),
+                    vaddr: 0,
+                    vsize: bytes.len() as u64,
+                    file_off: 0,
+                    file_size: bytes.len() as u64,
+                    entropy: binary.overall_entropy,
+                    read: true,
+                    write: false,
+                    exec: false,
+                });
+            }
+            let reason: String = error
+                .to_string()
+                .chars()
+                .map(|character| {
+                    if character.is_control() {
+                        ' '
+                    } else {
+                        character
+                    }
+                })
+                .take(512)
+                .collect();
+            binary.notes.push(format!(
+                "Raw-file fallback: container parsing was unavailable ({reason})"
+            ));
+            binary
+        }
+    }
+}
+
 fn catch_parse(path: &str, bytes: &[u8]) -> Result<Binary> {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -167,5 +212,21 @@ pub(crate) fn mk_section(
         read,
         write,
         exec,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arbitrary_bytes_get_an_explicit_raw_file_model() {
+        let bytes = b"plain data, not an executable\0";
+        let binary = analyze_or_raw("notes.bin", bytes);
+        assert_eq!(binary.format, Format::Unknown);
+        assert_eq!(binary.size, bytes.len() as u64);
+        assert_eq!(binary.sections.len(), 1);
+        assert_eq!(binary.sections[0].name, ".file");
+        assert!(binary.notes[0].contains("Raw-file fallback"));
     }
 }
